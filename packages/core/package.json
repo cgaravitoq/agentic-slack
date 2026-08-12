@@ -1,10 +1,10 @@
 {
-  "name": "@agentic-slack/slack-agent",
+  "name": "@agentic-slack/core",
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "exports": "./src/index.ts",
   "dependencies": {
-    "@agentic-slack/core": "workspace:*",
     "@flue/runtime": "2.0.3",
     "@flue/slack": "2.0.3",
     "hono": "4.12.32",

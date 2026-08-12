@@ -5,24 +5,34 @@
   "type": "module",
   "packageManager": "bun@1.3.14",
   "workspaces": [
-    "apps/*"
+    "apps/*",
+    "packages/*"
   ],
   "scripts": {
     "format:check": "biome format .",
     "format:write": "biome format --write .",
     "lint": "oxlint . --type-aware --deny typescript/no-floating-promises",
+    "manifest": "bun run apps/slack-agent/scripts/generate-manifest.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "deploy:dry": "wrangler deploy --dry-run --config apps/slack-agent/wrangler.jsonc",
+    "build": "vite build --config apps/slack-agent/vite.config.ts",
+    "deploy:dry": "bun run build && wrangler deploy --dry-run --config apps/slack-agent/dist/agentic_slack/wrangler.json",
     "verify": "bun run format:check && bun run lint && bun run typecheck && bun test && bun run deploy:dry"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.8",
+    "@cloudflare/vite-plugin": "1.51.0",
+    "@cloudflare/workers-types": "5.20260804.1",
+    "@flue/vite": "2.0.3",
     "@types/bun": "1.3.14",
     "oxlint": "1.78.0",
     "oxlint-tsgolint": "7.0.2001",
     "typescript": "7.0.2",
+    "vite": "8.2.0",
     "wrangler": "4.122.0"
   },
-  "trustedDependencies": []
+  "trustedDependencies": [],
+  "overrides": {
+    "hono": "4.12.32"
+  }
 }

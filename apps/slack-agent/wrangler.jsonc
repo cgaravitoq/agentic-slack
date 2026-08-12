@@ -1,6 +1,19 @@
 {
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "agentic-slack",
-  "main": "src/index.ts",
-  "compatibility_date": "2026-08-13"
+  "compatibility_date": "2026-08-13",
+  "compatibility_flags": ["nodejs_compat"],
+  "ai": { "binding": "AI" },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "traces": { "enabled": true }
+  },
+  "d1_databases": [{ "binding": "DB" }],
+  "migrations": [
+    {
+      "tag": "flue-class-FlueSlackAgentAgent",
+      "new_sqlite_classes": ["FlueSlackAgentAgent"]
+    }
+  ]
 }

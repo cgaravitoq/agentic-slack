@@ -6,8 +6,9 @@
     "moduleDetection": "force",
     "moduleResolution": "Bundler",
     "noEmit": true,
+    "skipLibCheck": true,
     "strict": true,
-    "types": ["bun"]
+    "types": ["bun", "@cloudflare/workers-types"]
   },
-  "include": ["apps/**/*.ts"]
+  "include": ["apps/**/*.ts", "packages/**/*.ts"]
 }
