@@ -16,6 +16,24 @@ export interface SlackDestination {
   threadTs: string;
 }
 
+export function extractAssistantText(
+  content: readonly { type: string; text?: string }[] | undefined,
+): string {
+  if (!content) return "";
+  return content
+    .filter(
+      (block): block is { type: "text"; text: string } =>
+        block.type === "text" &&
+        typeof block.text === "string" &&
+        block.text.length > 0,
+    )
+    .map((block) => block.text)
+    .join("\n");
+}
+
+export const SLACK_DELIVERY_FALLBACK =
+  "I finished the turn but could not post a Slack reply. Please try again.";
+
 type Fetcher = (
   input: RequestInfo | URL,
   init?: RequestInit,

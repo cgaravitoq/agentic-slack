@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { defineTool } from "@flue/runtime/tool";
 import * as v from "valibot";
 
@@ -13,6 +14,7 @@ import {
   createReplyTool,
   defineAgentConfig,
   expireLatest,
+  extractAssistantText,
   generateSlackManifest,
   missingReadiness,
   MODEL,
@@ -147,7 +149,9 @@ describe("neutral core composition", () => {
       [
         "bun",
         "run",
-        "apps/slack-agent/scripts/generate-manifest.ts",
+        fileURLToPath(
+          new URL("../scripts/generate-manifest.ts", import.meta.url),
+        ),
         "https://agent.example.com",
       ],
       { stdout: "pipe", stderr: "pipe" },
@@ -306,6 +310,23 @@ describe("neutral core composition", () => {
 });
 
 describe("terminal Slack delivery", () => {
+  test("joins text blocks and ignores thinking and tool calls", () => {
+    expect(
+      extractAssistantText([
+        { type: "text", text: "First" },
+        { type: "thinking", thinking: "hidden reasoning" },
+        { type: "text", text: "Second" },
+        { type: "toolCall", id: "c1", name: "x", arguments: {} },
+      ] as readonly { type: string; text?: string }[]),
+    ).toBe("First\nSecond");
+  });
+
+  test("returns an empty string for empty or undefined content", () => {
+    expect(extractAssistantText(undefined)).toBe("");
+    expect(extractAssistantText([])).toBe("");
+    expect(extractAssistantText([{ type: "text", text: "" }])).toBe("");
+  });
+
   test("binds destination and credential, sanitizes text, and posts once", async () => {
     const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> =
       [];

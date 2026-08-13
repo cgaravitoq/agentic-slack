@@ -4,10 +4,13 @@ import { env } from "cloudflare:workers";
 import {
   composeInstructions,
   composeTools,
+  CORE_REPLY_TOOL_NAME,
   createReplyTool,
   expireLatest,
+  extractAssistantText,
   MODEL,
   replaceRetention,
+  SLACK_DELIVERY_FALLBACK,
   type ResolvedAgentConfig,
   type ExpiryPayload,
   type ExpirySchedule,
@@ -15,6 +18,8 @@ import {
 } from "@agentic-slack/core";
 import {
   type AgentProps,
+  observe,
+  useAgentFinish,
   useInitialData,
   useInstruction,
   useModel,
@@ -24,6 +29,17 @@ import { extend } from "@flue/runtime/cloudflare";
 import * as v from "valibot";
 import config from "../agent.config.ts";
 import type { WorkerBindings } from "./app.ts";
+
+let lastAssistantText = "";
+
+// Module scope: this file runs in the Durable Object isolate that dispatches
+// agent turns, so turn events are observable here but never in the Worker.
+observe((event) => {
+  if (event.type === "turn" && event.purpose === "agent" && !event.isError) {
+    const text = extractAssistantText(event.response?.output?.content);
+    if (text) lastAssistantText = text;
+  }
+});
 
 type RuntimeContext =
   typeof config extends ResolvedAgentConfig<infer Context> ? Context : never;
@@ -49,12 +65,21 @@ export function SlackAgent(_props: AgentProps) {
     useInstruction(instruction);
   const bindings = env as unknown as WorkerBindings;
   const runtimeContext = { bindings } as unknown as RuntimeContext;
-  for (const tool of composeTools(
-    config,
-    runtimeContext,
-    createReplyTool(destination, bindings.SLACK_BOT_TOKEN),
-  ))
-    useTool(tool);
+  const reply = createReplyTool(destination, bindings.SLACK_BOT_TOKEN);
+  for (const tool of composeTools(config, runtimeContext, reply)) useTool(tool);
+  useAgentFinish(async (ctx) => {
+    const text = lastAssistantText;
+    lastAssistantText = "";
+    if (
+      ctx.response.toolCalls.some(
+        (call) => call.tool === CORE_REPLY_TOOL_NAME && !call.isError,
+      )
+    )
+      return;
+    await reply.run({
+      data: { text: text || SLACK_DELIVERY_FALLBACK },
+    } as Parameters<typeof reply.run>[0]);
+  });
   return `${config.name}: ${config.description}`;
 }
 

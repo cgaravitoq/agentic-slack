@@ -63,6 +63,8 @@ await mock.module("@flue/runtime", () => ({
   useInstruction: (instruction: string) => instructions.push(instruction),
   useModel: () => undefined,
   useTool: (tool: ToolDefinition) => tools.push(tool),
+  observe: () => undefined,
+  useAgentFinish: () => undefined,
 }));
 await mock.module("@flue/runtime/cloudflare", () => ({
   extend: () => ({ base: undefined }),
