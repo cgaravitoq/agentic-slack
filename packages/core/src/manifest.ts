@@ -12,6 +12,10 @@ export function generateSlackManifest(
         description: config.description,
       },
       features: {
+        app_home: {
+          messages_tab_enabled: true,
+          messages_tab_read_only_enabled: false,
+        },
         bot_user: { display_name: config.name, always_online: true },
         agent_view: { agent_description: config.description },
       },

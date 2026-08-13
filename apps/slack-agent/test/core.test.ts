@@ -277,6 +277,10 @@ describe("readiness and manifest", () => {
       name: "Neutral Agent",
       description: "Answers Slack conversations.",
     });
+    expect(manifest.features.app_home).toEqual({
+      messages_tab_enabled: true,
+      messages_tab_read_only_enabled: false,
+    });
     expect(manifest.features.agent_view).toEqual({
       agent_description: "Answers Slack conversations.",
     });
