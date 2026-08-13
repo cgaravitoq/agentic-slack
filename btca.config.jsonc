@@ -1,0 +1,97 @@
+{
+  "$schema": "https://btca.dev/btca.schema.json",
+  "dataDirectory": ".btca",
+  "provider": "openai",
+  "model": "gpt-5.6-luna",
+  "resources": [
+    {
+      "name": "flue",
+      "type": "git",
+      "url": "https://github.com/withastro/flue",
+      "branch": "main",
+      "searchPaths": [
+        "docs",
+        "examples",
+        "packages/runtime",
+        "packages/slack",
+        "packages/vite"
+      ],
+      "specialNotes": "Exact upstream for the pinned Flue 2.0.3 packages. Use it for runtime, Slack adapter, and generated Worker composition behavior."
+    },
+    {
+      "name": "slack-bolt",
+      "type": "git",
+      "url": "https://github.com/slackapi/bolt-js",
+      "branch": "main",
+      "searchPaths": ["src", "test", "docs", "examples"],
+      "specialNotes": "Reference Slack signing, event admission and acknowledgement, assistant threads, and Web API behavior without adding Bolt as a dependency."
+    },
+    {
+      "name": "opentag",
+      "type": "git",
+      "url": "https://github.com/CopilotKit/OpenTag",
+      "branch": "main",
+      "searchPaths": ["agent", "app", "docs", "e2e", "server.ts"],
+      "specialNotes": "Reference self-hosted Slack agent UX, triage, streaming, and human-in-the-loop patterns only."
+    },
+    {
+      "name": "copilotkit-channels",
+      "type": "git",
+      "url": "https://github.com/CopilotKit/CopilotKit",
+      "branch": "main",
+      "searchPaths": [
+        "packages/channels-core",
+        "packages/channels-slack",
+        "packages/channels-intelligence"
+      ],
+      "specialNotes": "Reference channel abstractions and native Slack streaming and rendering without migrating this repository's runtime."
+    },
+    {
+      "name": "cloudflare-agents",
+      "type": "git",
+      "url": "https://github.com/cloudflare/agents",
+      "branch": "main",
+      "searchPaths": [
+        "docs",
+        "examples",
+        "packages/agents",
+        "packages/ai-chat",
+        "packages/hono-agents"
+      ],
+      "specialNotes": "Reference Durable Object lifecycle, state, and agent request routing while keeping Flue authoritative in this repository."
+    },
+    {
+      "name": "workers-sdk",
+      "type": "git",
+      "url": "https://github.com/cloudflare/workers-sdk",
+      "branch": "main",
+      "searchPaths": [
+        "packages/vite-plugin-cloudflare",
+        "packages/wrangler",
+        "packages/miniflare"
+      ],
+      "specialNotes": "Reference the Cloudflare build, dry-deploy, and local-runtime seams used by this repository."
+    },
+    {
+      "name": "llms-txt",
+      "type": "git",
+      "url": "https://github.com/AnswerDotAI/llms-txt",
+      "branch": "main",
+      "searchPaths": ["README.md", "llms_txt", "nbs", "tests"],
+      "specialNotes": "Reference llms.txt parsing and failure behavior for @agentic-slack/plugin-llms-docs."
+    },
+    {
+      "name": "posthog",
+      "type": "git",
+      "url": "https://github.com/PostHog/posthog",
+      "branch": "master",
+      "searchPaths": [
+        "posthog/hogql",
+        "posthog/api",
+        "frontend/src/queries",
+        "products"
+      ],
+      "specialNotes": "Reference HogQL aggregate-query contracts and API behavior for @agentic-slack/plugin-posthog."
+    }
+  ]
+}
