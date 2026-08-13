@@ -3,6 +3,7 @@
 import { env } from "cloudflare:workers";
 import {
   composeInstructions,
+  composeTools,
   createReplyTool,
   expireLatest,
   MODEL,
@@ -42,7 +43,12 @@ export function SlackAgent(_props: AgentProps) {
   for (const instruction of composeInstructions(config))
     useInstruction(instruction);
   const bindings = env as unknown as { SLACK_BOT_TOKEN: string };
-  useTool(createReplyTool(destination, bindings.SLACK_BOT_TOKEN));
+  for (const tool of composeTools(
+    config,
+    { bindings },
+    createReplyTool(destination, bindings.SLACK_BOT_TOKEN),
+  ))
+    useTool(tool);
   return `${config.name}: ${config.description}`;
 }
 

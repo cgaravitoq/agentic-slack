@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { defineTool } from "@flue/runtime/tool";
+import * as v from "valibot";
+
 import {
   CHANNEL_RETENTION_DAYS,
   claimAndRun,
   CLOUDFLARE_TRACING_CONTENT,
   composeInstructions,
+  composeTools,
   CORE_INSTRUCTIONS,
+  CORE_REPLY_TOOL_NAME,
   createReplyTool,
   defineAgentConfig,
   expireLatest,
@@ -14,6 +19,71 @@ import {
   PRIVATE_RETENTION_DAYS,
   replaceRetention,
 } from "@agentic-slack/core";
+
+interface TestRuntimeContext {
+  bindings: {
+    pluginSecret: string;
+    addonRoute: string;
+  };
+}
+
+function terminalTool() {
+  return defineTool({
+    name: CORE_REPLY_TOOL_NAME,
+    description: "Reply.",
+    async run() {
+      return { output: "posted", terminate: true };
+    },
+  });
+}
+
+function createTestPlugin(factoryCalls: string[], toolCalls: string[]) {
+  return {
+    id: "test-search",
+    kind: "plugin" as const,
+    instructions: ["Use test search for exact lookups."],
+    createTools(context: TestRuntimeContext) {
+      factoryCalls.push("plugin");
+      const secret = context.bindings.pluginSecret;
+      return [
+        defineTool({
+          name: "test_search",
+          description: "Search the configured test source.",
+          input: v.object({ query: v.string() }),
+          output: v.string(),
+          async run({ data }) {
+            toolCalls.push(`${secret}:${data.query}`);
+            return { output: "search complete" };
+          },
+        }),
+      ];
+    },
+  };
+}
+
+function createTestAddon(factoryCalls: string[], toolCalls: string[]) {
+  return {
+    id: "test-triage",
+    kind: "addon" as const,
+    instructions: ["Triage requests after gathering facts."],
+    createTools(context: TestRuntimeContext) {
+      factoryCalls.push("addon");
+      const route = context.bindings.addonRoute;
+      return [
+        defineTool({
+          name: "test_triage",
+          description: "Classify one test request.",
+          input: v.object({ request: v.string() }),
+          output: v.string(),
+          async run({ data }) {
+            toolCalls.push(`${route}:${data.request}`);
+            return { output: "triage complete" };
+          },
+        }),
+      ];
+    },
+  };
+}
 
 const config = defineAgentConfig({
   name: "Neutral Agent",
@@ -36,6 +106,202 @@ describe("neutral core composition", () => {
     expect(instructions.at(-1)).toBe("Prefer short answers.");
     expect(Object.isFrozen(instructions)).toBe(true);
     expect(Object.isFrozen(CORE_INSTRUCTIONS)).toBe(true);
+  });
+
+  test("preserves core-only instruction and tool behavior when extensions are absent", () => {
+    const terminal = terminalTool();
+
+    expect(config.plugins).toEqual([]);
+    expect(config.addons).toEqual([]);
+    expect(composeInstructions(config)).toEqual([
+      ...CORE_INSTRUCTIONS,
+      "Prefer short answers.",
+    ]);
+    expect(composeTools(config, undefined, terminal)).toEqual([terminal]);
+  });
+
+  test("resolves config and manifests without invoking runtime factories", async () => {
+    let factoryCalls = 0;
+    const staticConfig = defineAgentConfig({
+      name: "Static Agent",
+      description: "Imports without Worker runtime.",
+      ownerInstructions: "Keep runtime values private.",
+      plugins: [
+        {
+          id: "runtime-only",
+          kind: "plugin",
+          createTools() {
+            factoryCalls += 1;
+            throw new Error("Factory must not run during static resolution");
+          },
+        },
+      ],
+    });
+
+    expect(factoryCalls).toBe(0);
+    expect(
+      generateSlackManifest(staticConfig, "https://agent.example.com"),
+    ).toContain('"name": "Static Agent"');
+    expect(factoryCalls).toBe(0);
+    const manifestProcess = Bun.spawn(
+      [
+        "bun",
+        "run",
+        "apps/slack-agent/scripts/generate-manifest.ts",
+        "https://agent.example.com",
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    expect(await manifestProcess.exited).toBe(0);
+    expect(await new Response(manifestProcess.stdout).text()).toContain(
+      '"name": "Slack Agent"',
+    );
+  });
+
+  test("creates plugin and addon tools in runtime order with secrets closure-bound", async () => {
+    const factoryCalls: string[] = [];
+    const toolCalls: string[] = [];
+    const pluginSecret = "plugin-secret-value";
+    const addonRoute = "private-addon-route";
+    const extensionConfig = defineAgentConfig<TestRuntimeContext>({
+      name: "Extended Agent",
+      description: "Uses static extensions.",
+      ownerInstructions: "Follow the owner's preferences.",
+      plugins: [createTestPlugin(factoryCalls, toolCalls)],
+      addons: [createTestAddon(factoryCalls, toolCalls)],
+    });
+    const terminal = terminalTool();
+    const instructions = composeInstructions(extensionConfig);
+    expect(factoryCalls).toEqual([]);
+    expect(JSON.stringify(extensionConfig)).not.toContain(pluginSecret);
+    expect(JSON.stringify(extensionConfig)).not.toContain(addonRoute);
+    const tools = composeTools(
+      extensionConfig,
+      { bindings: { pluginSecret, addonRoute } },
+      terminal,
+    );
+
+    expect(instructions).toEqual([
+      ...CORE_INSTRUCTIONS,
+      "Follow the owner's preferences.",
+      "Use test search for exact lookups.",
+      "Triage requests after gathering facts.",
+    ]);
+    expect(tools.map((tool) => tool.name)).toEqual([
+      "test_search",
+      "test_triage",
+      CORE_REPLY_TOOL_NAME,
+    ]);
+    expect(factoryCalls).toEqual(["plugin", "addon"]);
+    const modelVisible = JSON.stringify({
+      instructions,
+      tools: tools.map(({ name, description, input }) => ({
+        name,
+        description,
+        input,
+      })),
+    });
+    expect(modelVisible).not.toContain(pluginSecret);
+    expect(modelVisible).not.toContain(addonRoute);
+
+    await tools[0]?.run({ data: { query: "invoice" } } as Parameters<
+      (typeof tools)[number]["run"]
+    >[0]);
+    await tools[1]?.run({ data: { request: "refund" } } as Parameters<
+      (typeof tools)[number]["run"]
+    >[0]);
+    expect(toolCalls).toEqual([
+      `${pluginSecret}:invoice`,
+      `${addonRoute}:refund`,
+    ]);
+  });
+
+  test("rejects duplicate extension ids across kinds and reply tool shadowing", () => {
+    expect(() =>
+      defineAgentConfig({
+        name: "Duplicate Agent",
+        description: "Rejects duplicates.",
+        ownerInstructions: "Be concise.",
+        plugins: [{ id: "shared", kind: "plugin" }],
+        addons: [{ id: "shared", kind: "addon" }],
+      }),
+    ).toThrow("Duplicate agent extension id: shared");
+    const shadowConfig = defineAgentConfig({
+      name: "Shadow Agent",
+      description: "Rejects reply shadowing.",
+      ownerInstructions: "Be concise.",
+      plugins: [
+        {
+          id: "shadow",
+          kind: "plugin",
+          createTools() {
+            return [
+              defineTool({
+                name: CORE_REPLY_TOOL_NAME,
+                description: "Shadow reply.",
+                async run() {
+                  return "shadowed";
+                },
+              }),
+            ];
+          },
+        },
+      ],
+    });
+    expect(() => composeTools(shadowConfig, undefined, terminalTool())).toThrow(
+      `Agent extensions cannot register ${CORE_REPLY_TOOL_NAME}`,
+    );
+  });
+
+  test("copies and freezes resolved extension collections", () => {
+    const instructions = ["Original plugin instruction."];
+    const createTools = () => [];
+    const plugins = [
+      { id: "mutable", kind: "plugin" as const, instructions, createTools },
+    ];
+    const immutableConfig = defineAgentConfig({
+      name: "Immutable Agent",
+      description: "Freezes extensions.",
+      ownerInstructions: "Keep definitions stable.",
+      plugins,
+      addons: [{ id: "empty", kind: "addon" }],
+    });
+
+    instructions.push("Late instruction.");
+    plugins.push({
+      id: "late",
+      kind: "plugin",
+      instructions: [],
+      createTools,
+    });
+
+    expect(immutableConfig.plugins).toHaveLength(1);
+    expect(immutableConfig.plugins[0]?.instructions).toEqual([
+      "Original plugin instruction.",
+    ]);
+    expect(immutableConfig.plugins[0]?.createTools).toBe(createTools);
+    expect(immutableConfig.addons[0]).toMatchObject({
+      id: "empty",
+      instructions: [],
+      createTools: undefined,
+    });
+    expect(Object.isFrozen(immutableConfig.plugins)).toBe(true);
+    expect(Object.isFrozen(immutableConfig.addons)).toBe(true);
+    expect(Object.isFrozen(immutableConfig.plugins[0])).toBe(true);
+    expect(Object.isFrozen(immutableConfig.plugins[0]?.instructions)).toBe(
+      true,
+    );
+  });
+
+  test("rejects empty extension instructions", () => {
+    expect(() =>
+      defineAgentConfig({
+        name: "Invalid Agent",
+        description: "Rejects empty instructions.",
+        ownerInstructions: "Be concise.",
+        addons: [{ id: "invalid", kind: "addon", instructions: [" "] }],
+      }),
+    ).toThrow("Agent extension invalid requires non-empty instructions");
   });
 });
 

@@ -1,5 +1,6 @@
 import { defineTool } from "@flue/runtime/tool";
 import * as v from "valibot";
+import { CORE_REPLY_TOOL_NAME } from "./config.ts";
 
 const BROADCAST_RE = /<!(?:channel|here|everyone)(?:\|[^>]*)?>/gi;
 const SUBTEAM_RE = /<!subteam\^[^>]+>/gi;
@@ -45,7 +46,7 @@ export function createReplyTool(
 ) {
   let delivery: Promise<void> | undefined;
   return defineTool({
-    name: "reply_in_slack",
+    name: CORE_REPLY_TOOL_NAME,
     description:
       "Post the final reply to the Slack conversation bound by trusted code. Call exactly once.",
     input: v.object({ text: v.pipe(v.string(), v.minLength(1)) }),
