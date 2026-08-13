@@ -38,12 +38,23 @@
         "valibot": "1.4.2",
       },
     },
+    "packages/plugin-llms-docs": {
+      "name": "@agentic-slack/plugin-llms-docs",
+      "version": "0.0.0",
+      "dependencies": {
+        "@agentic-slack/core": "workspace:*",
+        "@flue/runtime": "2.0.3",
+        "valibot": "1.4.2",
+      },
+    },
   },
   "overrides": {
     "hono": "4.12.32",
   },
   "packages": {
     "@agentic-slack/core": ["@agentic-slack/core@workspace:packages/core"],
+
+    "@agentic-slack/plugin-llms-docs": ["@agentic-slack/plugin-llms-docs@workspace:packages/plugin-llms-docs"],
 
     "@agentic-slack/slack-agent": ["@agentic-slack/slack-agent@workspace:apps/slack-agent"],
 
