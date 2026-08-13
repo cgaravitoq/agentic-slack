@@ -74,7 +74,15 @@ describe("PostHog read-only plugin", () => {
 
     expect(calls).toEqual([]);
     expect(JSON.stringify(resolved)).not.toContain(secret);
-    expect(composeInstructions(resolved).join(" ")).toContain("query:read");
+    expect(composeInstructions(resolved).join(" ")).toContain(
+      "operator must grant",
+    );
+    expect(composeInstructions(resolved).join(" ")).toContain(
+      "Query Read access",
+    );
+    expect(composeInstructions(resolved).join(" ")).toContain(
+      "cannot inspect its permissions",
+    );
     const tools = composeTools(resolved, runtime(), terminalTool());
     expect(calls).toEqual(["resolved"]);
     expect(tools.map(({ name }) => name)).toEqual([

@@ -8,6 +8,7 @@ import {
   expireLatest,
   MODEL,
   replaceRetention,
+  type ResolvedAgentConfig,
   type ExpiryPayload,
   type ExpirySchedule,
   type SlackDestination,
@@ -22,6 +23,10 @@ import {
 import { extend } from "@flue/runtime/cloudflare";
 import * as v from "valibot";
 import config from "../agent.config.ts";
+import type { WorkerBindings } from "./app.ts";
+
+type RuntimeContext =
+  typeof config extends ResolvedAgentConfig<infer Context> ? Context : never;
 
 const initialData = v.pipe(
   v.strictObject({
@@ -42,10 +47,11 @@ export function SlackAgent(_props: AgentProps) {
   useModel(MODEL);
   for (const instruction of composeInstructions(config))
     useInstruction(instruction);
-  const bindings = env as unknown as { SLACK_BOT_TOKEN: string };
+  const bindings = env as unknown as WorkerBindings;
+  const runtimeContext = { bindings } as unknown as RuntimeContext;
   for (const tool of composeTools(
     config,
-    { bindings },
+    runtimeContext,
     createReplyTool(destination, bindings.SLACK_BOT_TOKEN),
   ))
     useTool(tool);

@@ -22,6 +22,8 @@
       "version": "0.0.0",
       "dependencies": {
         "@agentic-slack/core": "workspace:*",
+        "@agentic-slack/plugin-llms-docs": "workspace:*",
+        "@agentic-slack/plugin-posthog": "workspace:*",
         "@flue/runtime": "2.0.3",
         "@flue/slack": "2.0.3",
         "hono": "4.12.32",
