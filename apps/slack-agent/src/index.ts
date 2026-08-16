@@ -3,38 +3,20 @@ import {
   CLOUDFLARE_TRACING_CONTENT,
   refreshRetention,
 } from "@agentic-slack/core";
-import type { ConversationLifecycleAgent } from "@agentic-slack/core";
 import { dispatch, instrument, setProvider } from "@flue/runtime";
 import { createCloudflareTracing } from "@flue/runtime/cloudflare";
 import { cloudflareBindingProvider } from "@flue/runtime/cloudflare/workers-ai";
 import * as v from "valibot";
 import { SlackAgent } from "./agent.ts";
 import { createApp } from "./app.ts";
+import type { WorkerBindings } from "./app.ts";
 
-const workerBindings = v.object({
-  AI: v.custom<Ai>(
-    (value): value is Ai => value !== null && typeof value === "object",
-  ),
-  DB: v.custom<D1Database>(
-    (value): value is D1Database => value !== null && typeof value === "object",
-  ),
-  FLUE_SLACK_AGENT_AGENT: v.custom<
-    DurableObjectNamespace<ConversationLifecycleAgent>
-  >(
-    (value): value is DurableObjectNamespace<ConversationLifecycleAgent> =>
-      value !== null && typeof value === "object",
-  ),
-  SLACK_APP_ID: v.string(),
-  SLACK_BOT_TOKEN: v.string(),
-  SLACK_SIGNING_SECRET: v.string(),
-  SLACK_TEAM_ID: v.string(),
-});
 const slackResponse = v.object({
   error: v.optional(v.string()),
   ok: v.optional(v.boolean()),
 });
 
-const bindings = v.parse(workerBindings, env);
+const bindings: WorkerBindings = env;
 const trusted = {
   appId: bindings.SLACK_APP_ID,
   botToken: bindings.SLACK_BOT_TOKEN,

@@ -6,12 +6,7 @@ import type {
 } from "@agentic-slack/core";
 import { Hono } from "hono";
 
-export interface WorkerBindings extends SlackCoreBindings {
-  SLACK_SIGNING_SECRET: string;
-  SLACK_BOT_TOKEN: string;
-  SLACK_TEAM_ID: string;
-  SLACK_APP_ID: string;
-}
+export type WorkerBindings = Cloudflare.Env;
 
 export interface WorkerEnv {
   Bindings: WorkerBindings;

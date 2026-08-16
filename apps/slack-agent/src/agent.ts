@@ -53,17 +53,6 @@ const initialData = v.pipe(
   v.readonly(),
 );
 
-type WorkerEnv = typeof env;
-
-const hasBotToken = (
-  value: WorkerEnv,
-): value is { SLACK_BOT_TOKEN: string } => {
-  const entry = Object.entries(value).find(
-    ([key]) => key === "SLACK_BOT_TOKEN",
-  );
-  return typeof entry?.[1] === "string";
-};
-
 export const SlackAgent = (_props: AgentProps) => {
   const data = v.parse(initialData, useInitialData());
   const destination: SlackDestination = {
@@ -74,7 +63,7 @@ export const SlackAgent = (_props: AgentProps) => {
   for (const instruction of composeInstructions(config)) {
     useInstruction(instruction);
   }
-  if (!hasBotToken(env)) {
+  if (!env.SLACK_BOT_TOKEN) {
     throw new Error("Missing SLACK_BOT_TOKEN binding");
   }
   const bindings = env;
