@@ -15,5 +15,31 @@
       "tag": "flue-class-FlueSlackAgentAgent",
       "new_sqlite_classes": ["FlueSlackAgentAgent"]
     }
-  ]
+  ],
+  // Bindings are not inherited by environments, so each one repeats ai and
+  // d1_databases. Fill database_id from `wrangler d1 create` before deploying.
+  "env": {
+    "staging": {
+      "name": "agentic-slack-staging",
+      "ai": { "binding": "AI" },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "agentic-slack-staging",
+          "database_id": ""
+        }
+      ]
+    },
+    "production": {
+      "name": "agentic-slack",
+      "ai": { "binding": "AI" },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "agentic-slack",
+          "database_id": ""
+        }
+      ]
+    }
+  }
 }

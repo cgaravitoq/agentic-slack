@@ -13,12 +13,15 @@
     "format:write": "biome format --write .",
     "lint": "oxlint . --type-aware --deny typescript/no-floating-promises",
     "manifest": "bun run apps/slack-agent/scripts/generate-manifest.ts",
-    "db:migrate": "wrangler d1 migrations apply DB --config apps/slack-agent/wrangler.jsonc --remote",
     "db:migrate:local": "wrangler d1 migrations apply DB --config apps/slack-agent/wrangler.jsonc --local",
+    "db:migrate:staging": "wrangler d1 migrations apply DB --config apps/slack-agent/wrangler.jsonc --env staging --remote",
+    "db:migrate:production": "wrangler d1 migrations apply DB --config apps/slack-agent/wrangler.jsonc --env production --remote",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "build": "vite build --config apps/slack-agent/vite.config.ts",
-    "deploy:dry": "bun run build && wrangler deploy --dry-run --config apps/slack-agent/dist/agentic_slack/wrangler.json",
+    "deploy:dry": "CLOUDFLARE_ENV=staging bun run build && wrangler deploy --dry-run --config apps/slack-agent/dist/agentic_slack/wrangler.json",
+    "deploy:staging": "CLOUDFLARE_ENV=staging bun run build && wrangler deploy --config apps/slack-agent/dist/agentic_slack/wrangler.json",
+    "deploy:production": "CLOUDFLARE_ENV=production bun run build && wrangler deploy --config apps/slack-agent/dist/agentic_slack/wrangler.json",
     "verify": "bun run format:check && bun run lint && bun run typecheck && bun test && bun run deploy:dry"
   },
   "devDependencies": {
