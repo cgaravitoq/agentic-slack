@@ -13,6 +13,8 @@
     "format:write": "biome format --write .",
     "lint": "oxlint . --type-aware --deny typescript/no-floating-promises",
     "manifest": "bun run apps/slack-agent/scripts/generate-manifest.ts",
+    "db:migrate": "wrangler d1 migrations apply DB --config apps/slack-agent/wrangler.jsonc --remote",
+    "db:migrate:local": "wrangler d1 migrations apply DB --config apps/slack-agent/wrangler.jsonc --local",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "build": "vite build --config apps/slack-agent/vite.config.ts",
