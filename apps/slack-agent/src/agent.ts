@@ -53,7 +53,11 @@ const initialData = v.pipe(
   v.readonly(),
 );
 
-const hasBotToken = (value: object): value is { SLACK_BOT_TOKEN: string } => {
+type WorkerEnv = typeof env;
+
+const hasBotToken = (
+  value: WorkerEnv,
+): value is { SLACK_BOT_TOKEN: string } => {
   const entry = Object.entries(value).find(
     ([key]) => key === "SLACK_BOT_TOKEN",
   );

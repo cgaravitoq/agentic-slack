@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { createSlackIngress } from "@agentic-slack/core";
-import type { SlackCoreBindings } from "@agentic-slack/core";
+import type {
+  ConversationLifecycleAgent,
+  SlackCoreBindings,
+} from "@agentic-slack/core";
+import * as v from "valibot";
 
 const trusted = {
   appId: "A123",
@@ -37,18 +41,20 @@ class FakeD1 {
   }
 }
 
-const hasBindings = (value: object): value is SlackCoreBindings => {
-  const field = (key: string): unknown =>
-    Object.entries(value).find(([entryKey]) => entryKey === key)?.[1];
-  return (
-    typeof field("AI") === "object" &&
-    field("AI") !== null &&
-    typeof field("DB") === "object" &&
-    field("DB") !== null &&
-    typeof field("FLUE_SLACK_AGENT_AGENT") === "object" &&
-    field("FLUE_SLACK_AGENT_AGENT") !== null
-  );
-};
+const workerBindings = v.object({
+  AI: v.custom<Ai>(
+    (value): value is Ai => value !== null && typeof value === "object",
+  ),
+  DB: v.custom<D1Database>(
+    (value): value is D1Database => value !== null && typeof value === "object",
+  ),
+  FLUE_SLACK_AGENT_AGENT: v.custom<
+    DurableObjectNamespace<ConversationLifecycleAgent>
+  >(
+    (value): value is DurableObjectNamespace<ConversationLifecycleAgent> =>
+      value !== null && typeof value === "object",
+  ),
+});
 
 const testBindings = (db: FakeD1): SlackCoreBindings => {
   const value = {
@@ -56,13 +62,38 @@ const testBindings = (db: FakeD1): SlackCoreBindings => {
     DB: db,
     FLUE_SLACK_AGENT_AGENT: {},
   };
-  if (!hasBindings(value)) {
+  if (!v.is(workerBindings, value)) {
     throw new Error("Invalid test bindings");
   }
   return value;
 };
 
-const signedRequest = async (payload: object): Promise<Request> => {
+interface EventOverrides {
+  readonly bot_id?: string;
+  readonly text?: string;
+  readonly thread_ts?: string;
+}
+
+const eventEnvelope = v.object({
+  api_app_id: v.string(),
+  event: v.object({
+    bot_id: v.optional(v.string()),
+    channel: v.string(),
+    channel_type: v.optional(v.string()),
+    subtype: v.optional(v.string()),
+    text: v.optional(v.string()),
+    thread_ts: v.optional(v.string()),
+    ts: v.string(),
+    type: v.string(),
+    user: v.string(),
+  }),
+  event_id: v.string(),
+  team_id: v.string(),
+  type: v.string(),
+});
+type EventEnvelope = v.InferOutput<typeof eventEnvelope>;
+
+const signedRequest = async (payload: EventEnvelope): Promise<Request> => {
   const body = JSON.stringify(payload);
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const key = await crypto.subtle.importKey(
@@ -91,7 +122,7 @@ const signedRequest = async (payload: object): Promise<Request> => {
   });
 };
 
-const event = (overrides: Record<string, unknown> = {}) => ({
+const event = (overrides: EventOverrides = {}) => ({
   api_app_id: "A123",
   event: {
     channel: "C123",

@@ -12,13 +12,18 @@ import { SlackAgent } from "./agent.ts";
 import { createApp } from "./app.ts";
 
 const workerBindings = v.object({
-  AI: v.custom<Ai>((value) => value !== null && typeof value === "object"),
+  AI: v.custom<Ai>(
+    (value): value is Ai => value !== null && typeof value === "object",
+  ),
   DB: v.custom<D1Database>(
-    (value) => value !== null && typeof value === "object",
+    (value): value is D1Database => value !== null && typeof value === "object",
   ),
   FLUE_SLACK_AGENT_AGENT: v.custom<
     DurableObjectNamespace<ConversationLifecycleAgent>
-  >((value) => value !== null && typeof value === "object"),
+  >(
+    (value): value is DurableObjectNamespace<ConversationLifecycleAgent> =>
+      value !== null && typeof value === "object",
+  ),
   SLACK_APP_ID: v.string(),
   SLACK_BOT_TOKEN: v.string(),
   SLACK_SIGNING_SECRET: v.string(),

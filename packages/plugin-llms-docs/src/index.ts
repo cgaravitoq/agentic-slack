@@ -189,11 +189,11 @@ const parseIndex = (text: string, origin: URL): readonly LlmsDocument[] => {
       throw new Error("llms.txt contains a duplicate document URL");
     }
     urls.add(normalized);
-    documents.push({
-      title,
-      ...(note !== undefined && note !== "" ? { note } : {}),
-      url: normalized,
-    });
+    documents.push(
+      note !== undefined && note !== ""
+        ? { note, title, url: normalized }
+        : { title, url: normalized },
+    );
   }
   if (!h1) {
     throw new Error("llms.txt requires an H1 title");

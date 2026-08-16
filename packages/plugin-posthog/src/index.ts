@@ -97,10 +97,19 @@ const normalizeCredentials = (
   };
 };
 
+interface ResolvedRange {
+  readonly start: string;
+  readonly end: string;
+}
+
+interface QueryContract {
+  readonly columns: readonly string[];
+}
+
 const resolveRange = (
   requested: v.InferOutput<typeof input>["timeRange"],
   now: () => number,
-): { start: string; end: string } => {
+): ResolvedRange => {
   const end = requested.kind === "relative" ? now() : Date.parse(requested.end);
   const start =
     requested.kind === "relative"
@@ -168,7 +177,7 @@ const assertValidAliases = (columns: readonly string[]): void => {
   }
 };
 
-const assertQuery = (query: string): { columns: readonly string[] } => {
+const assertQuery = (query: string): QueryContract => {
   if (!/^SELECT\s+/iu.test(query) || /;|--|\/\*|\*\/|#/u.test(query)) {
     throw new Error("Invalid query");
   }
@@ -255,11 +264,18 @@ const assertPresentation = (
   }
 };
 
-const safeCell = (value: unknown): value is string | number | boolean | null =>
-  value === null ||
-  (typeof value === "number" && Number.isFinite(value)) ||
-  typeof value === "boolean" ||
-  (typeof value === "string" && value.length <= MAX_CELL_LENGTH);
+const cell = v.union([
+  v.null(),
+  v.pipe(v.number(), v.finite()),
+  v.boolean(),
+  v.pipe(v.string(), v.maxLength(MAX_CELL_LENGTH)),
+]);
+
+const responseSchema = v.object({
+  columns: v.array(v.string()),
+  results: v.pipe(v.array(v.array(cell)), v.maxLength(MAX_ROWS)),
+});
+type ParsedResponse = v.InferOutput<typeof responseSchema>;
 
 const same = (
   actual: readonly string[],
@@ -267,39 +283,6 @@ const same = (
 ): boolean =>
   actual.length === expected.length &&
   actual.every((value, index) => value === expected[index]);
-
-const parseResponse = (value: unknown, expectedColumns: readonly string[]) => {
-  if (
-    value === null ||
-    value === undefined ||
-    typeof value !== "object" ||
-    Array.isArray(value)
-  ) {
-    throw new Error("Malformed response");
-  }
-  const response = value as { columns?: unknown; results?: unknown };
-  if (
-    !Array.isArray(response.columns) ||
-    !response.columns.every((column) => typeof column === "string") ||
-    !same(response.columns, expectedColumns) ||
-    !Array.isArray(response.results) ||
-    response.results.length > MAX_ROWS
-  ) {
-    throw new Error("Unexpected response");
-  }
-  const rows = response.results.map((row) => {
-    if (!Array.isArray(row) || row.length !== expectedColumns.length) {
-      throw new Error("Unsafe response cell");
-    }
-    return row.map((cell) => {
-      if (!safeCell(cell)) {
-        throw new Error("Unsafe response cell");
-      }
-      return cell;
-    });
-  });
-  return { columns: response.columns, rows };
-};
 
 const concat = (chunks: readonly Uint8Array[], size: number): Uint8Array => {
   const combined = new Uint8Array(size);
@@ -311,7 +294,10 @@ const concat = (chunks: readonly Uint8Array[], size: number): Uint8Array => {
   return combined;
 };
 
-const readJson = async (response: Response): Promise<unknown> => {
+const readJson = async (
+  response: Response,
+  expectedColumns: readonly string[],
+): Promise<ParsedResponse> => {
   if (!response.body) {
     throw new Error("Missing response body");
   }
@@ -326,7 +312,14 @@ const readJson = async (response: Response): Promise<unknown> => {
     chunks.push(chunk);
   }
   const text = new TextDecoder().decode(concat(chunks, size));
-  return JSON.parse(text) as unknown;
+  const parsed = v.parse(responseSchema, JSON.parse(text));
+  if (
+    !same(parsed.columns, expectedColumns) ||
+    parsed.results.some((row) => row.length !== expectedColumns.length)
+  ) {
+    throw new Error("Unexpected response");
+  }
+  return parsed;
 };
 
 const createQueryTool = (
@@ -369,16 +362,13 @@ const createQueryTool = (
         ) {
           return unavailable();
         }
-        const parsed = parseResponse(
-          await readJson(response),
-          contract.columns,
-        );
+        const parsed = await readJson(response, contract.columns);
         return {
           output: {
             columns: parsed.columns,
             dataTrust: "untrusted_analytics_data",
             presentation: data.presentation,
-            rows: parsed.rows,
+            rows: parsed.results,
             status: "ok",
           },
         };

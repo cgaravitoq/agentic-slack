@@ -1,19 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import type { SlackCoreBindings } from "@agentic-slack/core";
+import type { ConversationLifecycleAgent } from "@agentic-slack/core";
+import * as v from "valibot";
 import { createApp } from "../src/app.ts";
 
-const hasBindings = (value: object): value is SlackCoreBindings => {
-  const field = (key: string): unknown =>
-    Object.entries(value).find(([entryKey]) => entryKey === key)?.[1];
-  return (
-    typeof field("AI") === "object" &&
-    field("AI") !== null &&
-    typeof field("DB") === "object" &&
-    field("DB") !== null &&
-    typeof field("FLUE_SLACK_AGENT_AGENT") === "object" &&
-    field("FLUE_SLACK_AGENT_AGENT") !== null
-  );
-};
+const workerBindings = v.object({
+  AI: v.custom<Ai>(
+    (value): value is Ai => value !== null && typeof value === "object",
+  ),
+  DB: v.custom<D1Database>(
+    (value): value is D1Database => value !== null && typeof value === "object",
+  ),
+  FLUE_SLACK_AGENT_AGENT: v.custom<
+    DurableObjectNamespace<ConversationLifecycleAgent>
+  >(
+    (value): value is DurableObjectNamespace<ConversationLifecycleAgent> =>
+      value !== null && typeof value === "object",
+  ),
+});
 
 const trusted = {
   appId: "app-id",
@@ -30,7 +33,7 @@ describe("GET /health", () => {
       DB: {},
       FLUE_SLACK_AGENT_AGENT: {},
     };
-    if (!hasBindings(rawBindings)) {
+    if (!v.is(workerBindings, rawBindings)) {
       throw new Error("Invalid test bindings");
     }
     const bindings = rawBindings;

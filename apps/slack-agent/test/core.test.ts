@@ -41,7 +41,11 @@ const terminalTool = () =>
 
 const createTools = () => [];
 
-const isD1Database = (value: object): value is D1Database => {
+interface PrepareStatementDouble {
+  readonly prepare?: unknown;
+}
+
+const isD1Database = (value: PrepareStatementDouble): value is D1Database => {
   const entry = Object.entries(value).find(([key]) => key === "prepare");
   return typeof entry?.[1] === "function";
 };
@@ -361,10 +365,21 @@ describe("terminal Slack delivery", () => {
       authorization: "Bearer xoxb-trusted-token",
       "content-type": "application/json; charset=utf-8",
     });
-    if (typeof request.init?.body !== "string") {
+    if (!v.is(v.string(), request.init?.body)) {
       throw new TypeError("Expected JSON body");
     }
-    expect(JSON.parse(request.init.body)).toEqual({
+    expect(
+      v.parse(
+        v.object({
+          channel: v.string(),
+          text: v.string(),
+          thread_ts: v.string(),
+          unfurl_links: v.boolean(),
+          unfurl_media: v.boolean(),
+        }),
+        JSON.parse(request.init.body),
+      ),
+    ).toEqual({
       channel: "C123",
       text: "&lt;@U999> [secret] [internal configuration]\n\nDone",
       thread_ts: "171.2",
@@ -379,7 +394,7 @@ describe("terminal Slack delivery", () => {
       { channelId: "C123", threadTs: "171.2" },
       "xoxb-trusted-token",
       (_input, init) => {
-        if (typeof init?.body !== "string") {
+        if (!v.is(v.string(), init?.body)) {
           return Promise.reject(new Error("Expected JSON body"));
         }
         delivered = v.parse(
@@ -426,8 +441,8 @@ describe("D1 claim lifecycle", () => {
       prepare(sql: string) {
         let eventId = "";
         return {
-          bind(value: unknown) {
-            eventId = String(value);
+          bind(...values: unknown[]) {
+            eventId = String(values[0]);
             return this;
           },
           run() {

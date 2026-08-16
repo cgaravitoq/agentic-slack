@@ -61,7 +61,13 @@ const runtime = () => ({
 const tool = (fetcher: PostHogFetcher) =>
   composeTools(config(fetcher), runtime(), terminalTool())[0];
 
-const run = async (fetcher: PostHogFetcher, data: Record<string, unknown>) =>
+interface QueryInput {
+  readonly presentation: unknown;
+  readonly query: string;
+  readonly timeRange: unknown;
+}
+
+const run = async (fetcher: PostHogFetcher, data: QueryInput) =>
   await tool(fetcher).run({
     data,
     log: noopLogger,
