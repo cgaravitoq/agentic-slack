@@ -5,7 +5,14 @@ import {
   defineAgentConfig,
 } from "@agentic-slack/core";
 import { defineTool } from "@flue/runtime/tool";
+import type { FlueLogger } from "@flue/runtime";
 import { createLlmsDocsPlugin } from "../src/index.ts";
+
+const noopLogger: FlueLogger = {
+  error() {},
+  info() {},
+  warn() {},
+};
 
 const index = `# Example Docs
 
@@ -20,52 +27,74 @@ const index = `# Example Docs
 
 - [FAQ](/docs/faq.md)`;
 
-function response(body: string | Uint8Array, contentType = "text/plain") {
-  return new Response(body, { headers: { "content-type": contentType } });
-}
+const response = (body: string | Uint8Array, contentType = "text/plain") =>
+  Promise.resolve(
+    new Response(body, { headers: { "content-type": contentType } }),
+  );
 
-function tool(plugin: ReturnType<typeof createLlmsDocsPlugin>, name: string) {
+const tool = (
+  plugin: ReturnType<typeof createLlmsDocsPlugin>,
+  name: string,
+) => {
   const found = plugin
     .createTools?.({})
     .find((candidate) => candidate.name === name);
-  if (!found) throw new Error(`Missing ${name}`);
+  if (!found) {
+    throw new Error(`Missing ${name}`);
+  }
   return found;
-}
+};
 
-async function run(
+const run = async (
   toolDefinition: ReturnType<typeof tool>,
   data: Record<string, string>,
-) {
-  return Promise.resolve(
-    toolDefinition.run({ data } as Parameters<typeof toolDefinition.run>[0]),
-  );
-}
+) =>
+  await toolDefinition.run({
+    data,
+    log: noopLogger,
+    toolCallId: "test-call",
+  });
 
-async function expectRejection(
+const expectRejection = async (
   action: Promise<unknown>,
   expectedMessage?: string,
-) {
+) => {
   try {
     await action;
   } catch (error) {
     expect(error).toBeInstanceOf(Error);
-    if (expectedMessage)
-      expect((error as Error).message).toContain(expectedMessage);
+    if (
+      error instanceof Error &&
+      expectedMessage !== undefined &&
+      expectedMessage !== ""
+    ) {
+      expect(error.message).toContain(expectedMessage);
+    }
     return;
   }
   throw new Error("Expected promise to reject");
-}
+};
 
 const originalFetch = globalThis.fetch;
+
+const requestUrl = (input: RequestInfo | URL): string => {
+  if (input instanceof Request) {
+    return input.url;
+  }
+  if (input instanceof URL) {
+    return input.href;
+  }
+  return input;
+};
 
 type FetchHandler = (
   input: Parameters<typeof fetch>[0],
   init?: Parameters<typeof fetch>[1],
 ) => Promise<Response>;
 
-function setFetch(handler: FetchHandler) {
-  globalThis.fetch = handler as unknown as typeof fetch;
-}
+const setFetch = (handler: FetchHandler) => {
+  Reflect.set(globalThis, "fetch", handler);
+};
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
@@ -74,14 +103,8 @@ afterEach(() => {
 describe("llms documentation plugin", () => {
   test("uses the Flue tool seam to parse, rank, label, and source index evidence", async () => {
     const requests: Request[] = [];
-    setFetch(async (input, init) => {
-      const request = new Request(
-        input instanceof Request
-          ? input.url
-          : input instanceof URL
-            ? input.href
-            : input,
-      );
+    setFetch((input, init) => {
+      const request = new Request(requestUrl(input));
       requests.push(request);
       expect(request.url).toBe("https://docs.example.com/llms.txt");
       expect(init?.redirect).toBe("manual");
@@ -104,16 +127,16 @@ describe("llms documentation plugin", () => {
       output: {
         documents: [
           {
-            title: "Install guide",
             note: "Install the package safely",
-            url: "https://docs.example.com/docs/install.md",
+            title: "Install guide",
             untrusted: true,
+            url: "https://docs.example.com/docs/install.md",
           },
           {
-            title: "API reference",
             note: "API methods",
-            url: "https://docs.example.com/docs/api.md",
+            title: "API reference",
             untrusted: true,
+            url: "https://docs.example.com/docs/api.md",
           },
         ],
       },
@@ -122,7 +145,7 @@ describe("llms documentation plugin", () => {
   });
 
   test("accepts a required H1 without lists as an empty search result", async () => {
-    setFetch(async () => response("\uFEFF# Empty Docs\n"));
+    setFetch(() => response("\uFEFF# Empty Docs\n"));
     const result = await run(
       tool(
         createLlmsDocsPlugin({ origin: "https://docs.example.com" }),
@@ -135,20 +158,16 @@ describe("llms documentation plugin", () => {
 
   test("refreshes the index before reading and only reads its same-origin authorized URL", async () => {
     const requests: Request[] = [];
-    setFetch(async (input, _init) => {
-      const request = new Request(
-        input instanceof Request
-          ? input.url
-          : input instanceof URL
-            ? input.href
-            : input,
-      );
+    setFetch((input, _init) => {
+      const request = new Request(requestUrl(input));
       requests.push(request);
-      if (request.url === "https://docs.example.com/llms.txt")
+      if (request.url === "https://docs.example.com/llms.txt") {
         return response(index);
-      if (request.url === "https://docs.example.com/docs/install.md")
+      }
+      if (request.url === "https://docs.example.com/docs/install.md") {
         return response("# Install\n\nUntrusted facts.", "text/markdown");
-      throw new Error(`Unexpected request ${request.url}`);
+      }
+      return Promise.reject(new Error(`Unexpected request ${request.url}`));
     });
     const read = tool(
       createLlmsDocsPlugin({ origin: "https://docs.example.com" }),
@@ -191,75 +210,78 @@ describe("llms documentation plugin", () => {
       "# Docs\n\n## Links\n\n- malformed",
       "No title",
     ];
-    for (const invalid of cases) {
-      setFetch(async () => response(invalid));
-      await expectRejection(
-        run(
-          tool(
-            createLlmsDocsPlugin({ origin: "https://docs.example.com" }),
-            "search_docs",
+    await Promise.all(
+      cases.map((invalid) => {
+        setFetch(() => response(invalid));
+        return expectRejection(
+          run(
+            tool(
+              createLlmsDocsPlugin({ origin: "https://docs.example.com" }),
+              "search_docs",
+            ),
+            { query: "doc" },
           ),
-          { query: "doc" },
-        ),
-      );
-    }
+        );
+      }),
+    );
   });
 
   test("rejects redirects, content types, invalid UTF-8, oversized bodies, and timeouts", async () => {
     const search = tool(
       createLlmsDocsPlugin({
+        indexMaxBytes: 10,
         origin: "https://docs.example.com",
         timeoutMs: 1,
-        indexMaxBytes: 10,
       }),
       "search_docs",
     );
-    setFetch(
-      async () =>
+    setFetch(() =>
+      Promise.resolve(
         new Response(null, {
-          status: 302,
           headers: { location: "/next" },
+          status: 302,
         }),
+      ),
     );
     await expectRejection(run(search, { query: "docs" }), "redirects");
-    setFetch(async () => response(index, "text/html"));
+    setFetch(() => response(index, "text/html"));
     await expectRejection(run(search, { query: "docs" }), "content type");
-    setFetch(async () => response(new Uint8Array([0xff]), "text/plain"));
-    await expectRejection(run(search, { query: "docs" }), "UTF-8");
-    setFetch(async () => response("# This is too long", "text/plain"));
+    setFetch(() => response(new Uint8Array([0xff]), "text/plain"));
+    await expectRejection(run(search, { query: "docs" }), "utf-8");
+    setFetch(() => response("# This is too long", "text/plain"));
     await expectRejection(run(search, { query: "docs" }), "byte limit");
-    setFetch(
-      (_input, init) =>
-        new Promise((_resolve, reject) =>
-          init?.signal?.addEventListener("abort", () =>
-            reject(new DOMException("Timed out", "AbortError")),
-          ),
-        ),
-    );
+    setFetch((_input, init) => {
+      const { promise, reject } = Promise.withResolvers<Response>();
+      init?.signal?.addEventListener("abort", () => {
+        reject(new DOMException("Timed out", "AbortError"));
+      });
+      return promise;
+    });
     await expectRejection(run(search, { query: "docs" }), "Timed out");
   });
 
   test("cancels a chunked body as soon as it crosses the byte limit", async () => {
     let cancelled = false;
     const stream = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled = true;
+      },
       start(controller) {
         controller.enqueue(new TextEncoder().encode("# Docs\n"));
         controller.enqueue(new TextEncoder().encode("overflow"));
       },
-      cancel() {
-        cancelled = true;
-      },
     });
-    setFetch(
-      async () =>
+    setFetch(() =>
+      Promise.resolve(
         new Response(stream, {
           headers: { "content-type": "text/plain" },
         }),
+      ),
     );
     const search = tool(
       createLlmsDocsPlugin({
-        origin: "https://docs.example.com",
         indexMaxBytes: 8,
+        origin: "https://docs.example.com",
       }),
       "search_docs",
     );
@@ -270,37 +292,40 @@ describe("llms documentation plugin", () => {
   test("cancels an invalid UTF-8 stream that remains open", async () => {
     let cancelled = false;
     const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new Uint8Array([0xff]));
-      },
       cancel() {
         cancelled = true;
       },
+      start(controller) {
+        controller.enqueue(new Uint8Array([0xff]));
+      },
     });
-    setFetch(
-      async () =>
+    setFetch(() =>
+      Promise.resolve(
         new Response(stream, {
           headers: { "content-type": "text/plain" },
         }),
+      ),
     );
     const search = tool(
       createLlmsDocsPlugin({ origin: "https://docs.example.com" }),
       "search_docs",
     );
-    await expectRejection(run(search, { query: "docs" }), "UTF-8");
+    await expectRejection(run(search, { query: "docs" }), "utf-8");
     expect(cancelled).toBe(true);
   });
 
-  test("keeps factory execution and network access lazy through static config and manifest composition", async () => {
+  test("keeps factory execution and network access lazy through static config and manifest composition", () => {
     let networkCalls = 0;
-    setFetch(async () => {
+    setFetch(() => {
       networkCalls += 1;
-      throw new Error("Network access is runtime-only");
+      return Promise.resolve(
+        Promise.reject(new Error("Network access is runtime-only")),
+      );
     });
     const plugin = createLlmsDocsPlugin({ origin: "https://docs.example.com" });
     const config = defineAgentConfig({
-      name: "Docs Agent",
       description: "Uses optional documentation.",
+      name: "Docs Agent",
       ownerInstructions: "Owner instructions come first.",
       plugins: [plugin],
     });
@@ -317,10 +342,10 @@ describe("llms documentation plugin", () => {
         config,
         {},
         defineTool({
-          name: "reply_in_slack",
           description: "Reply",
-          async run() {
-            return { terminate: true };
+          name: "reply_in_slack",
+          run() {
+            return Promise.resolve(Promise.resolve({ terminate: true }));
           },
         }),
       ),

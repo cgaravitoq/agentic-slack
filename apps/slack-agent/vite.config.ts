@@ -3,12 +3,12 @@ import { flue, flueWorkerConfig } from "@flue/vite";
 import { defineConfig } from "vite";
 
 export default defineConfig({
-  root: import.meta.dirname,
   plugins: [
     flue(),
     cloudflare({
-      configPath: "wrangler.jsonc",
       config: flueWorkerConfig(),
+      configPath: "wrangler.jsonc",
     }),
   ],
+  root: import.meta.dirname,
 });

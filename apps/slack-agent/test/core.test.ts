@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
+import type { FlueLogger } from "@flue/runtime";
 import { defineTool } from "@flue/runtime/tool";
 import * as v from "valibot";
 
@@ -29,73 +30,86 @@ interface TestRuntimeContext {
   };
 }
 
-function terminalTool() {
-  return defineTool({
-    name: CORE_REPLY_TOOL_NAME,
+const terminalTool = () =>
+  defineTool({
     description: "Reply.",
-    async run() {
-      return { output: "posted", terminate: true };
+    name: CORE_REPLY_TOOL_NAME,
+    run() {
+      return Promise.resolve({ output: "posted", terminate: true });
     },
   });
-}
 
-function createTestPlugin(factoryCalls: string[], toolCalls: string[]) {
-  return {
-    id: "test-search",
-    kind: "plugin" as const,
-    instructions: ["Use test search for exact lookups."],
-    createTools(context: TestRuntimeContext) {
-      factoryCalls.push("plugin");
-      const secret = context.bindings.pluginSecret;
-      return [
-        defineTool({
-          name: "test_search",
-          description: "Search the configured test source.",
-          input: v.object({ query: v.string() }),
-          output: v.string(),
-          async run({ data }) {
-            toolCalls.push(`${secret}:${data.query}`);
-            return { output: "search complete" };
-          },
-        }),
-      ];
-    },
-  };
-}
+const createTools = () => [];
 
-function createTestAddon(factoryCalls: string[], toolCalls: string[]) {
-  return {
-    id: "test-triage",
-    kind: "addon" as const,
-    instructions: ["Triage requests after gathering facts."],
-    createTools(context: TestRuntimeContext) {
-      factoryCalls.push("addon");
-      const route = context.bindings.addonRoute;
-      return [
-        defineTool({
-          name: "test_triage",
-          description: "Classify one test request.",
-          input: v.object({ request: v.string() }),
-          output: v.string(),
-          async run({ data }) {
-            toolCalls.push(`${route}:${data.request}`);
-            return { output: "triage complete" };
-          },
-        }),
-      ];
-    },
-  };
-}
+const isD1Database = (value: object): value is D1Database => {
+  const entry = Object.entries(value).find(([key]) => key === "prepare");
+  return typeof entry?.[1] === "function";
+};
+
+const noopLogger: FlueLogger = {
+  error() {},
+  info() {},
+  warn() {},
+};
+const runContext = <T>(data: T) => ({
+  data,
+  log: noopLogger,
+  toolCallId: "test-call",
+});
+
+const createTestPlugin = (factoryCalls: string[], toolCalls: string[]) => ({
+  createTools(context: TestRuntimeContext) {
+    factoryCalls.push("plugin");
+    const secret = context.bindings.pluginSecret;
+    return [
+      defineTool({
+        description: "Search the configured test source.",
+        input: v.object({ query: v.string() }),
+        name: "test_search",
+        output: v.string(),
+        run({ data }) {
+          toolCalls.push(`${secret}:${data.query}`);
+          return Promise.resolve({ output: "search complete" });
+        },
+      }),
+    ];
+  },
+  id: "test-search",
+  instructions: ["Use test search for exact lookups."],
+  kind: "plugin" as const,
+});
+
+const createTestAddon = (factoryCalls: string[], toolCalls: string[]) => ({
+  createTools(context: TestRuntimeContext) {
+    factoryCalls.push("addon");
+    const route = context.bindings.addonRoute;
+    return [
+      defineTool({
+        description: "Classify one test request.",
+        input: v.object({ request: v.string() }),
+        name: "test_triage",
+        output: v.string(),
+        run({ data }) {
+          toolCalls.push(`${route}:${data.request}`);
+          return Promise.resolve({ output: "triage complete" });
+        },
+      }),
+    ];
+  },
+  id: "test-triage",
+  instructions: ["Triage requests after gathering facts."],
+  kind: "addon" as const,
+});
 
 const config = defineAgentConfig({
-  name: "Neutral Agent",
   description: "Answers Slack conversations.",
+  name: "Neutral Agent",
   ownerInstructions: "Prefer short answers.",
 });
 
 describe("neutral core composition", () => {
   test("applies neutral defaults and fixes the Workers AI model", () => {
-    expect(config.retention).toEqual({ privateDays: 7, channelDays: 15 });
+    expect(config.retention).toEqual({ channelDays: 15, privateDays: 7 });
     expect(PRIVATE_RETENTION_DAYS).toBe(7);
     expect(CHANNEL_RETENTION_DAYS).toBe(15);
     expect(MODEL).toBe("cloudflare/@cf/zai-org/glm-4.7-flash");
@@ -125,17 +139,17 @@ describe("neutral core composition", () => {
   test("resolves config and manifests without invoking runtime factories", async () => {
     let factoryCalls = 0;
     const staticConfig = defineAgentConfig({
-      name: "Static Agent",
       description: "Imports without Worker runtime.",
+      name: "Static Agent",
       ownerInstructions: "Keep runtime values private.",
       plugins: [
         {
-          id: "runtime-only",
-          kind: "plugin",
           createTools() {
             factoryCalls += 1;
             throw new Error("Factory must not run during static resolution");
           },
+          id: "runtime-only",
+          kind: "plugin",
         },
       ],
     });
@@ -154,7 +168,7 @@ describe("neutral core composition", () => {
         ),
         "https://agent.example.com",
       ],
-      { stdout: "pipe", stderr: "pipe" },
+      { stderr: "pipe", stdout: "pipe" },
     );
     expect(await manifestProcess.exited).toBe(0);
     expect(await new Response(manifestProcess.stdout).text()).toContain(
@@ -168,11 +182,11 @@ describe("neutral core composition", () => {
     const pluginSecret = "plugin-secret-value";
     const addonRoute = "private-addon-route";
     const extensionConfig = defineAgentConfig<TestRuntimeContext>({
-      name: "Extended Agent",
+      addons: [createTestAddon(factoryCalls, toolCalls)],
       description: "Uses static extensions.",
+      name: "Extended Agent",
       ownerInstructions: "Follow the owner's preferences.",
       plugins: [createTestPlugin(factoryCalls, toolCalls)],
-      addons: [createTestAddon(factoryCalls, toolCalls)],
     });
     const terminal = terminalTool();
     const instructions = composeInstructions(extensionConfig);
@@ -181,7 +195,7 @@ describe("neutral core composition", () => {
     expect(JSON.stringify(extensionConfig)).not.toContain(addonRoute);
     const tools = composeTools(
       extensionConfig,
-      { bindings: { pluginSecret, addonRoute } },
+      { bindings: { addonRoute, pluginSecret } },
       terminal,
     );
 
@@ -200,20 +214,16 @@ describe("neutral core composition", () => {
     const modelVisible = JSON.stringify({
       instructions,
       tools: tools.map(({ name, description, input }) => ({
-        name,
         description,
         input,
+        name,
       })),
     });
     expect(modelVisible).not.toContain(pluginSecret);
     expect(modelVisible).not.toContain(addonRoute);
 
-    await tools[0]?.run({ data: { query: "invoice" } } as Parameters<
-      (typeof tools)[number]["run"]
-    >[0]);
-    await tools[1]?.run({ data: { request: "refund" } } as Parameters<
-      (typeof tools)[number]["run"]
-    >[0]);
+    await tools[0]?.run(runContext({ query: "invoice" }));
+    await tools[1]?.run(runContext({ request: "refund" }));
     expect(toolCalls).toEqual([
       `${pluginSecret}:invoice`,
       `${addonRoute}:refund`,
@@ -223,32 +233,32 @@ describe("neutral core composition", () => {
   test("rejects duplicate extension ids across kinds and reply tool shadowing", () => {
     expect(() =>
       defineAgentConfig({
-        name: "Duplicate Agent",
+        addons: [{ id: "shared", kind: "addon" }],
         description: "Rejects duplicates.",
+        name: "Duplicate Agent",
         ownerInstructions: "Be concise.",
         plugins: [{ id: "shared", kind: "plugin" }],
-        addons: [{ id: "shared", kind: "addon" }],
       }),
     ).toThrow("Duplicate agent extension id: shared");
     const shadowConfig = defineAgentConfig({
-      name: "Shadow Agent",
       description: "Rejects reply shadowing.",
+      name: "Shadow Agent",
       ownerInstructions: "Be concise.",
       plugins: [
         {
-          id: "shadow",
-          kind: "plugin",
           createTools() {
             return [
               defineTool({
-                name: CORE_REPLY_TOOL_NAME,
                 description: "Shadow reply.",
-                async run() {
-                  return "shadowed";
+                name: CORE_REPLY_TOOL_NAME,
+                run() {
+                  return Promise.resolve("shadowed");
                 },
               }),
             ];
           },
+          id: "shadow",
+          kind: "plugin",
         },
       ],
     });
@@ -259,24 +269,23 @@ describe("neutral core composition", () => {
 
   test("copies and freezes resolved extension collections", () => {
     const instructions = ["Original plugin instruction."];
-    const createTools = () => [];
     const plugins = [
-      { id: "mutable", kind: "plugin" as const, instructions, createTools },
+      { createTools, id: "mutable", instructions, kind: "plugin" as const },
     ];
     const immutableConfig = defineAgentConfig({
-      name: "Immutable Agent",
+      addons: [{ id: "empty", kind: "addon" }],
       description: "Freezes extensions.",
+      name: "Immutable Agent",
       ownerInstructions: "Keep definitions stable.",
       plugins,
-      addons: [{ id: "empty", kind: "addon" }],
     });
 
     instructions.push("Late instruction.");
     plugins.push({
-      id: "late",
-      kind: "plugin",
-      instructions: [],
       createTools,
+      id: "late",
+      instructions: [],
+      kind: "plugin",
     });
 
     expect(immutableConfig.plugins).toHaveLength(1);
@@ -285,9 +294,9 @@ describe("neutral core composition", () => {
     ]);
     expect(immutableConfig.plugins[0]?.createTools).toBe(createTools);
     expect(immutableConfig.addons[0]).toMatchObject({
+      createTools: undefined,
       id: "empty",
       instructions: [],
-      createTools: undefined,
     });
     expect(Object.isFrozen(immutableConfig.plugins)).toBe(true);
     expect(Object.isFrozen(immutableConfig.addons)).toBe(true);
@@ -300,10 +309,10 @@ describe("neutral core composition", () => {
   test("rejects empty extension instructions", () => {
     expect(() =>
       defineAgentConfig({
-        name: "Invalid Agent",
+        addons: [{ id: "invalid", instructions: [" "], kind: "addon" }],
         description: "Rejects empty instructions.",
+        name: "Invalid Agent",
         ownerInstructions: "Be concise.",
-        addons: [{ id: "invalid", kind: "addon", instructions: [" "] }],
       }),
     ).toThrow("Agent extension invalid requires non-empty instructions");
   });
@@ -311,38 +320,34 @@ describe("neutral core composition", () => {
 
 describe("terminal Slack delivery", () => {
   test("joins text blocks and ignores thinking and tool calls", () => {
-    expect(
-      extractAssistantText([
-        { type: "text", text: "First" },
-        { type: "thinking", thinking: "hidden reasoning" },
-        { type: "text", text: "Second" },
-        { type: "toolCall", id: "c1", name: "x", arguments: {} },
-      ] as readonly { type: string; text?: string }[]),
-    ).toBe("First\nSecond");
+    const content = [
+      { text: "First", type: "text" },
+      { thinking: "hidden reasoning", type: "thinking" },
+      { text: "Second", type: "text" },
+      { arguments: {}, id: "c1", name: "x", type: "toolCall" },
+    ];
+    expect(extractAssistantText(content)).toBe("First\nSecond");
   });
 
   test("returns an empty string for empty or undefined content", () => {
-    expect(extractAssistantText(undefined)).toBe("");
+    expect(extractAssistantText()).toBe("");
     expect(extractAssistantText([])).toBe("");
-    expect(extractAssistantText([{ type: "text", text: "" }])).toBe("");
+    expect(extractAssistantText([{ text: "", type: "text" }])).toBe("");
   });
 
   test("binds destination and credential, sanitizes text, and posts once", async () => {
-    const requests: Array<{ input: RequestInfo | URL; init?: RequestInit }> =
-      [];
+    const requests: { input: RequestInfo | URL; init?: RequestInit }[] = [];
     const tool = createReplyTool(
       { channelId: "C123", threadTs: "171.2" },
       "xoxb-trusted-token",
-      async (input, init) => {
-        requests.push({ input, init });
-        return Response.json({ ok: true, ts: "171.3" });
+      (input, init) => {
+        requests.push({ init, input });
+        return Promise.resolve(Response.json({ ok: true, ts: "171.3" }));
       },
     );
-    const input = {
-      data: {
-        text: "<!channel> <@U999> xoxb-leaked SIGNING_SECRET=oops\n\n\nDone",
-      },
-    } as Parameters<typeof tool.run>[0];
+    const input = runContext({
+      text: "<!channel> <@U999> xoxb-leaked SIGNING_SECRET=oops\n\n\nDone",
+    });
 
     expect(await tool.run(input)).toEqual({
       output: "posted",
@@ -350,18 +355,19 @@ describe("terminal Slack delivery", () => {
     });
     expect(await tool.run(input)).toEqual({ output: "already posted" });
     expect(requests).toHaveLength(1);
-    const request = requests[0];
+    const [request] = requests;
     expect(request.input).toBe("https://slack.com/api/chat.postMessage");
     expect(request.init?.headers).toMatchObject({
       authorization: "Bearer xoxb-trusted-token",
       "content-type": "application/json; charset=utf-8",
     });
-    if (typeof request.init?.body !== "string")
-      throw new Error("Expected JSON body");
+    if (typeof request.init?.body !== "string") {
+      throw new TypeError("Expected JSON body");
+    }
     expect(JSON.parse(request.init.body)).toEqual({
       channel: "C123",
-      thread_ts: "171.2",
       text: "&lt;@U999> [secret] [internal configuration]\n\nDone",
+      thread_ts: "171.2",
       unfurl_links: false,
       unfurl_media: false,
     });
@@ -372,26 +378,26 @@ describe("terminal Slack delivery", () => {
     const tool = createReplyTool(
       { channelId: "C123", threadTs: "171.2" },
       "xoxb-trusted-token",
-      async (_input, init) => {
-        if (typeof init?.body !== "string")
-          throw new Error("Expected JSON body");
-        delivered = JSON.parse(init.body).text;
-        return Response.json({ ok: true });
+      (_input, init) => {
+        if (typeof init?.body !== "string") {
+          return Promise.reject(new Error("Expected JSON body"));
+        }
+        delivered = v.parse(
+          v.object({ text: v.string() }),
+          JSON.parse(init.body),
+        ).text;
+        return Promise.resolve(Response.json({ ok: true }));
       },
     );
-    await tool.run({ data: { text: "a".repeat(4_100) } } as Parameters<
-      typeof tool.run
-    >[0]);
-    expect(delivered).toHaveLength(3_893);
+    await tool.run(runContext({ text: "a".repeat(4100) }));
+    expect(delivered).toHaveLength(3893);
     expect(delivered.endsWith("\n\n(truncated)")).toBe(true);
   });
 
   test("coalesces concurrent terminal delivery attempts", async () => {
     let posts = 0;
-    let release: (() => void) | undefined;
-    const blocked = new Promise<void>((resolve) => {
-      release = resolve;
-    });
+    const { promise: blocked, resolve: release } =
+      Promise.withResolvers<undefined>();
     const tool = createReplyTool(
       { channelId: "C123", threadTs: "171.2" },
       "xoxb-trusted-token",
@@ -401,11 +407,11 @@ describe("terminal Slack delivery", () => {
         return Response.json({ ok: true });
       },
     );
-    const input = { data: { text: "hello" } } as Parameters<typeof tool.run>[0];
+    const input = runContext({ text: "hello" });
     const first = tool.run(input);
     const second = tool.run(input);
     expect(posts).toBe(1);
-    release?.();
+    release();
     expect(await Promise.all([first, second])).toEqual([
       { output: "posted", terminate: true },
       { output: "already posted" },
@@ -424,33 +430,42 @@ describe("D1 claim lifecycle", () => {
             eventId = String(value);
             return this;
           },
-          async run() {
+          run() {
             if (sql.startsWith("INSERT")) {
-              if (seen.has(eventId)) return { meta: { changes: 0 } };
+              if (seen.has(eventId)) {
+                return Promise.resolve({ meta: { changes: 0 } });
+              }
               seen.add(eventId);
-              return { meta: { changes: 1 } };
+              return Promise.resolve({ meta: { changes: 1 } });
             }
-            if (sql.includes("WHERE event_id")) seen.delete(eventId);
-            return { meta: { changes: 1 } };
+            if (sql.includes("WHERE event_id")) {
+              seen.delete(eventId);
+            }
+            return Promise.resolve({ meta: { changes: 1 } });
           },
         };
       },
-    } as unknown as D1Database;
+    };
+    if (!isD1Database(db)) {
+      throw new Error("Invalid D1 test database");
+    }
     let failure: unknown;
     try {
-      await claimAndRun(db, "Ev-failed", async () => {
-        throw new Error("dispatch failed");
-      });
+      await claimAndRun(db, "Ev-failed", () =>
+        Promise.reject(new Error("dispatch failed")),
+      );
     } catch (error) {
       failure = error;
     }
     expect(failure).toEqual(new Error("dispatch failed"));
     let completed = 0;
-    await claimAndRun(db, "Ev-failed", async () => {
+    await claimAndRun(db, "Ev-failed", () => {
       completed += 1;
+      return Promise.resolve();
     });
-    await claimAndRun(db, "Ev-failed", async () => {
+    await claimAndRun(db, "Ev-failed", () => {
       completed += 1;
+      return Promise.resolve();
     });
     expect(completed).toBe(1);
   });
@@ -461,19 +476,19 @@ describe("sliding retention", () => {
     const calls: string[] = [];
     await replaceRetention(
       {
-        async listSchedules() {
-          return [
-            { id: "old", callback: "expireConversation", payload: {}, time: 1 },
-            { id: "other", callback: "other", payload: {}, time: 2 },
-          ];
-        },
-        async schedule(seconds, callback, payload) {
-          calls.push(`schedule:${seconds}:${callback}:${payload.surface}`);
-          return { id: "new", callback, payload, time: 3 };
-        },
-        async cancelSchedule(id) {
+        cancelSchedule(id) {
           calls.push(`cancel:${id}`);
-          return true;
+          return Promise.resolve(true);
+        },
+        listSchedules() {
+          return Promise.resolve([
+            { callback: "expireConversation", id: "old", payload: {}, time: 1 },
+            { callback: "other", id: "other", payload: {}, time: 2 },
+          ]);
+        },
+        schedule(seconds, callback, payload) {
+          calls.push(`schedule:${seconds}:${callback}:${payload.surface}`);
+          return Promise.resolve({ callback, id: "new", payload, time: 3 });
         },
       },
       "private",
@@ -487,15 +502,15 @@ describe("sliding retention", () => {
     calls.length = 0;
     await replaceRetention(
       {
-        async listSchedules() {
-          return [];
+        cancelSchedule() {
+          return Promise.resolve(true);
         },
-        async schedule(seconds, callback, payload) {
+        listSchedules() {
+          return Promise.resolve([]);
+        },
+        schedule(seconds, callback, payload) {
           calls.push(`schedule:${seconds}:${callback}:${payload.surface}`);
-          return { id: "channel", callback, payload, time: 4 };
-        },
-        async cancelSchedule() {
-          return true;
+          return Promise.resolve({ callback, id: "channel", payload, time: 4 });
         },
       },
       "channel",
@@ -508,25 +523,26 @@ describe("sliding retention", () => {
   test("destroys the whole conversation only for the latest expiry", async () => {
     let destroyed = 0;
     const latest = {
-      id: "latest",
       callback: "expireConversation",
+      id: "latest",
       payload: {},
       time: 2,
     };
     const agent = {
-      async listSchedules() {
-        return [
-          { id: "stale", callback: "expireConversation", payload: {}, time: 1 },
-          latest,
-        ];
-      },
-      async destroy() {
+      destroy() {
         destroyed += 1;
+        return Promise.resolve();
+      },
+      listSchedules() {
+        return Promise.resolve([
+          { callback: "expireConversation", id: "stale", payload: {}, time: 1 },
+          latest,
+        ]);
       },
     };
     await expireLatest(agent, {
-      id: "stale",
       callback: "expireConversation",
+      id: "stale",
       payload: {},
       time: 1,
     });
@@ -540,10 +556,10 @@ describe("readiness and manifest", () => {
     expect(
       missingReadiness(
         {
-          signingSecret: "",
-          botToken: "secret-value",
-          teamId: "",
           appId: "A123",
+          botToken: "secret-value",
+          signingSecret: "",
+          teamId: "",
         },
         {},
       ),
@@ -557,12 +573,33 @@ describe("readiness and manifest", () => {
   });
 
   test("generates a neutral manifest from config and deployed URL", () => {
-    const manifest = JSON.parse(
-      generateSlackManifest(config, "https://agent.example.com/path"),
+    const manifest = v.parse(
+      v.object({
+        display_information: v.object({
+          description: v.string(),
+          name: v.string(),
+        }),
+        features: v.object({
+          agent_view: v.object({ agent_description: v.string() }),
+          app_home: v.object({
+            messages_tab_enabled: v.boolean(),
+            messages_tab_read_only_enabled: v.boolean(),
+          }),
+        }),
+        settings: v.object({
+          event_subscriptions: v.object({
+            bot_events: v.array(v.string()),
+            request_url: v.string(),
+          }),
+        }),
+      }),
+      JSON.parse(
+        generateSlackManifest(config, "https://agent.example.com/path"),
+      ),
     );
     expect(manifest.display_information).toEqual({
-      name: "Neutral Agent",
       description: "Answers Slack conversations.",
+      name: "Neutral Agent",
     });
     expect(manifest.features.app_home).toEqual({
       messages_tab_enabled: true,
@@ -572,9 +609,9 @@ describe("readiness and manifest", () => {
       agent_description: "Answers Slack conversations.",
     });
     expect(manifest.settings.event_subscriptions).toEqual({
-      request_url: "https://agent.example.com/channels/slack/events",
       bot_events: ["app_mention", "message.im"],
+      request_url: "https://agent.example.com/channels/slack/events",
     });
-    expect(JSON.stringify(manifest)).not.toMatch(/xox[a-z]-|[UA][A-Z0-9]{8,}/);
+    expect(JSON.stringify(manifest)).not.toMatch(/xox[a-z]-|[UA][A-Z0-9]{8,}/u);
   });
 });

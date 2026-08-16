@@ -11,13 +11,13 @@ import {
   MODEL,
   replaceRetention,
   SLACK_DELIVERY_FALLBACK,
-  type ResolvedAgentConfig,
-  type ExpiryPayload,
-  type ExpirySchedule,
-  type SlackDestination,
+} from "@agentic-slack/core";
+import type {
+  ExpiryPayload,
+  ExpirySchedule,
+  SlackDestination,
 } from "@agentic-slack/core";
 import {
-  type AgentProps,
   observe,
   useAgentFinish,
   useInitialData,
@@ -25,10 +25,10 @@ import {
   useModel,
   useTool,
 } from "@flue/runtime";
+import type { AgentProps } from "@flue/runtime";
 import { extend } from "@flue/runtime/cloudflare";
 import * as v from "valibot";
 import config from "../agent.config.ts";
-import type { WorkerBindings } from "./app.ts";
 
 let lastAssistantText = "";
 
@@ -37,36 +37,48 @@ let lastAssistantText = "";
 observe((event) => {
   if (event.type === "turn" && event.purpose === "agent" && !event.isError) {
     const text = extractAssistantText(event.response?.output?.content);
-    if (text) lastAssistantText = text;
+    if (text) {
+      lastAssistantText = text;
+    }
   }
 });
 
-type RuntimeContext =
-  typeof config extends ResolvedAgentConfig<infer Context> ? Context : never;
-
 const initialData = v.pipe(
   v.strictObject({
-    teamId: v.string(),
     channelId: v.string(),
-    threadTs: v.string(),
     surface: v.picklist(["private", "channel"]),
+    teamId: v.string(),
+    threadTs: v.string(),
   }),
   v.readonly(),
 );
 
-export function SlackAgent(_props: AgentProps) {
-  const data = v.parse(initialData, useInitialData<unknown>());
+const hasBotToken = (value: object): value is { SLACK_BOT_TOKEN: string } => {
+  const entry = Object.entries(value).find(
+    ([key]) => key === "SLACK_BOT_TOKEN",
+  );
+  return typeof entry?.[1] === "string";
+};
+
+export const SlackAgent = (_props: AgentProps) => {
+  const data = v.parse(initialData, useInitialData());
   const destination: SlackDestination = {
     channelId: data.channelId,
     threadTs: data.threadTs,
   };
   useModel(MODEL);
-  for (const instruction of composeInstructions(config))
+  for (const instruction of composeInstructions(config)) {
     useInstruction(instruction);
-  const bindings = env as unknown as WorkerBindings;
-  const runtimeContext = { bindings } as unknown as RuntimeContext;
+  }
+  if (!hasBotToken(env)) {
+    throw new Error("Missing SLACK_BOT_TOKEN binding");
+  }
+  const bindings = env;
+  const runtimeContext = { bindings };
   const reply = createReplyTool(destination, bindings.SLACK_BOT_TOKEN);
-  for (const tool of composeTools(config, runtimeContext, reply)) useTool(tool);
+  for (const tool of composeTools(config, runtimeContext, reply)) {
+    useTool(tool);
+  }
   useAgentFinish(async (ctx) => {
     const text = lastAssistantText;
     lastAssistantText = "";
@@ -74,34 +86,37 @@ export function SlackAgent(_props: AgentProps) {
       ctx.response.toolCalls.some(
         (call) => call.tool === CORE_REPLY_TOOL_NAME && !call.isError,
       )
-    )
+    ) {
       return;
+    }
     await reply.run({
       data: { text: text || SLACK_DELIVERY_FALLBACK },
-    } as Parameters<typeof reply.run>[0]);
+      log: ctx.log,
+      toolCallId: "finish-fallback",
+    });
   });
   return `${config.name}: ${config.description}`;
-}
+};
 
 SlackAgent.initialData = initialData;
 
 interface RetentionAgent {
-  listSchedules(): Promise<readonly ExpirySchedule[]>;
-  cancelSchedule(id: string): Promise<boolean>;
-  schedule(
+  listSchedules: () => Promise<readonly ExpirySchedule[]>;
+  cancelSchedule: (id: string) => Promise<boolean>;
+  schedule: (
     delaySeconds: number,
     callback: "expireConversation",
     payload: ExpiryPayload,
-  ): Promise<ExpirySchedule>;
-  destroy(): Promise<void>;
+  ) => Promise<ExpirySchedule>;
+  destroy: () => Promise<void>;
 }
 
-export const cloudflare = extend({
+export const cloudflare = extend<RetentionAgent>({
   base: (Base) =>
     class extends Base {
       async refreshRetention(surface: "private" | "channel"): Promise<void> {
         await replaceRetention(
-          this as unknown as RetentionAgent,
+          this,
           surface,
           config.retention.privateDays,
           config.retention.channelDays,
@@ -112,7 +127,7 @@ export const cloudflare = extend({
         _payload: ExpiryPayload,
         schedule: ExpirySchedule,
       ): Promise<void> {
-        await expireLatest(this as unknown as RetentionAgent, schedule);
+        await expireLatest(this, schedule);
       }
     },
 });

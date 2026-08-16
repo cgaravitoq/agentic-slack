@@ -60,52 +60,58 @@ export interface ResolvedAgentConfig<RuntimeContext = unknown> {
   };
 }
 
-function resolveExtension<Kind extends "plugin" | "addon", RuntimeContext>(
+const resolveExtension = <Kind extends "plugin" | "addon", RuntimeContext>(
   extension: ExtensionDefinition<Kind, RuntimeContext>,
-): ResolvedExtension<Kind, RuntimeContext> {
+): ResolvedExtension<Kind, RuntimeContext> => {
   const id = extension.id.trim();
-  if (!id) throw new Error(`Agent ${extension.kind} requires id`);
+  if (!id) {
+    throw new Error(`Agent ${extension.kind} requires id`);
+  }
   const instructions = (extension.instructions ?? []).map((instruction) => {
     const resolved = instruction.trim();
-    if (!resolved)
+    if (!resolved) {
       throw new Error(`Agent extension ${id} requires non-empty instructions`);
+    }
     return resolved;
   });
   return Object.freeze({
-    id,
-    kind: extension.kind,
-    instructions: Object.freeze(instructions),
     createTools: extension.createTools,
+    id,
+    instructions: Object.freeze(instructions),
+    kind: extension.kind,
   });
-}
+};
 
-export function defineAgentConfig<RuntimeContext>(
+export const defineAgentConfig = <RuntimeContext>(
   config: AgentConfig<RuntimeContext>,
-): ResolvedAgentConfig<RuntimeContext> {
+): ResolvedAgentConfig<RuntimeContext> => {
   for (const [field, value] of Object.entries({
-    name: config.name,
     description: config.description,
+    name: config.name,
     ownerInstructions: config.ownerInstructions,
   })) {
-    if (!value.trim()) throw new Error(`Agent config requires ${field}`);
+    if (!value.trim()) {
+      throw new Error(`Agent config requires ${field}`);
+    }
   }
   const plugins = (config.plugins ?? []).map(resolveExtension);
   const addons = (config.addons ?? []).map(resolveExtension);
   const extensionIds = new Set<string>();
   for (const extension of [...plugins, ...addons]) {
-    if (extensionIds.has(extension.id))
+    if (extensionIds.has(extension.id)) {
       throw new Error(`Duplicate agent extension id: ${extension.id}`);
+    }
     extensionIds.add(extension.id);
   }
   return Object.freeze({
-    name: config.name.trim(),
+    addons: Object.freeze(addons),
     description: config.description.trim(),
+    name: config.name.trim(),
     ownerInstructions: config.ownerInstructions.trim(),
     plugins: Object.freeze(plugins),
-    addons: Object.freeze(addons),
     retention: Object.freeze({
-      privateDays: config.retention?.privateDays ?? PRIVATE_RETENTION_DAYS,
       channelDays: config.retention?.channelDays ?? CHANNEL_RETENTION_DAYS,
+      privateDays: config.retention?.privateDays ?? PRIVATE_RETENTION_DAYS,
     }),
   });
-}
+};

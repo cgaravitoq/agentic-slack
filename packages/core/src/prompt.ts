@@ -1,4 +1,5 @@
-import { CORE_REPLY_TOOL_NAME, type ResolvedAgentConfig } from "./config.ts";
+import { CORE_REPLY_TOOL_NAME } from "./config.ts";
+import type { ResolvedAgentConfig } from "./config.ts";
 import type { ToolDefinition } from "@flue/runtime";
 
 export const CORE_INSTRUCTIONS = Object.freeze([
@@ -9,26 +10,26 @@ export const CORE_INSTRUCTIONS = Object.freeze([
   "Do not attempt broadcasts or mentions. The delivery boundary sanitizes all output.",
 ]);
 
-export function composeInstructions<RuntimeContext>(
+export const composeInstructions = <RuntimeContext>(
   config: ResolvedAgentConfig<RuntimeContext>,
-): readonly string[] {
-  return Object.freeze([
+): readonly string[] =>
+  Object.freeze([
     ...CORE_INSTRUCTIONS,
     config.ownerInstructions,
     ...config.plugins.flatMap((plugin) => plugin.instructions),
     ...config.addons.flatMap((addon) => addon.instructions),
   ]);
-}
 
-export function composeTools<RuntimeContext>(
+export const composeTools = <RuntimeContext>(
   config: ResolvedAgentConfig<RuntimeContext>,
   runtimeContext: RuntimeContext,
   terminalReplyTool: ToolDefinition,
-): readonly ToolDefinition[] {
+): readonly ToolDefinition[] => {
   const extensionTools = [...config.plugins, ...config.addons].flatMap(
     (extension) => extension.createTools?.(runtimeContext) ?? [],
   );
-  if (extensionTools.some((tool) => tool.name === CORE_REPLY_TOOL_NAME))
+  if (extensionTools.some((tool) => tool.name === CORE_REPLY_TOOL_NAME)) {
     throw new Error(`Agent extensions cannot register ${CORE_REPLY_TOOL_NAME}`);
+  }
   return Object.freeze([...extensionTools, terminalReplyTool]);
-}
+};

@@ -1,23 +1,23 @@
 import type { ResolvedAgentConfig } from "./config.ts";
 
-export function generateSlackManifest<RuntimeContext>(
+export const generateSlackManifest = <RuntimeContext>(
   config: ResolvedAgentConfig<RuntimeContext>,
   deployedUrl: string,
-): string {
-  const origin = new URL(deployedUrl).origin;
+): string => {
+  const { origin } = new URL(deployedUrl);
   return JSON.stringify(
     {
       display_information: {
-        name: config.name,
         description: config.description,
+        name: config.name,
       },
       features: {
+        agent_view: { agent_description: config.description },
         app_home: {
           messages_tab_enabled: true,
           messages_tab_read_only_enabled: false,
         },
-        bot_user: { display_name: config.name, always_online: true },
-        agent_view: { agent_description: config.description },
+        bot_user: { always_online: true, display_name: config.name },
       },
       oauth_config: {
         scopes: {
@@ -32,8 +32,8 @@ export function generateSlackManifest<RuntimeContext>(
       },
       settings: {
         event_subscriptions: {
-          request_url: `${origin}/channels/slack/events`,
           bot_events: ["app_mention", "message.im"],
+          request_url: `${origin}/channels/slack/events`,
         },
         interactivity: { is_enabled: false },
         org_deploy_enabled: false,
@@ -44,4 +44,4 @@ export function generateSlackManifest<RuntimeContext>(
     null,
     2,
   );
-}
+};

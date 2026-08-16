@@ -1,20 +1,30 @@
 import { expect, mock, test } from "bun:test";
-import {
-  composeInstructions,
-  defineAgentConfig,
-  type AgentPlugin,
-} from "@agentic-slack/core";
-import { defineTool, type ToolDefinition } from "@flue/runtime/tool";
+import { composeInstructions, defineAgentConfig } from "@agentic-slack/core";
+import type { AgentPlugin } from "@agentic-slack/core";
+import type { FlueLogger } from "@flue/runtime";
+import { defineTool } from "@flue/runtime/tool";
+import type { ToolDefinition } from "@flue/runtime/tool";
 import * as v from "valibot";
 
 import defaultConfig from "../agent.config.ts";
+
+const noopLogger: FlueLogger = {
+  error() {},
+  info() {},
+  warn() {},
+};
+const runContext = <T>(data: T) => ({
+  data,
+  log: noopLogger,
+  toolCallId: "test-call",
+});
 
 const defaultPlugins = [...defaultConfig.plugins];
 const defaultAddons = [...defaultConfig.addons];
 const pluginSecret = "extension-secret-value";
 const bindings = {
-  SLACK_BOT_TOKEN: "xoxb-test-token",
   EXTENSION_SECRET: pluginSecret,
+  SLACK_BOT_TOKEN: "xoxb-test-token",
 };
 const instructions: string[] = [];
 const tools: ToolDefinition[] = [];
@@ -25,28 +35,28 @@ interface RuntimeContext {
 }
 
 const plugin: AgentPlugin<RuntimeContext> = {
-  id: "runtime-context",
-  kind: "plugin",
-  instructions: ["Use runtime_context for a safe lookup."],
   createTools(context) {
     const secret = context.bindings.EXTENSION_SECRET;
     return [
       defineTool({
-        name: "runtime_context",
         description: "Run a lookup with operator-provided credentials.",
         input: v.object({ query: v.string() }),
-        async run() {
+        name: "runtime_context",
+        run() {
           resolvedSecret = secret;
-          return { output: "lookup complete" };
+          return Promise.resolve({ output: "lookup complete" });
         },
       }),
     ];
   },
+  id: "runtime-context",
+  instructions: ["Use runtime_context for a safe lookup."],
+  kind: "plugin",
 };
 
 const extensionConfig = defineAgentConfig<RuntimeContext>({
-  name: "Extended Agent",
   description: "Exercises extension composition.",
+  name: "Extended Agent",
   ownerInstructions: "Keep credentials private.",
   plugins: [plugin],
 });
@@ -54,17 +64,17 @@ const extensionConfig = defineAgentConfig<RuntimeContext>({
 await mock.module("cloudflare:workers", () => ({ env: bindings }));
 await mock.module("../agent.config.ts", () => ({ default: extensionConfig }));
 await mock.module("@flue/runtime", () => ({
+  observe: () => {},
+  useAgentFinish: () => {},
   useInitialData: () => ({
-    teamId: "T123",
     channelId: "C123",
-    threadTs: "171.2",
     surface: "private",
+    teamId: "T123",
+    threadTs: "171.2",
   }),
   useInstruction: (instruction: string) => instructions.push(instruction),
-  useModel: () => undefined,
+  useModel: () => {},
   useTool: (tool: ToolDefinition) => tools.push(tool),
-  observe: () => undefined,
-  useAgentFinish: () => undefined,
 }));
 await mock.module("@flue/runtime/cloudflare", () => ({
   extend: () => ({ base: undefined }),
@@ -78,9 +88,10 @@ test("default agent configuration remains core-only", () => {
 });
 
 test("package.json pins plugin workspace deps for import resolution", async () => {
-  const packageJson = await Bun.file(
-    new URL("../package.json", import.meta.url),
-  ).json();
+  const packageJson = v.parse(
+    v.object({ dependencies: v.record(v.string(), v.string()) }),
+    await Bun.file(new URL("../package.json", import.meta.url)).json(),
+  );
   expect(packageJson.dependencies["@agentic-slack/plugin-llms-docs"]).toBe(
     "workspace:*",
   );
@@ -90,20 +101,20 @@ test("package.json pins plugin workspace deps for import resolution", async () =
 });
 
 test("passes Worker bindings to plugins without model-visible secrets", async () => {
-  expect(SlackAgent({} as never)).toBe(
+  expect(SlackAgent({ id: "test" })).toBe(
     "Extended Agent: Exercises extension composition.",
   );
   expect(instructions).toEqual([...composeInstructions(extensionConfig)]);
   const modelVisible = JSON.stringify({
     instructions,
     tools: tools.map(({ name, description, input }) => ({
-      name,
       description,
       input,
+      name,
     })),
   });
   expect(modelVisible).not.toContain(pluginSecret);
 
-  await tools[0]?.run({ data: { query: "invoice" } } as never);
+  await tools[0]?.run(runContext({ query: "invoice" }));
   expect(resolvedSecret).toBe(pluginSecret);
 });
