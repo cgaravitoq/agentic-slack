@@ -1,5 +1,6 @@
 import { createSlackIngress, missingReadiness } from "@agentic-slack/core";
 import type {
+  RoutedSlackLifecycle,
   RoutedSlackTurn,
   SlackCoreBindings,
   TrustedSlackConfig,
@@ -19,8 +20,12 @@ export const createApp = (
     instanceId: string,
     bindings: SlackCoreBindings,
   ) => Promise<void>,
+  handleLifecycle?: (
+    lifecycle: RoutedSlackLifecycle,
+    bindings: SlackCoreBindings,
+  ) => Promise<void>,
 ) => {
-  const channel = createSlackIngress(trusted, handleTurn);
+  const channel = createSlackIngress(trusted, handleTurn, handleLifecycle);
   const app = new Hono<WorkerEnv>();
   app.get("/health", (context) => {
     const missing = missingReadiness(trusted, context.env);

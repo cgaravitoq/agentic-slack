@@ -17,10 +17,12 @@ import {
   expireLatest,
   extractAssistantText,
   generateSlackManifest,
+  MAX_SUGGESTED_PROMPTS,
   missingReadiness,
   MODEL,
   PRIVATE_RETENTION_DAYS,
   replaceRetention,
+  setSuggestedPrompts,
 } from "@agentic-slack/core";
 
 interface TestRuntimeContext {
@@ -624,9 +626,139 @@ describe("readiness and manifest", () => {
       agent_description: "Answers Slack conversations.",
     });
     expect(manifest.settings.event_subscriptions).toEqual({
-      bot_events: ["app_mention", "message.im"],
+      bot_events: ["app_mention", "assistant_thread_started", "message.im"],
       request_url: "https://agent.example.com/channels/slack/events",
     });
     expect(JSON.stringify(manifest)).not.toMatch(/xox[a-z]-|[UA][A-Z0-9]{8,}/u);
+  });
+});
+
+describe("assistant suggested prompts", () => {
+  test("ships no prompts unless the operator configures them", () => {
+    expect(config.suggestedPrompts).toEqual([]);
+    expect(Object.isFrozen(config.suggestedPrompts)).toBe(true);
+  });
+
+  test("trims configured prompts, keeps their order, and rejects empty ones", () => {
+    const configured = defineAgentConfig({
+      description: "Answers Slack conversations.",
+      name: "Prompted Agent",
+      ownerInstructions: "Prefer short answers.",
+      suggestedPrompts: [
+        { message: "  What changed?  ", title: " Recap " },
+        { message: " Who is on call? ", title: " On call " },
+        { message: " What is still open? ", title: " Open items " },
+      ],
+    });
+    expect(configured.suggestedPrompts).toEqual([
+      { message: "What changed?", title: "Recap" },
+      { message: "Who is on call?", title: "On call" },
+      { message: "What is still open?", title: "Open items" },
+    ]);
+    expect(() =>
+      defineAgentConfig({
+        description: "Answers Slack conversations.",
+        name: "Prompted Agent",
+        ownerInstructions: "Prefer short answers.",
+        suggestedPrompts: [{ message: "   ", title: "Recap" }],
+      }),
+    ).toThrow("Agent suggested prompt requires title and message");
+  });
+
+  test("refuses more prompts than Slack renders", () => {
+    expect(MAX_SUGGESTED_PROMPTS).toBe(4);
+    expect(() =>
+      defineAgentConfig({
+        description: "Answers Slack conversations.",
+        name: "Prompted Agent",
+        ownerInstructions: "Prefer short answers.",
+        suggestedPrompts: Array.from(
+          { length: MAX_SUGGESTED_PROMPTS + 1 },
+          (_unused, index) => ({
+            message: `Question ${index}`,
+            title: `Prompt ${index}`,
+          }),
+        ),
+      }),
+    ).toThrow("Agent config allows at most 4 suggested prompts");
+  });
+
+  test("skips the Slack call entirely when the prompt list is empty", async () => {
+    const calls: string[] = [];
+    await setSuggestedPrompts(
+      { channelId: "D123", threadTs: "171.1" },
+      [],
+      "xoxb-test",
+      (input, init) => {
+        calls.push(new Request(input, init).url);
+        return Promise.resolve(Response.json({ ok: true }));
+      },
+    );
+    expect(calls).toEqual([]);
+  });
+
+  test("posts configured prompts in order to the bound thread", async () => {
+    const requests: {
+      authorization: string | null;
+      body: unknown;
+      contentType: string | null;
+      method: string;
+      url: string;
+    }[] = [];
+    await setSuggestedPrompts(
+      { channelId: "D123", threadTs: "171.1" },
+      [
+        { message: "What changed?", title: "Recap" },
+        { message: "Who is on call?", title: "On call" },
+        { message: "What is still open?", title: "Open items" },
+      ],
+      "xoxb-trusted-token",
+      async (input, init) => {
+        const request = new Request(input, init);
+        requests.push({
+          authorization: request.headers.get("authorization"),
+          body: await request.json(),
+          contentType: request.headers.get("content-type"),
+          method: request.method,
+          url: request.url,
+        });
+        return Response.json({ ok: true });
+      },
+    );
+    expect(requests).toEqual([
+      {
+        authorization: "Bearer xoxb-trusted-token",
+        body: {
+          channel_id: "D123",
+          prompts: [
+            { message: "What changed?", title: "Recap" },
+            { message: "Who is on call?", title: "On call" },
+            { message: "What is still open?", title: "Open items" },
+          ],
+          thread_ts: "171.1",
+        },
+        contentType: "application/json; charset=utf-8",
+        method: "POST",
+        url: "https://slack.com/api/assistant.threads.setSuggestedPrompts",
+      },
+    ]);
+  });
+
+  test("raises the Slack error when the API rejects the prompts", async () => {
+    let failure = "resolved";
+    try {
+      await setSuggestedPrompts(
+        { channelId: "D123", threadTs: "171.1" },
+        [{ message: "What changed?", title: "Recap" }],
+        "xoxb-test",
+        () =>
+          Promise.resolve(Response.json({ error: "not_allowed", ok: false })),
+      );
+    } catch (error: unknown) {
+      failure = error instanceof Error ? error.message : "unknown";
+    }
+    expect(failure).toBe(
+      "Slack assistant.threads.setSuggestedPrompts failed: not_allowed",
+    );
   });
 });

@@ -39,6 +39,7 @@ export interface TrustedSlackConfig {
 }
 
 export interface RoutedSlackTurn {
+  kind: "turn";
   eventId: string;
   teamId: string;
   appId: string;
@@ -50,17 +51,38 @@ export interface RoutedSlackTurn {
   surface: ConversationSurface;
 }
 
+export interface RoutedSlackLifecycle {
+  kind: "lifecycle";
+  eventId: string;
+  teamId: string;
+  appId: string;
+  channelId: string;
+  threadTs: string;
+}
+
+export type RoutedSlackEvent = RoutedSlackTurn | RoutedSlackLifecycle;
+
 export interface SlackCoreEnv {
   Bindings: SlackCoreBindings;
 }
 
 export const routeSlackEvent = (
   payload: SlackEventsApiPayload,
-): RoutedSlackTurn | null => {
+): RoutedSlackEvent | null => {
   if (!isEventCallbackEnvelope(payload)) {
     return null;
   }
   const { event } = payload;
+  if (event.type === "assistant_thread_started") {
+    return {
+      appId: payload.api_app_id,
+      channelId: event.assistant_thread.channel_id,
+      eventId: payload.event_id,
+      kind: "lifecycle",
+      teamId: payload.team_id,
+      threadTs: event.assistant_thread.thread_ts,
+    };
+  }
   if (event.type === "app_mention") {
     const text = event.text?.replace(LEADING_MENTION_RE, "").trim();
     const { user } = event;
@@ -71,6 +93,7 @@ export const routeSlackEvent = (
       appId: payload.api_app_id,
       channelId: event.channel,
       eventId: payload.event_id,
+      kind: "turn",
       messageTs: event.ts,
       surface: "channel",
       teamId: payload.team_id,
@@ -94,6 +117,7 @@ export const routeSlackEvent = (
     appId: payload.api_app_id,
     channelId: event.channel,
     eventId: payload.event_id,
+    kind: "turn",
     messageTs: event.ts,
     surface: "private",
     teamId: payload.team_id,
@@ -139,6 +163,10 @@ export const createSlackIngress = (
     instanceId: string,
     env: SlackCoreBindings,
   ) => Promise<void>,
+  handleLifecycle?: (
+    lifecycle: RoutedSlackLifecycle,
+    env: SlackCoreBindings,
+  ) => Promise<void>,
 ) => {
   const identityComplete = Boolean(
     trusted.signingSecret &&
@@ -151,25 +179,34 @@ export const createSlackIngress = (
       if (!identityComplete) {
         return;
       }
-      const turn = routeSlackEvent(payload);
+      const routed = routeSlackEvent(payload);
       if (
-        !turn ||
-        turn.teamId !== trusted.teamId ||
-        turn.appId !== trusted.appId
+        !routed ||
+        routed.teamId !== trusted.teamId ||
+        routed.appId !== trusted.appId
       ) {
         return;
       }
-      const instanceId = channel.instanceId({
-        channelId: turn.channelId,
-        teamId: turn.teamId,
-        threadTs: turn.threadTs,
-      });
+      const run =
+        routed.kind === "turn"
+          ? () =>
+              handleTurn(
+                routed,
+                channel.instanceId({
+                  channelId: routed.channelId,
+                  teamId: routed.teamId,
+                  threadTs: routed.threadTs,
+                }),
+                c.env,
+              )
+          : handleLifecycle && (() => handleLifecycle(routed, c.env));
+      if (!run) {
+        return;
+      }
       c.executionCtx.waitUntil(
         (async () => {
           try {
-            await claimAndRun(c.env.DB, turn.eventId, () =>
-              handleTurn(turn, instanceId, c.env),
-            );
+            await claimAndRun(c.env.DB, routed.eventId, run);
           } catch (error: unknown) {
             console.error("Slack event handling failed", error);
           }

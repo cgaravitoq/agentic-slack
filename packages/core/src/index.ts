@@ -1,8 +1,10 @@
+export { setSuggestedPrompts } from "./assistant.ts";
 export {
   CHANNEL_RETENTION_DAYS,
   CLOUDFLARE_TRACING_CONTENT,
   CORE_REPLY_TOOL_NAME,
   defineAgentConfig,
+  MAX_SUGGESTED_PROMPTS,
   MODEL,
   PRIVATE_RETENTION_DAYS,
 } from "./config.ts";
@@ -13,6 +15,7 @@ export type {
   ExtensionToolFactory,
   ResolvedAgentConfig,
   ResolvedExtension,
+  SuggestedPrompt,
 } from "./config.ts";
 export { claimAndRun, claimEvent, releaseEvent } from "./dedup.ts";
 export {
@@ -46,6 +49,8 @@ export {
   routeSlackEvent,
 } from "./slack.ts";
 export type {
+  RoutedSlackEvent,
+  RoutedSlackLifecycle,
   RoutedSlackTurn,
   SlackCoreBindings,
   SlackCoreEnv,

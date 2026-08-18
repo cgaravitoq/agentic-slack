@@ -1,10 +1,16 @@
 import { describe, expect, test } from "bun:test";
-import { createSlackIngress } from "@agentic-slack/core";
+import {
+  createSlackIngress,
+  defineAgentConfig,
+  setSuggestedPrompts,
+} from "@agentic-slack/core";
 import type {
   ConversationLifecycleAgent,
   SlackCoreBindings,
 } from "@agentic-slack/core";
 import * as v from "valibot";
+import { createApp } from "../src/app.ts";
+import { createLifecycleHandler } from "../src/lifecycle.ts";
 
 const trusted = {
   appId: "A123",
@@ -93,7 +99,28 @@ const eventEnvelope = v.object({
 });
 type EventEnvelope = v.InferOutput<typeof eventEnvelope>;
 
-const signedRequest = async (payload: EventEnvelope): Promise<Request> => {
+const assistantEnvelope = v.object({
+  api_app_id: v.string(),
+  event: v.object({
+    assistant_thread: v.object({
+      channel_id: v.string(),
+      context: v.object({ channel_id: v.optional(v.string()) }),
+      thread_ts: v.string(),
+      user_id: v.string(),
+    }),
+    event_ts: v.string(),
+    type: v.string(),
+  }),
+  event_id: v.string(),
+  team_id: v.string(),
+  type: v.string(),
+});
+type AssistantEnvelope = v.InferOutput<typeof assistantEnvelope>;
+
+const signedRequest = async (
+  payload: AssistantEnvelope | EventEnvelope,
+  url = "https://example.com/events",
+): Promise<Request> => {
   const body = JSON.stringify(payload);
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const key = await crypto.subtle.importKey(
@@ -111,7 +138,7 @@ const signedRequest = async (payload: EventEnvelope): Promise<Request> => {
   const signature = `v0=${Array.from(new Uint8Array(bytes), (byte) =>
     byte.toString(16).padStart(2, "0"),
   ).join("")}`;
-  return new Request("https://example.com/events", {
+  return new Request(url, {
     body,
     headers: {
       "content-type": "application/json",
@@ -281,5 +308,305 @@ describe("signed Slack ingress", () => {
     );
     await Promise.all(pending);
     expect(admitted).toEqual([]);
+  });
+});
+
+describe("assistant thread lifecycle", () => {
+  const assistantThreadStarted: AssistantEnvelope = {
+    api_app_id: "A123",
+    event: {
+      assistant_thread: {
+        channel_id: "D999",
+        context: {},
+        thread_ts: "180.1",
+        user_id: "U123",
+      },
+      event_ts: "181.9",
+      type: "assistant_thread_started",
+    },
+    event_id: "Ev-assistant",
+    team_id: "T123",
+    type: "event_callback",
+  };
+
+  test("sets suggested prompts once on the started thread and starts no agent turn", async () => {
+    const db = new FakeD1();
+    const turns: string[] = [];
+    const requests: {
+      authorization: string | null;
+      body: unknown;
+      method: string;
+      url: string;
+    }[] = [];
+    const channel = createSlackIngress(
+      trusted,
+      (turn) => {
+        turns.push(turn.eventId);
+        return Promise.resolve();
+      },
+      (lifecycle) =>
+        setSuggestedPrompts(
+          { channelId: lifecycle.channelId, threadTs: lifecycle.threadTs },
+          [{ message: "What changed?", title: "Recap" }],
+          trusted.botToken,
+          async (input, init) => {
+            const request = new Request(input, init);
+            requests.push({
+              authorization: request.headers.get("authorization"),
+              body: await request.json(),
+              method: request.method,
+              url: request.url,
+            });
+            return Response.json({ ok: true });
+          },
+        ),
+    );
+    const pending: Promise<unknown>[] = [];
+    const executionCtx = {
+      passThroughOnException() {},
+      props: {},
+      waitUntil(promise: Promise<unknown>) {
+        pending.push(promise);
+      },
+    };
+    const bindings = testBindings(db);
+
+    const deliver = async () => {
+      const response = await channel
+        .route()
+        .request(
+          await signedRequest(assistantThreadStarted),
+          undefined,
+          bindings,
+          executionCtx,
+        );
+      expect(response.status).toBe(200);
+      await Promise.all(pending.splice(0));
+    };
+    await deliver();
+    await deliver();
+
+    expect(turns).toEqual([]);
+    expect(requests).toEqual([
+      {
+        authorization: "Bearer xoxb-test",
+        body: {
+          channel_id: "D999",
+          prompts: [{ message: "What changed?", title: "Recap" }],
+          thread_ts: "180.1",
+        },
+        method: "POST",
+        url: "https://slack.com/api/assistant.threads.setSuggestedPrompts",
+      },
+    ]);
+  });
+
+  test("rejects lifecycle events from a foreign workspace or app", async () => {
+    const db = new FakeD1();
+    const lifecycles: string[] = [];
+    const channel = createSlackIngress(
+      trusted,
+      () => Promise.resolve(),
+      (lifecycle) => {
+        lifecycles.push(lifecycle.eventId);
+        return Promise.resolve();
+      },
+    );
+    const pending: Promise<unknown>[] = [];
+    const executionCtx = {
+      passThroughOnException() {},
+      props: {},
+      waitUntil(promise: Promise<unknown>) {
+        pending.push(promise);
+      },
+    };
+    const bindings = testBindings(db);
+
+    const rejected: AssistantEnvelope[] = [
+      {
+        ...assistantThreadStarted,
+        event_id: "Ev-foreign-team",
+        team_id: "T999",
+      },
+      {
+        ...assistantThreadStarted,
+        api_app_id: "A999",
+        event_id: "Ev-foreign-app",
+      },
+    ];
+    await Promise.all(
+      rejected.map(async (payload) => {
+        const response = await channel
+          .route()
+          .request(
+            await signedRequest(payload),
+            undefined,
+            bindings,
+            executionCtx,
+          );
+        expect(response.status).toBe(200);
+      }),
+    );
+    await Promise.all(pending);
+    expect(lifecycles).toEqual([]);
+  });
+
+  test("serves operator prompts through an app built by createApp", async () => {
+    const db = new FakeD1();
+    const turns: string[] = [];
+    const requests: {
+      authorization: string | null;
+      body: unknown;
+      method: string;
+      url: string;
+    }[] = [];
+    const operatorConfig = defineAgentConfig({
+      description: "Answers Slack conversations.",
+      name: "Operator Agent",
+      ownerInstructions: "Prefer short answers.",
+      suggestedPrompts: [
+        { message: "Summarize the incident", title: "Incident recap" },
+        { message: "Draft the release note", title: "Release note" },
+      ],
+    });
+    const app = createApp(
+      trusted,
+      (turn) => {
+        turns.push(turn.eventId);
+        return Promise.resolve();
+      },
+      createLifecycleHandler(
+        operatorConfig,
+        trusted.botToken,
+        async (input, init) => {
+          const request = new Request(input, init);
+          requests.push({
+            authorization: request.headers.get("authorization"),
+            body: await request.json(),
+            method: request.method,
+            url: request.url,
+          });
+          return Response.json({ ok: true });
+        },
+      ),
+    );
+    const pending: Promise<unknown>[] = [];
+    const executionCtx = {
+      passThroughOnException() {},
+      props: {},
+      waitUntil(promise: Promise<unknown>) {
+        pending.push(promise);
+      },
+    };
+
+    const response = await app.request(
+      await signedRequest(
+        assistantThreadStarted,
+        "https://example.com/channels/slack/events",
+      ),
+      undefined,
+      testBindings(db),
+      executionCtx,
+    );
+    expect(response.status).toBe(200);
+    await Promise.all(pending);
+
+    expect(turns).toEqual([]);
+    expect(requests).toEqual([
+      {
+        authorization: "Bearer xoxb-test",
+        body: {
+          channel_id: "D999",
+          prompts: [
+            { message: "Summarize the incident", title: "Incident recap" },
+            { message: "Draft the release note", title: "Release note" },
+          ],
+          thread_ts: "180.1",
+        },
+        method: "POST",
+        url: "https://slack.com/api/assistant.threads.setSuggestedPrompts",
+      },
+    ]);
+  });
+
+  test("serves a second operator config and credential through the same seam", async () => {
+    const db = new FakeD1();
+    const turns: string[] = [];
+    const requests: {
+      authorization: string | null;
+      body: unknown;
+      method: string;
+      url: string;
+    }[] = [];
+    const secondTrusted = { ...trusted, botToken: "xoxb-second" };
+    const secondConfig = defineAgentConfig({
+      description: "Answers Slack conversations.",
+      name: "Second Operator Agent",
+      ownerInstructions: "Prefer short answers.",
+      suggestedPrompts: [
+        { message: "Draft the release note", title: "Release note" },
+        { message: "Summarize the incident", title: "Incident recap" },
+        { message: "List the open questions", title: "Open questions" },
+      ],
+    });
+    const app = createApp(
+      secondTrusted,
+      (turn) => {
+        turns.push(turn.eventId);
+        return Promise.resolve();
+      },
+      createLifecycleHandler(
+        secondConfig,
+        secondTrusted.botToken,
+        async (input, init) => {
+          const request = new Request(input, init);
+          requests.push({
+            authorization: request.headers.get("authorization"),
+            body: await request.json(),
+            method: request.method,
+            url: request.url,
+          });
+          return Response.json({ ok: true });
+        },
+      ),
+    );
+    const pending: Promise<unknown>[] = [];
+    const executionCtx = {
+      passThroughOnException() {},
+      props: {},
+      waitUntil(promise: Promise<unknown>) {
+        pending.push(promise);
+      },
+    };
+
+    const response = await app.request(
+      await signedRequest(
+        assistantThreadStarted,
+        "https://example.com/channels/slack/events",
+      ),
+      undefined,
+      testBindings(db),
+      executionCtx,
+    );
+    expect(response.status).toBe(200);
+    await Promise.all(pending);
+
+    expect(turns).toEqual([]);
+    expect(requests).toEqual([
+      {
+        authorization: "Bearer xoxb-second",
+        body: {
+          channel_id: "D999",
+          prompts: [
+            { message: "Draft the release note", title: "Release note" },
+            { message: "Summarize the incident", title: "Incident recap" },
+            { message: "List the open questions", title: "Open questions" },
+          ],
+          thread_ts: "180.1",
+        },
+        method: "POST",
+        url: "https://slack.com/api/assistant.threads.setSuggestedPrompts",
+      },
+    ]);
   });
 });

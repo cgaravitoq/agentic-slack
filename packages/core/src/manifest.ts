@@ -32,7 +32,7 @@ export const generateSlackManifest = <RuntimeContext>(
       },
       settings: {
         event_subscriptions: {
-          bot_events: ["app_mention", "message.im"],
+          bot_events: ["app_mention", "assistant_thread_started", "message.im"],
           request_url: `${origin}/channels/slack/events`,
         },
         interactivity: { is_enabled: false },

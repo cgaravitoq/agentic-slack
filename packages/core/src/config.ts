@@ -5,6 +5,7 @@ export const CHANNEL_RETENTION_DAYS = 15;
 export const MODEL = "cloudflare/@cf/zai-org/glm-4.7-flash";
 export const CLOUDFLARE_TRACING_CONTENT = false;
 export const CORE_REPLY_TOOL_NAME = "reply_in_slack";
+export const MAX_SUGGESTED_PROMPTS = 4;
 
 export type ExtensionToolFactory<RuntimeContext> = (
   context: RuntimeContext,
@@ -36,10 +37,16 @@ export interface ResolvedExtension<
   readonly createTools?: ExtensionToolFactory<RuntimeContext>;
 }
 
+export interface SuggestedPrompt {
+  title: string;
+  message: string;
+}
+
 export interface AgentConfig<RuntimeContext = unknown> {
   name: string;
   description: string;
   ownerInstructions: string;
+  suggestedPrompts?: readonly SuggestedPrompt[];
   plugins?: readonly AgentPlugin<RuntimeContext>[];
   addons?: readonly AgentAddon<RuntimeContext>[];
   retention?: {
@@ -52,6 +59,7 @@ export interface ResolvedAgentConfig<RuntimeContext = unknown> {
   name: string;
   description: string;
   ownerInstructions: string;
+  suggestedPrompts: readonly SuggestedPrompt[];
   plugins: readonly ResolvedExtension<"plugin", RuntimeContext>[];
   addons: readonly ResolvedExtension<"addon", RuntimeContext>[];
   retention: {
@@ -59,6 +67,15 @@ export interface ResolvedAgentConfig<RuntimeContext = unknown> {
     channelDays: number;
   };
 }
+
+const resolveSuggestedPrompt = (prompt: SuggestedPrompt): SuggestedPrompt => {
+  const title = prompt.title.trim();
+  const message = prompt.message.trim();
+  if (!(title && message)) {
+    throw new Error("Agent suggested prompt requires title and message");
+  }
+  return Object.freeze({ message, title });
+};
 
 const resolveExtension = <Kind extends "plugin" | "addon", RuntimeContext>(
   extension: ExtensionDefinition<Kind, RuntimeContext>,
@@ -94,6 +111,14 @@ export const defineAgentConfig = <RuntimeContext>(
       throw new Error(`Agent config requires ${field}`);
     }
   }
+  const suggestedPrompts = (config.suggestedPrompts ?? []).map(
+    resolveSuggestedPrompt,
+  );
+  if (suggestedPrompts.length > MAX_SUGGESTED_PROMPTS) {
+    throw new Error(
+      `Agent config allows at most ${MAX_SUGGESTED_PROMPTS} suggested prompts`,
+    );
+  }
   const plugins = (config.plugins ?? []).map(resolveExtension);
   const addons = (config.addons ?? []).map(resolveExtension);
   const extensionIds = new Set<string>();
@@ -113,5 +138,6 @@ export const defineAgentConfig = <RuntimeContext>(
       channelDays: config.retention?.channelDays ?? CHANNEL_RETENTION_DAYS,
       privateDays: config.retention?.privateDays ?? PRIVATE_RETENTION_DAYS,
     }),
+    suggestedPrompts: Object.freeze(suggestedPrompts),
   });
 };
