@@ -15,7 +15,7 @@ const STREAM_TS = "171.9";
 interface SlackCall {
   authorization: string;
   method: string;
-  body: Record<string, string>;
+  body: Record<string, string | unknown[]>;
 }
 
 interface HandleDispatchRequest {
@@ -31,6 +31,7 @@ interface HandleDispatchRequest {
 const slackCalls: SlackCall[] = [];
 const dispatched: { instanceId: string; request: HandleDispatchRequest }[] = [];
 let deltas: string[] = [];
+let toolChunks: ConversationStreamChunk[] = [];
 let replyText = "";
 let runFailure: Error | undefined;
 
@@ -45,6 +46,51 @@ const delta = (
   messageId: "m1",
   position,
   type: "message-delta",
+});
+
+const toolInput = (
+  toolCallId: string,
+  toolName: string,
+): ConversationStreamChunk => ({
+  conversationId: "c1",
+  input: { query: "anything" },
+  messageId: "m1",
+  position,
+  toolCallId,
+  toolName,
+  type: "tool-input",
+});
+
+const toolOutput = (
+  toolCallId: string,
+  output:
+    | string
+    | {
+        api_key: string;
+        auth: string;
+        note: string;
+        password: string;
+      }
+    | { body: string; status: number }
+    | { stderr: string }
+    | null,
+): ConversationStreamChunk => ({
+  conversationId: "c1",
+  output,
+  position,
+  toolCallId,
+  type: "tool-output",
+});
+
+const toolOutputError = (
+  toolCallId: string,
+  errorText: string,
+): ConversationStreamChunk => ({
+  conversationId: "c1",
+  errorText,
+  position,
+  toolCallId,
+  type: "tool-output-error",
 });
 
 await mockCloudflareWorkers({
@@ -67,6 +113,9 @@ await mock.module("@flue/runtime", () => ({
       _target: string | DispatchReceipt,
       readOptions?: { onEvent?: (chunk: ConversationStreamChunk) => void },
     ) {
+      for (const chunk of toolChunks) {
+        readOptions?.onEvent?.(chunk);
+      }
       for (const text of deltas) {
         readOptions?.onEvent?.(delta(text, "text"));
         readOptions?.onEvent?.(delta("SECRET_THOUGHT=leak", "reasoning"));
@@ -88,20 +137,49 @@ await mock.module("@flue/runtime/cloudflare", () => ({
 await mockWorkersAi();
 
 const originalFetch = globalThis.fetch;
+const createLifoSettler = <T>() => {
+  let batch: { resolve: (next: T) => void; value: T }[] = [];
+  let scheduled = false;
+  return (value: T): Promise<T> => {
+    const deferred = Promise.withResolvers<T>();
+    batch.push({ resolve: deferred.resolve, value });
+    if (!scheduled) {
+      scheduled = true;
+      queueMicrotask(() => {
+        const pending = batch;
+        batch = [];
+        scheduled = false;
+        for (const waiter of pending.toReversed()) {
+          waiter.resolve(waiter.value);
+        }
+      });
+    }
+    return deferred.promise;
+  };
+};
+const settleFetch = createLifoSettler<Response>();
 const capturingFetch: Pick<typeof globalThis, "fetch">["fetch"] = Object.assign(
   (input: RequestInfo | URL, init?: RequestInit) => {
     if (!v.is(v.string(), input) || !v.is(v.string(), init?.body)) {
       throw new TypeError("Expected a Slack URL string and a JSON body");
     }
-    slackCalls.push({
+    const recorded = {
       authorization: v.parse(
         v.object({ authorization: v.string() }),
         init.headers,
       ).authorization,
-      body: v.parse(v.record(v.string(), v.string()), JSON.parse(init.body)),
+      body: v.parse(
+        v.record(v.string(), v.union([v.string(), v.array(v.unknown())])),
+        JSON.parse(init.body),
+      ),
       method: input.replace("https://slack.com/api/", ""),
-    });
-    return Promise.resolve(Response.json({ ok: true, ts: STREAM_TS }));
+    };
+    return settleFetch(Response.json({ ok: true, ts: STREAM_TS })).then(
+      (response) => {
+        slackCalls.push(recorded);
+        return response;
+      },
+    );
   },
   { preconnect: originalFetch.preconnect },
 );
@@ -246,13 +324,21 @@ const streamAuthorizations = () => [
 
 const streamedMarkdown = () =>
   bodiesFor("chat.appendStream")
-    .map((body) => body.markdown_text)
+    .map((body) =>
+      v.is(v.string(), body.markdown_text) ? body.markdown_text : "",
+    )
     .join("");
+
+const taskChunks = () =>
+  bodiesFor("chat.appendStream").flatMap((body) =>
+    v.is(v.array(v.unknown()), body.chunks) ? body.chunks : [],
+  );
 
 beforeEach(() => {
   slackCalls.length = 0;
   dispatched.length = 0;
   deltas = [];
+  toolChunks = [];
   replyText = "";
   runFailure = undefined;
 });
@@ -276,6 +362,7 @@ test("streams the turn into the routed thread, never a model-chosen one", async 
       channel: "C777",
       recipient_team_id: "T123",
       recipient_user_id: "U777",
+      task_display_mode: "timeline",
       thread_ts: "171.0",
     },
   ]);
@@ -298,6 +385,7 @@ test("keeps the wire destination on the routed channel, not one named in the tur
       channel: "C777",
       recipient_team_id: "T123",
       recipient_user_id: "U777",
+      task_display_mode: "timeline",
       thread_ts: "171.0",
     },
   ]);
@@ -321,4 +409,277 @@ test("closes the stream when the agent run fails", async () => {
     { channel: "C777", ts: STREAM_TS },
   ]);
   expect(streamedMarkdown()).toContain("Please try again.");
+});
+
+test("streams a tool call as a named, sanitized task update", async () => {
+  toolChunks = [
+    toolInput("call-1", "search_docs"),
+    toolOutput("call-1", "found <!channel> three matches"),
+  ];
+  deltas = ["All done."];
+  replyText = "All done.";
+
+  expect(await runTurn("Ev-tool")).toBe(200);
+
+  expect(bodiesFor("chat.startStream")).toHaveLength(1);
+  expect(bodiesFor("chat.appendStream")).toEqual([
+    {
+      channel: "C777",
+      chunks: [
+        {
+          id: "call-1",
+          status: "in_progress",
+          title: "search_docs",
+          type: "task_update",
+        },
+      ],
+      ts: STREAM_TS,
+    },
+    {
+      channel: "C777",
+      chunks: [
+        {
+          id: "call-1",
+          output: "found three matches",
+          status: "complete",
+          title: "search_docs",
+          type: "task_update",
+        },
+      ],
+      ts: STREAM_TS,
+    },
+    { channel: "C777", markdown_text: "All ", ts: STREAM_TS },
+    { channel: "C777", markdown_text: "done.", ts: STREAM_TS },
+  ]);
+  expect(JSON.stringify(slackCalls)).not.toContain("<!channel>");
+});
+
+test("does not reuse a tool-call id title from an earlier turn", async () => {
+  toolChunks = [
+    toolInput("call-shared", "search_docs"),
+    toolOutput("call-shared", "one"),
+  ];
+  deltas = ["First."];
+  replyText = "First.";
+  expect(await runTurn("Ev-turn-1")).toBe(200);
+
+  slackCalls.length = 0;
+  toolChunks = [toolOutput("call-shared", "two")];
+  deltas = ["Second."];
+  replyText = "Second.";
+  expect(await runTurn("Ev-turn-2")).toBe(200);
+
+  expect(taskChunks()).toEqual([
+    {
+      id: "call-shared",
+      output: "two",
+      status: "complete",
+      title: "Step",
+      type: "task_update",
+    },
+  ]);
+});
+
+test("names an orphan tool result as a fallback step", async () => {
+  toolChunks = [toolOutput("call-orphan", "found three")];
+  deltas = ["Done."];
+  replyText = "Done.";
+
+  expect(await runTurn("Ev-orphan")).toBe(200);
+
+  expect(taskChunks()).toEqual([
+    {
+      id: "call-orphan",
+      output: "found three",
+      status: "complete",
+      title: "Step",
+      type: "task_update",
+    },
+  ]);
+});
+
+test("omits the output of a void tool result", async () => {
+  toolChunks = [toolInput("call-void", "noop"), toolOutput("call-void", null)];
+  deltas = ["Done."];
+  replyText = "Done.";
+
+  expect(await runTurn("Ev-void")).toBe(200);
+
+  expect(bodiesFor("chat.appendStream")).toEqual([
+    {
+      channel: "C777",
+      chunks: [
+        {
+          id: "call-void",
+          status: "in_progress",
+          title: "noop",
+          type: "task_update",
+        },
+      ],
+      ts: STREAM_TS,
+    },
+    {
+      channel: "C777",
+      chunks: [
+        {
+          id: "call-void",
+          status: "complete",
+          title: "noop",
+          type: "task_update",
+        },
+      ],
+      ts: STREAM_TS,
+    },
+    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+  ]);
+});
+
+test("marks a failed tool as an error and still finishes the reply", async () => {
+  toolChunks = [
+    toolInput("call-2", "search_docs"),
+    toolOutputError("call-2", "upstream refused the request"),
+  ];
+  deltas = ["I could not look that up."];
+  replyText = "I could not look that up.";
+
+  expect(await runTurn("Ev-tool-error")).toBe(200);
+
+  expect(taskChunks()).toEqual([
+    {
+      id: "call-2",
+      status: "in_progress",
+      title: "search_docs",
+      type: "task_update",
+    },
+    {
+      id: "call-2",
+      output: "upstream refused the request",
+      status: "error",
+      title: "search_docs",
+      type: "task_update",
+    },
+  ]);
+  expect(streamedMarkdown()).toBe("I could not look that up.");
+  expect(bodiesFor("chat.stopStream")).toEqual([
+    { channel: "C777", ts: STREAM_TS },
+  ]);
+});
+
+test("redacts credentials carried in a tool result before the wire", async () => {
+  toolChunks = [
+    toolInput("call-3", "read_env"),
+    toolOutput("call-3", {
+      api_key: "AKIA-live-1",
+      auth: "xoxb-1234567890-abcdef",
+      note: "SLACK_SIGNING_SECRET=hunter2",
+      password: "hunter2,admin",
+    }),
+  ];
+  deltas = ["Done."];
+  replyText = "Done.";
+
+  expect(await runTurn("Ev-tool-secret")).toBe(200);
+
+  expect(bodiesFor("chat.appendStream")).toEqual([
+    {
+      channel: "C777",
+      chunks: [
+        {
+          id: "call-3",
+          status: "in_progress",
+          title: "read_env",
+          type: "task_update",
+        },
+      ],
+      ts: STREAM_TS,
+    },
+    {
+      channel: "C777",
+      chunks: [
+        {
+          id: "call-3",
+          output:
+            '{[internal configuration],"auth":"[secret]","note":[internal configuration]",[internal configuration]}',
+          status: "complete",
+          title: "read_env",
+          type: "task_update",
+        },
+      ],
+      ts: STREAM_TS,
+    },
+    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+  ]);
+});
+
+test("redacts credentials escaped by JSON.stringify before the wire", async () => {
+  toolChunks = [
+    toolInput("call-http", "http_get"),
+    toolOutput("call-http", {
+      body: '{"password":"hunter2","api_key":"AKIA-live-1"}',
+      status: 200,
+    }),
+    toolInput("call-err", "run_cmd"),
+    toolOutput("call-err", {
+      stderr: 'auth failed for PASSWORD="hunter2"',
+    }),
+  ];
+  deltas = ["Done."];
+  replyText = "Done.";
+
+  expect(await runTurn("Ev-escaped-secret")).toBe(200);
+
+  expect(bodiesFor("chat.appendStream")).toEqual([
+    {
+      channel: "C777",
+      chunks: [
+        {
+          id: "call-http",
+          status: "in_progress",
+          title: "http_get",
+          type: "task_update",
+        },
+      ],
+      ts: STREAM_TS,
+    },
+    {
+      channel: "C777",
+      chunks: [
+        {
+          id: "call-http",
+          output:
+            '{"body":"{[internal configuration],[internal configuration]}","status":200}',
+          status: "complete",
+          title: "http_get",
+          type: "task_update",
+        },
+      ],
+      ts: STREAM_TS,
+    },
+    {
+      channel: "C777",
+      chunks: [
+        {
+          id: "call-err",
+          status: "in_progress",
+          title: "run_cmd",
+          type: "task_update",
+        },
+      ],
+      ts: STREAM_TS,
+    },
+    {
+      channel: "C777",
+      chunks: [
+        {
+          id: "call-err",
+          output: '{"stderr":"auth failed for [internal configuration]"}',
+          status: "complete",
+          title: "run_cmd",
+          type: "task_update",
+        },
+      ],
+      ts: STREAM_TS,
+    },
+    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+  ]);
 });

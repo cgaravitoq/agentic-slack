@@ -23,14 +23,19 @@ export {
   createStreamSanitizer,
   MAX_SLACK_APPEND_LENGTH,
   MAX_SLACK_MESSAGE_LENGTH,
+  MAX_SLACK_TASK_CHUNK_LENGTH,
   sanitizeReply,
+  sanitizeTaskText,
   SLACK_DELIVERY_FALLBACK,
   SLACK_STREAM_FAILURE_NOTICE,
+  SLACK_TASK_FALLBACK_TITLE,
   streamTargetFor,
 } from "./delivery.ts";
 export type {
   SlackStream,
   SlackStreamTarget,
+  SlackTaskStatus,
+  SlackTaskUpdate,
   StreamSanitizer,
 } from "./delivery.ts";
 export { generateSlackManifest } from "./manifest.ts";

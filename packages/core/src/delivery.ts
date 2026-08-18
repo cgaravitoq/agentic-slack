@@ -7,7 +7,7 @@ const SUBTEAM_RE = /<!subteam\^[^>]+>/giu;
 const CONTROL_OPENER_RE = /<(?=[@#!])/gu;
 const SLACK_TOKEN_RE = /\b(?:xox[a-z]|xapp)-[A-Za-z0-9-]+/gu;
 const SECRET_ASSIGNMENT_RE =
-  /\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|SIGNING_SECRET)[A-Z0-9_]*\s*[:=]\s*["']?[^,\s"']+/giu;
+  /(?:\\["'])?["']?\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|SIGNING_SECRET)[A-Z0-9_]*(?:\\["'])?["']?\s*[:=]\s*(?:\\"[^"\\]*\\"|\\'[^'\\]*\\'|"[^"]*"|'[^']*'|[^,\s"']+)/giu;
 
 // A redaction pattern that is still growing at the end of the buffer would be
 // split by an emit, so the tail it could still occupy is withheld instead.
@@ -15,11 +15,14 @@ const OPEN_TAIL_RES = [
   /<[^>]*$/u,
   /\S+\s*$/u,
   /\s+$/u,
-  /[A-Za-z0-9_]+\s*[:=]\s*["']?[^,\s"']*$/u,
+  /(?:\\["'])?["']?[A-Za-z0-9_]+(?:\\["'])?["']?\s*[:=]\s*(?:\\"[^"\\]*\\"|\\'[^'\\]*\\'|"[^"]*"|'[^']*'|\\"[^"\\]*\\?|\\'[^'\\]*\\?|"[^"]*|'[^']*|[^,\s"']*)\s*$/u,
 ];
 
 export const MAX_SLACK_MESSAGE_LENGTH = 3900;
 export const MAX_SLACK_APPEND_LENGTH = 12_000;
+export const MAX_SLACK_TASK_CHUNK_LENGTH = 256;
+
+export const SLACK_TASK_FALLBACK_TITLE = "Step";
 
 export const SLACK_DELIVERY_FALLBACK =
   "I finished the turn but produced no reply. Please try again.";
@@ -45,6 +48,14 @@ const redact = (text: string): string =>
     .replace(SLACK_TOKEN_RE, "[secret]")
     .replace(SECRET_ASSIGNMENT_RE, "[internal configuration]")
     .replaceAll(/\n{3,}/gu, "\n\n");
+
+// Task chunks are one-line labels, so the shared redaction runs over text
+// whose newlines have already collapsed. Length is left to `clampTaskChunk`,
+// which spends the budget across the whole chunk rather than per field.
+export const sanitizeTaskText = (text: string, fallback = ""): string => {
+  const safe = redact(text).replaceAll(/\s+/gu, " ").trim();
+  return safe === "" ? fallback : safe;
+};
 
 export const sanitizeReply = (
   text: string,
@@ -131,11 +142,114 @@ export const streamTargetFor = (turn: RoutedSlackTurn): SlackStreamTarget =>
     threadTs: turn.threadTs,
   });
 
+export type SlackTaskStatus = "pending" | "in_progress" | "complete" | "error";
+
+export interface SlackTaskUpdate {
+  id: string;
+  title: string;
+  status: SlackTaskStatus;
+  output?: string;
+}
+
+// Slack's `task_update` chunk, not the `task_card` block: the chunk keys the
+// task on `id` and takes `details`/`output` as plain strings, where the block
+// uses `task_id` and rich_text entities.
+// `id` is passed through unredacted because Slack never renders it: it is
+// only a correlation key, so the rendering-side attacks the sanitizer exists
+// to stop (broadcast pings, `<@...>` control sequences, markdown injection)
+// are unreachable through that field. An empty runtime id is stored as `_`
+// so the chunk stays a valid key. The budget path may still truncate the
+// id, and that is accepted. `title` and `output` are the visible text.
+interface SlackTaskChunk {
+  type: "task_update";
+  id: string;
+  title: string;
+  status: SlackTaskStatus;
+  output?: string;
+}
+
+// Slack budgets 256 characters per `task_update` chunk without splitting that
+// across its fields, and an oversized chunk comes back `invalid_chunks` - a
+// rejected append that would cost the user the whole reply. So the serialized
+// chunk is what gets measured, and the budget is spent in priority order: the
+// output first, then the title down to its fallback, and only then the id,
+// which is opaque. `title` is required, so it never empties.
+const taskChunkEncoder = new TextEncoder();
+
+// Measured in UTF-8 bytes, which is at least the character count Slack
+// documents: overshooting costs a shorter preview, undershooting costs the
+// reply. A UTF-16 length would undercount every non-ASCII result.
+const oversizeOf = (chunk: SlackTaskChunk): number =>
+  taskChunkEncoder.encode(JSON.stringify(chunk)).length -
+  MAX_SLACK_TASK_CHUNK_LENGTH;
+
+// The overflow is a byte count but a slice is indexed in UTF-16 units, so the
+// cut is scaled by the text's own bytes-per-unit rather than subtracted raw,
+// which would erase a multibyte field wholesale on the first pass.
+const trimTaskField = (text: string, overflow: number): string => {
+  const bytes = taskChunkEncoder.encode(text).length;
+  const drop =
+    bytes === 0 ? text.length : Math.ceil((overflow * text.length) / bytes);
+  const kept = text.slice(0, Math.max(0, text.length - drop));
+  // A slice can land between the halves of a surrogate pair, and the orphan
+  // would reach Slack escaped as a replacement character.
+  const whole = /[\uD800-\uDBFF]$/u.test(kept) ? kept.slice(0, -1) : kept;
+  return whole.trimEnd();
+};
+
+const shrinkTaskChunk = (
+  chunk: SlackTaskChunk,
+  overflow: number,
+): SlackTaskChunk | undefined => {
+  const { id, output, title, ...rest } = chunk;
+  if (output !== undefined) {
+    const kept = trimTaskField(output, overflow);
+    return kept === ""
+      ? { ...rest, id, title }
+      : { ...rest, id, output: kept, title };
+  }
+  if (title !== SLACK_TASK_FALLBACK_TITLE) {
+    const kept = trimTaskField(title, overflow);
+    return {
+      ...rest,
+      id,
+      title: kept === "" ? SLACK_TASK_FALLBACK_TITLE : kept,
+    };
+  }
+  if (id.length > 1) {
+    return {
+      ...rest,
+      id: id.slice(0, Math.max(1, id.length - overflow)),
+      title,
+    };
+  }
+  return undefined;
+};
+
+const clampTaskChunk = (chunk: SlackTaskChunk): SlackTaskChunk => {
+  let fitted = chunk;
+  let overflow = oversizeOf(fitted);
+  while (overflow > 0) {
+    const next = shrinkTaskChunk(fitted, overflow) ?? fitted;
+    // Identity is the no-progress case: shrink returned undefined, so
+    // `?? fitted` reused the current chunk and further passes cannot help.
+    if (next === fitted) {
+      return next;
+    }
+    fitted = next;
+    overflow = oversizeOf(next);
+  }
+  return fitted;
+};
+
 export interface SlackStream {
   append: (delta: string) => void;
+  task: (update: SlackTaskUpdate) => void;
   finish: (fallback: string) => Promise<void>;
   fail: (notice: string) => Promise<void>;
 }
+
+type SlackRequestBody = Record<string, string | SlackTaskChunk[]>;
 
 export const createSlackStream = (
   target: SlackStreamTarget,
@@ -150,7 +264,7 @@ export const createSlackStream = (
   let closed = false;
   let failure: Error | undefined;
 
-  const call = async (method: string, body: Record<string, string>) => {
+  const call = async (method: string, body: SlackRequestBody) => {
     const response = await fetcher(`https://slack.com/api/${method}`, {
       body: JSON.stringify(body),
       headers: {
@@ -179,9 +293,14 @@ export const createSlackStream = (
             channel: channelId,
             recipient_team_id: target.recipientTeamId,
             recipient_user_id: target.recipientUserId,
+            task_display_mode: "timeline",
             thread_ts: target.threadTs,
           }
-        : { channel: channelId, thread_ts: target.threadTs },
+        : {
+            channel: channelId,
+            task_display_mode: "timeline",
+            thread_ts: target.threadTs,
+          },
     );
     if (result.ts === undefined) {
       throw new Error("Slack chat.startStream returned no stream ts");
@@ -209,6 +328,28 @@ export const createSlackStream = (
       });
       appended = true;
     }
+  };
+
+  // A task update rides the same append call as reply text but never sets
+  // `appended`: a turn that only ran tools still owes the user a reply.
+  const sendTask = async (update: SlackTaskUpdate): Promise<void> => {
+    const ts = await start();
+    const output =
+      update.output === undefined ? "" : sanitizeTaskText(update.output);
+    const chunk: SlackTaskChunk = {
+      id: update.id === "" ? "_" : update.id,
+      status: update.status,
+      title: sanitizeTaskText(update.title, SLACK_TASK_FALLBACK_TITLE),
+      type: "task_update",
+    };
+    if (output !== "") {
+      chunk.output = output;
+    }
+    await call("chat.appendStream", {
+      channel: channelId,
+      chunks: [clampTaskChunk(chunk)],
+      ts,
+    });
   };
 
   const attempt = async (work: () => Promise<void>): Promise<void> => {
@@ -276,6 +417,12 @@ export const createSlackStream = (
       if (failure !== undefined) {
         throw failure;
       }
+    },
+    task(update) {
+      if (closed) {
+        return;
+      }
+      enqueue(() => sendTask(update));
     },
   };
 };
