@@ -7,6 +7,7 @@ import type { ToolDefinition } from "@flue/runtime/tool";
 import * as v from "valibot";
 
 import defaultConfig from "../agent.config.ts";
+import { mockCloudflareWorkers } from "./module-mocks.ts";
 
 const noopLogger: FlueLogger = {
   error() {},
@@ -61,22 +62,21 @@ const extensionConfig = defineAgentConfig<RuntimeContext>({
   plugins: [plugin],
 });
 
-await mock.module("cloudflare:workers", () => ({ env: bindings }));
+await mockCloudflareWorkers(bindings);
 await mock.module("../agent.config.ts", () => ({ default: extensionConfig }));
+const runtime = await import("@flue/runtime");
 await mock.module("@flue/runtime", () => ({
-  observe: () => {},
-  useAgentFinish: () => {},
-  useInitialData: () => ({
-    channelId: "C123",
-    surface: "private",
-    teamId: "T123",
-    threadTs: "171.2",
-  }),
+  ...runtime,
   useInstruction: (instruction: string) => instructions.push(instruction),
   useModel: () => {},
   useTool: (tool: ToolDefinition) => tools.push(tool),
 }));
+// The spread keeps the mocked export list as wide as the real module: Bun
+// freezes it on first use, so a narrow mock breaks whichever test file loads
+// next and the breakage only shows up in one test-file order.
+const cloudflare = await import("@flue/runtime/cloudflare");
 await mock.module("@flue/runtime/cloudflare", () => ({
+  ...cloudflare,
   extend: () => ({ base: undefined }),
 }));
 

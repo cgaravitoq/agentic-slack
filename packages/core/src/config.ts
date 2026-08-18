@@ -4,7 +4,11 @@ export const PRIVATE_RETENTION_DAYS = 7;
 export const CHANNEL_RETENTION_DAYS = 15;
 export const MODEL = "cloudflare/@cf/zai-org/glm-4.7-flash";
 export const CLOUDFLARE_TRACING_CONTENT = false;
-export const CORE_REPLY_TOOL_NAME = "reply_in_slack";
+// The retired delivery tool name stays reserved so no extension can pose as
+// the delivery boundary the model was taught to trust.
+export const RESERVED_TOOL_NAMES: readonly string[] = Object.freeze([
+  "reply_in_slack",
+]);
 export const MAX_SUGGESTED_PROMPTS = 4;
 
 export type ExtensionToolFactory<RuntimeContext> = (

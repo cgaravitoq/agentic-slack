@@ -4,7 +4,6 @@ import {
   composeTools,
   defineAgentConfig,
 } from "@agentic-slack/core";
-import { defineTool } from "@flue/runtime/tool";
 import type { FlueLogger } from "@flue/runtime";
 import { createLlmsDocsPlugin } from "../src/index.ts";
 
@@ -337,19 +336,7 @@ describe("llms documentation plugin", () => {
       "Ground factual answers in read_doc evidence and visibly cite each returned source URL.",
     ]);
     expect(networkCalls).toBe(0);
-    expect(
-      composeTools(
-        config,
-        {},
-        defineTool({
-          description: "Reply",
-          name: "reply_in_slack",
-          run() {
-            return Promise.resolve(Promise.resolve({ terminate: true }));
-          },
-        }),
-      ),
-    ).toHaveLength(3);
+    expect(composeTools(config, {})).toHaveLength(2);
     expect(networkCalls).toBe(0);
   });
 

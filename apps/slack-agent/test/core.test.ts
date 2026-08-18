@@ -11,17 +11,15 @@ import {
   composeInstructions,
   composeTools,
   CORE_INSTRUCTIONS,
-  CORE_REPLY_TOOL_NAME,
-  createReplyTool,
   defineAgentConfig,
   expireLatest,
-  extractAssistantText,
   generateSlackManifest,
   MAX_SUGGESTED_PROMPTS,
   missingReadiness,
   MODEL,
   PRIVATE_RETENTION_DAYS,
   replaceRetention,
+  RESERVED_TOOL_NAMES,
   setSuggestedPrompts,
 } from "@agentic-slack/core";
 
@@ -31,15 +29,6 @@ interface TestRuntimeContext {
     addonRoute: string;
   };
 }
-
-const terminalTool = () =>
-  defineTool({
-    description: "Reply.",
-    name: CORE_REPLY_TOOL_NAME,
-    run() {
-      return Promise.resolve({ output: "posted", terminate: true });
-    },
-  });
 
 const createTools = () => [];
 
@@ -131,15 +120,13 @@ describe("neutral core composition", () => {
   });
 
   test("preserves core-only instruction and tool behavior when extensions are absent", () => {
-    const terminal = terminalTool();
-
     expect(config.plugins).toEqual([]);
     expect(config.addons).toEqual([]);
     expect(composeInstructions(config)).toEqual([
       ...CORE_INSTRUCTIONS,
       "Prefer short answers.",
     ]);
-    expect(composeTools(config, undefined, terminal)).toEqual([terminal]);
+    expect(composeTools(config, {})).toEqual([]);
   });
 
   test("resolves config and manifests without invoking runtime factories", async () => {
@@ -194,16 +181,13 @@ describe("neutral core composition", () => {
       ownerInstructions: "Follow the owner's preferences.",
       plugins: [createTestPlugin(factoryCalls, toolCalls)],
     });
-    const terminal = terminalTool();
     const instructions = composeInstructions(extensionConfig);
     expect(factoryCalls).toEqual([]);
     expect(JSON.stringify(extensionConfig)).not.toContain(pluginSecret);
     expect(JSON.stringify(extensionConfig)).not.toContain(addonRoute);
-    const tools = composeTools(
-      extensionConfig,
-      { bindings: { addonRoute, pluginSecret } },
-      terminal,
-    );
+    const tools = composeTools(extensionConfig, {
+      bindings: { addonRoute, pluginSecret },
+    });
 
     expect(instructions).toEqual([
       ...CORE_INSTRUCTIONS,
@@ -214,7 +198,6 @@ describe("neutral core composition", () => {
     expect(tools.map((tool) => tool.name)).toEqual([
       "test_search",
       "test_triage",
-      CORE_REPLY_TOOL_NAME,
     ]);
     expect(factoryCalls).toEqual(["plugin", "addon"]);
     const modelVisible = JSON.stringify({
@@ -236,7 +219,7 @@ describe("neutral core composition", () => {
     ]);
   });
 
-  test("rejects duplicate extension ids across kinds and reply tool shadowing", () => {
+  test("rejects duplicate extension ids across kinds and reserved tool names", () => {
     expect(() =>
       defineAgentConfig({
         addons: [{ id: "shared", kind: "addon" }],
@@ -256,7 +239,7 @@ describe("neutral core composition", () => {
             return [
               defineTool({
                 description: "Shadow reply.",
-                name: CORE_REPLY_TOOL_NAME,
+                name: RESERVED_TOOL_NAMES[0] ?? "",
                 run() {
                   return Promise.resolve("shadowed");
                 },
@@ -268,8 +251,9 @@ describe("neutral core composition", () => {
         },
       ],
     });
-    expect(() => composeTools(shadowConfig, undefined, terminalTool())).toThrow(
-      `Agent extensions cannot register ${CORE_REPLY_TOOL_NAME}`,
+    expect(RESERVED_TOOL_NAMES).toContain("reply_in_slack");
+    expect(() => composeTools(shadowConfig, {})).toThrow(
+      `Agent extensions cannot register ${RESERVED_TOOL_NAMES[0]}`,
     );
   });
 
@@ -321,118 +305,6 @@ describe("neutral core composition", () => {
         ownerInstructions: "Be concise.",
       }),
     ).toThrow("Agent extension invalid requires non-empty instructions");
-  });
-});
-
-describe("terminal Slack delivery", () => {
-  test("joins text blocks and ignores thinking and tool calls", () => {
-    const content = [
-      { text: "First", type: "text" },
-      { thinking: "hidden reasoning", type: "thinking" },
-      { text: "Second", type: "text" },
-      { arguments: {}, id: "c1", name: "x", type: "toolCall" },
-    ];
-    expect(extractAssistantText(content)).toBe("First\nSecond");
-  });
-
-  test("returns an empty string for empty or undefined content", () => {
-    expect(extractAssistantText()).toBe("");
-    expect(extractAssistantText([])).toBe("");
-    expect(extractAssistantText([{ text: "", type: "text" }])).toBe("");
-  });
-
-  test("binds destination and credential, sanitizes text, and posts once", async () => {
-    const requests: { input: RequestInfo | URL; init?: RequestInit }[] = [];
-    const tool = createReplyTool(
-      { channelId: "C123", threadTs: "171.2" },
-      "xoxb-trusted-token",
-      (input, init) => {
-        requests.push({ init, input });
-        return Promise.resolve(Response.json({ ok: true, ts: "171.3" }));
-      },
-    );
-    const input = runContext({
-      text: "<!channel> <@U999> xoxb-leaked SIGNING_SECRET=oops\n\n\nDone",
-    });
-
-    expect(await tool.run(input)).toEqual({
-      output: "posted",
-      terminate: true,
-    });
-    expect(await tool.run(input)).toEqual({ output: "already posted" });
-    expect(requests).toHaveLength(1);
-    const [request] = requests;
-    expect(request.input).toBe("https://slack.com/api/chat.postMessage");
-    expect(request.init?.headers).toMatchObject({
-      authorization: "Bearer xoxb-trusted-token",
-      "content-type": "application/json; charset=utf-8",
-    });
-    if (!v.is(v.string(), request.init?.body)) {
-      throw new TypeError("Expected JSON body");
-    }
-    expect(
-      v.parse(
-        v.object({
-          channel: v.string(),
-          text: v.string(),
-          thread_ts: v.string(),
-          unfurl_links: v.boolean(),
-          unfurl_media: v.boolean(),
-        }),
-        JSON.parse(request.init.body),
-      ),
-    ).toEqual({
-      channel: "C123",
-      text: "&lt;@U999> [secret] [internal configuration]\n\nDone",
-      thread_ts: "171.2",
-      unfurl_links: false,
-      unfurl_media: false,
-    });
-  });
-
-  test("enforces Slack's safe length limit", async () => {
-    let delivered = "";
-    const tool = createReplyTool(
-      { channelId: "C123", threadTs: "171.2" },
-      "xoxb-trusted-token",
-      (_input, init) => {
-        if (!v.is(v.string(), init?.body)) {
-          return Promise.reject(new Error("Expected JSON body"));
-        }
-        delivered = v.parse(
-          v.object({ text: v.string() }),
-          JSON.parse(init.body),
-        ).text;
-        return Promise.resolve(Response.json({ ok: true }));
-      },
-    );
-    await tool.run(runContext({ text: "a".repeat(4100) }));
-    expect(delivered).toHaveLength(3893);
-    expect(delivered.endsWith("\n\n(truncated)")).toBe(true);
-  });
-
-  test("coalesces concurrent terminal delivery attempts", async () => {
-    let posts = 0;
-    const { promise: blocked, resolve: release } =
-      Promise.withResolvers<undefined>();
-    const tool = createReplyTool(
-      { channelId: "C123", threadTs: "171.2" },
-      "xoxb-trusted-token",
-      async () => {
-        posts += 1;
-        await blocked;
-        return Response.json({ ok: true });
-      },
-    );
-    const input = runContext({ text: "hello" });
-    const first = tool.run(input);
-    const second = tool.run(input);
-    expect(posts).toBe(1);
-    release();
-    expect(await Promise.all([first, second])).toEqual([
-      { output: "posted", terminate: true },
-      { output: "already posted" },
-    ]);
   });
 });
 

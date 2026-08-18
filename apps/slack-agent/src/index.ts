@@ -1,9 +1,13 @@
 import { env } from "cloudflare:workers";
 import {
   CLOUDFLARE_TRACING_CONTENT,
+  createSlackStream,
   refreshRetention,
+  SLACK_DELIVERY_FALLBACK,
+  SLACK_STREAM_FAILURE_NOTICE,
+  streamTargetFor,
 } from "@agentic-slack/core";
-import { dispatch, instrument, setProvider } from "@flue/runtime";
+import { init, instrument, setProvider } from "@flue/runtime";
 import { createCloudflareTracing } from "@flue/runtime/cloudflare";
 import { cloudflareBindingProvider } from "@flue/runtime/cloudflare/workers-ai";
 import * as v from "valibot";
@@ -59,15 +63,9 @@ export default createApp(
         );
       }
     }
-    await dispatch(SlackAgent, {
-      id: instanceId,
+    const handle = init(SlackAgent, { id: instanceId });
+    const receipt = await handle.dispatch({
       idempotencyKey: turn.eventId,
-      initialData: {
-        channelId: turn.channelId,
-        surface: turn.surface,
-        teamId: turn.teamId,
-        threadTs: turn.threadTs,
-      },
       message: {
         attributes: {
           event_id: turn.eventId,
@@ -80,6 +78,22 @@ export default createApp(
           turn.surface === "private" ? "slack.message.im" : "slack.app_mention",
       },
     });
+    // The stream is opened, fed and closed here so the destination stays bound
+    // to the routed event and never to anything the model produced.
+    const stream = createSlackStream(streamTargetFor(turn), trusted.botToken);
+    try {
+      const reply = await handle.read(receipt, {
+        onEvent(chunk) {
+          if (chunk.type === "message-delta" && chunk.kind === "text") {
+            stream.append(chunk.delta);
+          }
+        },
+      });
+      await stream.finish(reply.text || SLACK_DELIVERY_FALLBACK);
+    } catch (error: unknown) {
+      await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+      throw error;
+    }
   },
   createLifecycleHandler(config, trusted.botToken),
 );

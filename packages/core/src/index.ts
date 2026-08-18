@@ -2,11 +2,11 @@ export { setSuggestedPrompts } from "./assistant.ts";
 export {
   CHANNEL_RETENTION_DAYS,
   CLOUDFLARE_TRACING_CONTENT,
-  CORE_REPLY_TOOL_NAME,
   defineAgentConfig,
   MAX_SUGGESTED_PROMPTS,
   MODEL,
   PRIVATE_RETENTION_DAYS,
+  RESERVED_TOOL_NAMES,
 } from "./config.ts";
 export type {
   AgentAddon,
@@ -19,13 +19,20 @@ export type {
 } from "./config.ts";
 export { claimAndRun, claimEvent, releaseEvent } from "./dedup.ts";
 export {
-  createReplyTool,
-  extractAssistantText,
+  createSlackStream,
+  createStreamSanitizer,
+  MAX_SLACK_APPEND_LENGTH,
   MAX_SLACK_MESSAGE_LENGTH,
   sanitizeReply,
   SLACK_DELIVERY_FALLBACK,
+  SLACK_STREAM_FAILURE_NOTICE,
+  streamTargetFor,
 } from "./delivery.ts";
-export type { SlackDestination } from "./delivery.ts";
+export type {
+  SlackStream,
+  SlackStreamTarget,
+  StreamSanitizer,
+} from "./delivery.ts";
 export { generateSlackManifest } from "./manifest.ts";
 export {
   composeInstructions,

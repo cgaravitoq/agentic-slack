@@ -1,6 +1,10 @@
 import * as v from "valibot";
 import type { SuggestedPrompt } from "./config.ts";
-import type { SlackDestination } from "./delivery.ts";
+
+interface AssistantThread {
+  channelId: string;
+  threadTs: string;
+}
 
 type Fetcher = (input: string, init: RequestInit) => Promise<Response>;
 
@@ -10,7 +14,7 @@ const slackResponse = v.object({
 });
 
 export const setSuggestedPrompts = async (
-  destination: SlackDestination,
+  destination: AssistantThread,
   prompts: readonly SuggestedPrompt[],
   token: string,
   fetcher: Fetcher = fetch,

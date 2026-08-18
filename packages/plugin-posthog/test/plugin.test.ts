@@ -4,7 +4,6 @@ import {
   composeTools,
   defineAgentConfig,
 } from "@agentic-slack/core";
-import { defineTool } from "@flue/runtime/tool";
 import type { FlueLogger } from "@flue/runtime";
 
 import { createPostHogPlugin } from "../src/index.ts";
@@ -20,15 +19,6 @@ const secret = "phx_private_key";
 const now = () => Date.parse("2026-08-13T12:00:00.000Z");
 const query =
   "SELECT count() AS total FROM events WHERE timestamp >= {start} AND timestamp <= {end} LIMIT 20";
-
-const terminalTool = () =>
-  defineTool({
-    description: "Deliver the final reply.",
-    name: "reply_in_slack",
-    run() {
-      return Promise.resolve({ output: "posted", terminate: true });
-    },
-  });
 
 const plugin = (fetcher: PostHogFetcher, resolverCalls: string[] = []) =>
   createPostHogPlugin<{
@@ -59,7 +49,7 @@ const runtime = () => ({
 });
 
 const tool = (fetcher: PostHogFetcher) =>
-  composeTools(config(fetcher), runtime(), terminalTool())[0];
+  composeTools(config(fetcher), runtime())[0];
 
 interface QueryInput {
   readonly presentation: unknown;
@@ -115,7 +105,7 @@ const nonFiniteFetcher: PostHogFetcher = () =>
   );
 
 describe("PostHog read-only plugin", () => {
-  test("is runtime-lazy, keeps credentials closure-bound, and remains before core reply", () => {
+  test("is runtime-lazy, keeps credentials closure-bound, and stays lazy", () => {
     const calls: string[] = [];
     const resolved = config(okFetcher, calls);
 
@@ -130,12 +120,9 @@ describe("PostHog read-only plugin", () => {
     expect(composeInstructions(resolved).join(" ")).toContain(
       "cannot inspect its permissions",
     );
-    const tools = composeTools(resolved, runtime(), terminalTool());
+    const tools = composeTools(resolved, runtime());
     expect(calls).toEqual(["resolved"]);
-    expect(tools.map(({ name }) => name)).toEqual([
-      "query_posthog",
-      "reply_in_slack",
-    ]);
+    expect(tools.map(({ name }) => name)).toEqual(["query_posthog"]);
     expect(
       JSON.stringify(
         tools.map(({ name, description, input }) => ({
@@ -373,16 +360,12 @@ describe("PostHog read-only plugin", () => {
       plugins: [pathPlugin],
     });
     expect(() =>
-      composeTools(
-        pathConfig,
-        {
-          credentials: {
-            ...runtime().credentials,
-            host: "https://eu.posthog.com/api",
-          },
+      composeTools(pathConfig, {
+        credentials: {
+          ...runtime().credentials,
+          host: "https://eu.posthog.com/api",
         },
-        terminalTool(),
-      ),
+      }),
     ).toThrow("Invalid PostHog host");
     expect(
       await run(nonFiniteFetcher, {
