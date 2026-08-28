@@ -7,13 +7,23 @@ export {
 export type { ResolvedAgentConfig } from "./config.ts";
 export { claimAndRun, claimEvent, releaseEvent } from "./dedup.ts";
 export {
+  applySlackDeliveryEvent,
   createSlackStream,
+  createSqlSlackDeliveryStore,
+  evictLiveSlackDelivery,
+  failSlackDelivery,
+  finishSlackDelivery,
   MAX_SLACK_APPEND_LENGTH,
   MAX_SLACK_MESSAGE_LENGTH,
+  openSlackDelivery,
   SLACK_DELIVERY_FALLBACK,
+  slackDeliveryBinding,
+  slackDeliveryBindingSchema,
+  slackEventFromObservation,
   SLACK_STREAM_FAILURE_NOTICE,
   streamTargetFor,
 } from "./delivery.ts";
+export type { SlackDeliveryBinding, SlackDeliveryStore } from "./delivery.ts";
 export {
   MAX_SLACK_TASK_CHUNK_LENGTH,
   SLACK_TASK_FALLBACK_TITLE,

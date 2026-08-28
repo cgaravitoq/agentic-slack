@@ -1,10 +1,8 @@
 import { env } from "cloudflare:workers";
 import {
   CLOUDFLARE_TRACING_CONTENT,
-  createSlackStream,
   refreshRetention,
-  SLACK_DELIVERY_FALLBACK,
-  SLACK_STREAM_FAILURE_NOTICE,
+  slackDeliveryBinding,
   streamTargetFor,
 } from "@agentic-slack/core";
 import { init, instrument, setProvider } from "@flue/runtime";
@@ -21,18 +19,6 @@ const slackResponse = v.object({
   error: v.optional(v.string()),
   ok: v.optional(v.boolean()),
 });
-
-// A tool result is whatever the tool returned, so it is rendered to text here,
-// at the edge of the runtime, before the stream sanitizes it for Slack.
-const toolOutputText = v.union([
-  v.string(),
-  v.pipe(
-    v.unknown(),
-    v.transform((value) =>
-      value === undefined || value === null ? "" : JSON.stringify(value),
-    ),
-  ),
-]);
 
 const bindings: WorkerBindings = env;
 const trusted = {
@@ -76,8 +62,9 @@ export default createApp(
       }
     }
     const handle = init(SlackAgent, { id: instanceId });
-    const receipt = await handle.dispatch({
+    await handle.dispatch({
       idempotencyKey: turn.eventId,
+      initialData: slackDeliveryBinding(streamTargetFor(turn)),
       message: {
         attributes: {
           event_id: turn.eventId,
@@ -90,52 +77,6 @@ export default createApp(
           turn.surface === "private" ? "slack.message.im" : "slack.app_mention",
       },
     });
-    // The stream is opened, fed and closed here so the destination stays bound
-    // to the routed event and never to anything the model produced.
-    const stream = createSlackStream(streamTargetFor(turn), trusted.botToken);
-    // `tool-output` and `tool-output-error` carry only the call id, so the name
-    // a result is shown under has to come from the `tool-input` that opened it.
-    const toolNames = new Map<string, string>();
-    try {
-      const reply = await handle.read(receipt, {
-        onEvent(chunk) {
-          if (chunk.type === "message-delta" && chunk.kind === "text") {
-            stream.append(chunk.delta);
-            return;
-          }
-          if (chunk.type === "tool-input") {
-            toolNames.set(chunk.toolCallId, chunk.toolName);
-            stream.task({
-              id: chunk.toolCallId,
-              status: "in_progress",
-              title: chunk.toolName,
-            });
-            return;
-          }
-          if (chunk.type === "tool-output") {
-            stream.task({
-              id: chunk.toolCallId,
-              output: v.parse(toolOutputText, chunk.output),
-              status: "complete",
-              title: toolNames.get(chunk.toolCallId) ?? "",
-            });
-            return;
-          }
-          if (chunk.type === "tool-output-error") {
-            stream.task({
-              id: chunk.toolCallId,
-              output: chunk.errorText,
-              status: "error",
-              title: toolNames.get(chunk.toolCallId) ?? "",
-            });
-          }
-        },
-      });
-      await stream.finish(reply.text || SLACK_DELIVERY_FALLBACK);
-    } catch (error: unknown) {
-      await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
-      throw error;
-    }
   },
   createLifecycleHandler(config, trusted.botToken),
 );

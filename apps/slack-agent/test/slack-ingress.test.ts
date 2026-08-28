@@ -233,7 +233,7 @@ describe("signed Slack ingress", () => {
       );
     expect(directResponse.status).toBe(200);
     await Promise.all(pending);
-    expect(turns.at(-1)).toBe("private hello:slack:v1:T123:D123:172.1");
+    expect(turns.at(-1)).toBe("private hello:slack:v1:T123:D123:D123");
   });
 
   test("rejects invalid signatures, mismatched identity, bots, subtypes, and empty turns", async () => {

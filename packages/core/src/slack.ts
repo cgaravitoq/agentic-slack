@@ -62,6 +62,12 @@ export interface RoutedSlackLifecycle {
 
 export type RoutedSlackEvent = RoutedSlackTurn | RoutedSlackLifecycle;
 
+const conversationInstanceRef = (turn: RoutedSlackTurn) => ({
+  channelId: turn.channelId,
+  teamId: turn.teamId,
+  threadTs: turn.surface === "private" ? turn.channelId : turn.threadTs,
+});
+
 export interface SlackCoreEnv {
   Bindings: SlackCoreBindings;
 }
@@ -192,11 +198,7 @@ export const createSlackIngress = (
           ? () =>
               handleTurn(
                 routed,
-                channel.instanceId({
-                  channelId: routed.channelId,
-                  teamId: routed.teamId,
-                  threadTs: routed.threadTs,
-                }),
+                channel.instanceId(conversationInstanceRef(routed)),
                 c.env,
               )
           : handleLifecycle && (() => handleLifecycle(routed, c.env));

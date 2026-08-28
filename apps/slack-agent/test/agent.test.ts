@@ -43,6 +43,10 @@ await mockCloudflareWorkers({
 const runtime = await import("@flue/runtime");
 await mock.module("@flue/runtime", () => ({
   ...runtime,
+  observe: () => () => {},
+  useAgentFinish: () => {},
+  useAgentStart: () => {},
+  useInitialData: () => {},
   useInstruction: (instruction: string) => instructions.push(instruction),
   useModel: (model: string) => {
     resolvedModel = model;

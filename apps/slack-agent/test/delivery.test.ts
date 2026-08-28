@@ -1,20 +1,27 @@
 import { describe, expect, test } from "bun:test";
 import {
+  applySlackDeliveryEvent,
   createSlackStream,
+  evictLiveSlackDelivery,
+  finishSlackDelivery,
   MAX_SLACK_APPEND_LENGTH,
   MAX_SLACK_MESSAGE_LENGTH,
   MAX_SLACK_TASK_CHUNK_LENGTH,
+  openSlackDelivery,
   SLACK_DELIVERY_FALLBACK,
+  slackDeliveryBinding,
+  slackEventFromObservation,
   SLACK_STREAM_FAILURE_NOTICE,
   SLACK_TASK_FALLBACK_TITLE,
   streamTargetFor,
 } from "@agentic-slack/core";
+import type { RoutedSlackTurn, SlackDeliveryStore } from "@agentic-slack/core";
+import type { FlueObservation } from "@flue/runtime";
 import {
   createStreamSanitizer,
   sanitizeReply,
   STREAM_TAIL_LENGTH,
 } from "../../../packages/core/src/delivery.ts";
-import type { RoutedSlackTurn } from "@agentic-slack/core";
 import * as v from "valibot";
 
 const BOT_TOKEN = "xoxb-trusted-token";
@@ -258,6 +265,32 @@ describe("trusted Slack streaming delivery", () => {
     });
     expect(slack.markdown()).toBe("Hello there, all done.");
     expect(JSON.stringify(slack.calls)).not.toContain("C999");
+  });
+
+  test("coalesces a 300-word answer into fewer than 20 appends with identical text", async () => {
+    const words = Array.from(
+      { length: 300 },
+      (_unused, index) => `word${String(index).padStart(3, "0")} `,
+    );
+    const sanitizer = createStreamSanitizer();
+    let uncoalesced = "";
+    for (const word of words) {
+      uncoalesced += sanitizer.push(word);
+    }
+    uncoalesced += sanitizer.flush();
+
+    const slack = createFakeSlack();
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    for (const word of words) {
+      stream.append(word);
+    }
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    const appends = slack
+      .methods()
+      .filter((method) => method === "chat.appendStream").length;
+    expect(appends).toBeLessThan(20);
+    expect(slack.markdown()).toBe(uncoalesced);
   });
 
   test("omits the recipient identity outside channels", async () => {
@@ -1030,5 +1063,89 @@ describe("routed stream target", () => {
     expect(target.recipientUserId).toBe("U123");
     expect(target.recipientTeamId).toBe("T123");
     expect(target.surface).toBe("channel");
+  });
+});
+
+describe("observation delivery mapping", () => {
+  const envelope = {
+    eventIndex: 0,
+    instanceId: "slack:v1:T123:C123:171.2",
+    timestamp: "2026-01-01T00:00:00.000Z",
+    v: 3 as const,
+  };
+
+  test("a failed tool uses the error text, not an empty result object", () => {
+    const event = {
+      ...envelope,
+      durationMs: 4,
+      errorInfo: { message: "upstream refused the request", type: "tool" },
+      isError: true,
+      result: {},
+      toolCallId: "call-2",
+      toolName: "search_docs",
+      type: "tool",
+    } satisfies FlueObservation;
+
+    expect(slackEventFromObservation(event)).toEqual({
+      error: true,
+      id: "call-2",
+      output: "upstream refused the request",
+      type: "tool-result",
+    });
+  });
+
+  test("a successful tool prefers effectiveResult over the harness result", () => {
+    const event = {
+      ...envelope,
+      durationMs: 4,
+      effectiveResult: "found three matches",
+      isError: false,
+      result: { content: [{ text: "found three matches", type: "text" }] },
+      toolCallId: "call-1",
+      toolName: "search_docs",
+      type: "tool",
+    } satisfies FlueObservation;
+
+    expect(slackEventFromObservation(event)).toEqual({
+      error: false,
+      id: "call-1",
+      output: "found three matches",
+      type: "tool-result",
+    });
+  });
+});
+
+describe("durable Slack delivery", () => {
+  test("does not throw or double-post when finish hits a Slack error and is retried", async () => {
+    const slack = createFakeSlack({ "chat.stopStream": "channel_not_found" });
+    const rows = new Map<
+      string,
+      NonNullable<ReturnType<SlackDeliveryStore["load"]>>
+    >();
+    const store: SlackDeliveryStore = {
+      load(instanceId) {
+        return rows.get(instanceId);
+      },
+      save(instanceId, record) {
+        rows.set(instanceId, record);
+      },
+    };
+    openSlackDelivery(
+      store,
+      "i1",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    applySlackDeliveryEvent(store, "i1", { text: "hello", type: "text" });
+    await finishSlackDelivery(store, "i1", BOT_TOKEN);
+    const calls = slack.calls.length;
+    await finishSlackDelivery(store, "i1", BOT_TOKEN);
+    evictLiveSlackDelivery();
+
+    expect(slack.calls).toHaveLength(calls);
+    expect(
+      slack.methods().filter((method) => method === "chat.startStream"),
+    ).toHaveLength(1);
   });
 });

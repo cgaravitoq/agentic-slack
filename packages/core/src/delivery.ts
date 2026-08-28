@@ -1,3 +1,4 @@
+import type { ConversationStreamChunk, FlueObservation } from "@flue/runtime";
 import * as v from "valibot";
 import type { ConversationSurface } from "./retention.ts";
 import type { RoutedSlackTurn } from "./slack.ts";
@@ -110,7 +111,7 @@ export const createStreamSanitizer = (): StreamSanitizer => {
 
 const routedOrigin = Symbol("routedOrigin");
 
-export interface SlackStreamTarget {
+interface SlackStreamTarget {
   readonly channelId: string;
   readonly threadTs: string;
   readonly recipientUserId: string;
@@ -129,6 +130,45 @@ export const streamTargetFor = (turn: RoutedSlackTurn): SlackStreamTarget =>
     threadTs: turn.threadTs,
   });
 
+export const slackDeliveryBindingSchema = v.object({
+  channelId: v.pipe(v.string(), v.minLength(1)),
+  recipientTeamId: v.pipe(v.string(), v.minLength(1)),
+  recipientUserId: v.pipe(v.string(), v.minLength(1)),
+  surface: v.picklist(["channel", "private"]),
+  threadTs: v.pipe(v.string(), v.minLength(1)),
+});
+
+export type SlackDeliveryBinding = v.InferOutput<
+  typeof slackDeliveryBindingSchema
+>;
+
+export const slackDeliveryBinding = (
+  target: SlackStreamTarget,
+): SlackDeliveryBinding =>
+  v.parse(slackDeliveryBindingSchema, {
+    channelId: target.channelId,
+    recipientTeamId: target.recipientTeamId,
+    recipientUserId: target.recipientUserId,
+    surface: target.surface,
+    threadTs: target.threadTs,
+  });
+
+const streamTargetFromBinding = (
+  binding: SlackDeliveryBinding,
+): SlackStreamTarget =>
+  streamTargetFor({
+    appId: "_",
+    channelId: binding.channelId,
+    eventId: "_",
+    kind: "turn",
+    messageTs: "_",
+    surface: binding.surface,
+    teamId: binding.recipientTeamId,
+    text: "_",
+    threadTs: binding.threadTs,
+    userId: binding.recipientUserId,
+  });
+
 export interface SlackStream {
   append: (delta: string) => void;
   task: (update: SlackTaskUpdate) => void;
@@ -136,7 +176,101 @@ export interface SlackStream {
   fail: (notice: string) => Promise<void>;
 }
 
+export type SlackDeliveryEvent =
+  | { type: "text"; text: string }
+  | { type: "tool-start"; id: string; name: string }
+  | { type: "tool-result"; id: string; output: string; error: boolean };
+
+interface SlackDeliveryRecord {
+  binding: SlackDeliveryBinding;
+  events: SlackDeliveryEvent[];
+  replyText: string;
+  failed: boolean;
+  closed: boolean;
+}
+
+export interface SlackDeliveryStore {
+  load: (instanceId: string) => SlackDeliveryRecord | undefined;
+  save: (instanceId: string, record: SlackDeliveryRecord) => void;
+}
+
+interface SqlExec {
+  exec: (query: string, ...bindings: string[]) => { toArray: () => unknown[] };
+}
+
+const deliveryRow = v.object({ payload: v.string() });
+
+const slackDeliveryRecordSchema = v.object({
+  binding: slackDeliveryBindingSchema,
+  closed: v.boolean(),
+  events: v.array(
+    v.union([
+      v.object({ text: v.string(), type: v.literal("text") }),
+      v.object({
+        id: v.string(),
+        name: v.string(),
+        type: v.literal("tool-start"),
+      }),
+      v.object({
+        error: v.boolean(),
+        id: v.string(),
+        output: v.string(),
+        type: v.literal("tool-result"),
+      }),
+    ]),
+  ),
+  failed: v.boolean(),
+  replyText: v.string(),
+});
+
+export const createSqlSlackDeliveryStore = (
+  sql: SqlExec,
+): SlackDeliveryStore => {
+  sql.exec(`
+    CREATE TABLE IF NOT EXISTS slack_delivery (
+      instance_id TEXT PRIMARY KEY,
+      payload TEXT NOT NULL
+    )
+  `);
+  return {
+    load(instanceId) {
+      const [row] = sql
+        .exec(
+          "SELECT payload FROM slack_delivery WHERE instance_id = ?",
+          instanceId,
+        )
+        .toArray();
+      let record: SlackDeliveryRecord | undefined;
+      if (row !== undefined && v.is(deliveryRow, row)) {
+        record = v.parse(slackDeliveryRecordSchema, JSON.parse(row.payload));
+      }
+      return record;
+    },
+    save(instanceId, record) {
+      sql.exec(
+        `INSERT INTO slack_delivery (instance_id, payload) VALUES (?, ?)
+         ON CONFLICT(instance_id) DO UPDATE SET payload = excluded.payload`,
+        instanceId,
+        JSON.stringify(record),
+      );
+    },
+  };
+};
+
 type SlackRequestBody = Record<string, string | SlackTaskChunk[]>;
+
+const COALESCE_CHARS = 1024;
+const COALESCE_MS = 300;
+
+const toolOutputText = v.union([
+  v.string(),
+  v.pipe(
+    v.unknown(),
+    v.transform((value) =>
+      value === undefined || value === null ? "" : JSON.stringify(value),
+    ),
+  ),
+]);
 
 export const createSlackStream = (
   target: SlackStreamTarget,
@@ -150,6 +284,8 @@ export const createSlackStream = (
   let appended = false;
   let closed = false;
   let failure: Error | undefined;
+  let pending = "";
+  let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
 
   const call = async (method: string, body: SlackRequestBody) => {
     const response = await fetcher(`https://slack.com/api/${method}`, {
@@ -265,11 +401,39 @@ export const createSlackStream = (
     })();
   };
 
+  const flushPending = (): void => {
+    if (coalesceTimer !== undefined) {
+      clearTimeout(coalesceTimer);
+      coalesceTimer = undefined;
+    }
+    const markdown = pending;
+    pending = "";
+    if (markdown) {
+      enqueue(() => send(markdown));
+    }
+  };
+
+  const bufferAppend = (safe: string): void => {
+    if (!safe) {
+      return;
+    }
+    pending += safe;
+    if (pending.length >= COALESCE_CHARS) {
+      flushPending();
+      return;
+    }
+    coalesceTimer ??= setTimeout(() => {
+      coalesceTimer = undefined;
+      flushPending();
+    }, COALESCE_MS);
+  };
+
   const close = async (trailer: string, always: boolean): Promise<void> => {
     if (closed) {
       return;
     }
     closed = true;
+    flushPending();
     enqueue(() => send(sanitizer.flush()));
     await queue;
     // A recorded failure must reach the user on whichever path closes the
@@ -291,10 +455,7 @@ export const createSlackStream = (
 
   return {
     append(delta) {
-      const safe = sanitizer.push(delta);
-      if (safe) {
-        enqueue(() => send(safe));
-      }
+      bufferAppend(sanitizer.push(delta));
     },
     async fail(notice) {
       await close(notice, true);
@@ -309,7 +470,292 @@ export const createSlackStream = (
       if (closed) {
         return;
       }
+      flushPending();
       enqueue(() => sendTask(update));
     },
   };
+};
+
+const toolErrorText = (event: {
+  errorInfo?: { message?: string };
+  result?: unknown;
+}): string => {
+  const fromInfo = event.errorInfo?.message?.trim() ?? "";
+  if (fromInfo !== "") {
+    return fromInfo;
+  }
+  return v.parse(toolOutputText, event.result);
+};
+
+const slackEventsFromChunks = (
+  chunks: readonly ConversationStreamChunk[],
+): SlackDeliveryEvent[] => {
+  const events: SlackDeliveryEvent[] = [];
+  for (const chunk of chunks) {
+    if (chunk.type === "message-delta" && chunk.kind === "text") {
+      events.push({ text: chunk.delta, type: "text" });
+      continue;
+    }
+    if (chunk.type === "tool-input") {
+      events.push({
+        id: chunk.toolCallId,
+        name: chunk.toolName,
+        type: "tool-start",
+      });
+      continue;
+    }
+    if (chunk.type === "tool-output") {
+      events.push({
+        error: false,
+        id: chunk.toolCallId,
+        output: v.parse(toolOutputText, chunk.output),
+        type: "tool-result",
+      });
+      continue;
+    }
+    if (chunk.type === "tool-output-error") {
+      events.push({
+        error: true,
+        id: chunk.toolCallId,
+        output: chunk.errorText,
+        type: "tool-result",
+      });
+    }
+  }
+  return events;
+};
+
+export const slackEventFromObservation = (
+  event: FlueObservation,
+): SlackDeliveryEvent | "fail" | undefined => {
+  if (event.type === "text_delta") {
+    return { text: event.text, type: "text" };
+  }
+  if (event.type === "tool_start") {
+    return { id: event.toolCallId, name: event.toolName, type: "tool-start" };
+  }
+  if (event.type === "tool") {
+    return {
+      error: event.isError,
+      id: event.toolCallId,
+      output: event.isError
+        ? toolErrorText(event)
+        : v.parse(toolOutputText, event.effectiveResult ?? event.result),
+      type: "tool-result",
+    };
+  }
+  if (event.type === "submission_settled" && event.outcome !== "completed") {
+    return "fail";
+  }
+  return undefined;
+};
+
+const applyDeliveryEvent = (
+  stream: SlackStream,
+  toolNames: Map<string, string>,
+  event: SlackDeliveryEvent,
+): void => {
+  if (event.type === "text") {
+    stream.append(event.text);
+    return;
+  }
+  if (event.type === "tool-start") {
+    toolNames.set(event.id, event.name);
+    stream.task({
+      id: event.id,
+      status: "in_progress",
+      title: event.name,
+    });
+    return;
+  }
+  stream.task({
+    id: event.id,
+    output: event.output,
+    status: event.error ? "error" : "complete",
+    title: toolNames.get(event.id) ?? "",
+  });
+};
+
+const feedSlackStream = (
+  stream: SlackStream,
+  events: readonly SlackDeliveryEvent[],
+): void => {
+  const toolNames = new Map<string, string>();
+  for (const event of events) {
+    applyDeliveryEvent(stream, toolNames, event);
+  }
+};
+
+const replyTrailer = (replyText: string): string =>
+  replyText === "" ? SLACK_DELIVERY_FALLBACK : replyText;
+
+interface LiveSlackDelivery {
+  stream: SlackStream;
+  toolNames: Map<string, string>;
+}
+
+const liveDeliveries = new Map<string, LiveSlackDelivery>();
+
+export const evictLiveSlackDelivery = (instanceId?: string): void => {
+  if (instanceId === undefined) {
+    liveDeliveries.clear();
+    return;
+  }
+  liveDeliveries.delete(instanceId);
+};
+
+const runSlackAlarmDelivery = async (
+  binding: SlackDeliveryBinding,
+  token: string,
+  work: {
+    events?: readonly SlackDeliveryEvent[];
+    chunks?: readonly ConversationStreamChunk[];
+    replyText: string;
+    error?: Error;
+  },
+  fetcher: Fetcher = fetch,
+): Promise<void> => {
+  const stream = createSlackStream(
+    streamTargetFromBinding(binding),
+    token,
+    fetcher,
+  );
+  try {
+    feedSlackStream(
+      stream,
+      work.events ?? slackEventsFromChunks(work.chunks ?? []),
+    );
+    if (work.error !== undefined) {
+      throw work.error;
+    }
+    await stream.finish(replyTrailer(work.replyText));
+  } catch (error: unknown) {
+    await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+    throw error;
+  }
+};
+
+const emptyRecord = (binding: SlackDeliveryBinding): SlackDeliveryRecord => ({
+  binding,
+  closed: false,
+  events: [],
+  failed: false,
+  replyText: "",
+});
+
+export const openSlackDelivery = (
+  store: SlackDeliveryStore,
+  instanceId: string,
+  binding: SlackDeliveryBinding,
+  token: string,
+  fetcher: Fetcher = fetch,
+): void => {
+  const existing = store.load(instanceId);
+  const record =
+    existing !== undefined && !existing.closed
+      ? existing
+      : emptyRecord(binding);
+  store.save(instanceId, record);
+  if (liveDeliveries.has(instanceId)) {
+    return;
+  }
+  liveDeliveries.set(instanceId, {
+    stream: createSlackStream(
+      streamTargetFromBinding(record.binding),
+      token,
+      fetcher,
+    ),
+    toolNames: new Map(),
+  });
+};
+
+export const applySlackDeliveryEvent = (
+  store: SlackDeliveryStore,
+  instanceId: string,
+  event: SlackDeliveryEvent,
+): void => {
+  const record = store.load(instanceId);
+  if (record === undefined || record.closed) {
+    return;
+  }
+  record.events.push(event);
+  if (event.type === "text") {
+    record.replyText += event.text;
+  }
+  store.save(instanceId, record);
+  const live = liveDeliveries.get(instanceId);
+  if (live !== undefined) {
+    applyDeliveryEvent(live.stream, live.toolNames, event);
+  }
+};
+
+export const failSlackDelivery = async (
+  store: SlackDeliveryStore,
+  instanceId: string,
+  token: string,
+  fetcher: Fetcher = fetch,
+): Promise<void> => {
+  const record = store.load(instanceId);
+  if (record === undefined || record.closed) {
+    return;
+  }
+  record.failed = true;
+  const live = liveDeliveries.get(instanceId);
+  try {
+    if (live !== undefined) {
+      await live.stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+      return;
+    }
+    const stream = createSlackStream(
+      streamTargetFromBinding(record.binding),
+      token,
+      fetcher,
+    );
+    feedSlackStream(stream, record.events);
+    await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+  } finally {
+    liveDeliveries.delete(instanceId);
+    record.closed = true;
+    store.save(instanceId, record);
+  }
+};
+
+export const finishSlackDelivery = async (
+  store: SlackDeliveryStore,
+  instanceId: string,
+  token: string,
+  fetcher: Fetcher = fetch,
+): Promise<void> => {
+  const record = store.load(instanceId);
+  if (record === undefined || record.closed) {
+    return;
+  }
+  if (record.failed) {
+    await failSlackDelivery(store, instanceId, token, fetcher);
+    return;
+  }
+  const trailer = replyTrailer(record.replyText);
+  const live = liveDeliveries.get(instanceId);
+  try {
+    if (live !== undefined) {
+      await live.stream.finish(trailer);
+      return;
+    }
+    await runSlackAlarmDelivery(
+      record.binding,
+      token,
+      {
+        events: record.events.filter((event) => event.type !== "text"),
+        replyText: trailer,
+      },
+      fetcher,
+    );
+  } catch {
+    // Slack already received the failure notice. Throwing would fail a
+    // completed turn and the runtime would retry the submission, posting twice.
+  } finally {
+    liveDeliveries.delete(instanceId);
+    record.closed = true;
+    store.save(instanceId, record);
+  }
 };
