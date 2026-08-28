@@ -21,7 +21,7 @@ export interface AgentConfig {
   model?: string;
 }
 
-export interface ResolvedAgentConfig<_RuntimeContext = unknown> {
+export interface ResolvedAgentConfig {
   name: string;
   description: string;
   ownerInstructions: string;

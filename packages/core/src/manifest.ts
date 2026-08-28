@@ -1,7 +1,7 @@
 import type { ResolvedAgentConfig } from "./config.ts";
 
-export const generateSlackManifest = <RuntimeContext>(
-  config: ResolvedAgentConfig<RuntimeContext>,
+export const generateSlackManifest = (
+  config: ResolvedAgentConfig,
   deployedUrl: string,
 ): string => {
   const { origin } = new URL(deployedUrl);

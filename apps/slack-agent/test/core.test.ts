@@ -255,6 +255,35 @@ describe("sliding retention", () => {
     await expireLatest(agent, latest);
     expect(destroyed).toBe(1);
   });
+
+  test("keeps the later id when two expiry schedules share a time", async () => {
+    let destroyed = 0;
+    const earlierId = {
+      callback: "expireConversation",
+      id: "expiry-a",
+      payload: {},
+      time: 10,
+    };
+    const laterId = {
+      callback: "expireConversation",
+      id: "expiry-b",
+      payload: {},
+      time: 10,
+    };
+    const agent = {
+      destroy() {
+        destroyed += 1;
+        return Promise.resolve();
+      },
+      listSchedules() {
+        return Promise.resolve([earlierId, laterId]);
+      },
+    };
+    await expireLatest(agent, earlierId);
+    expect(destroyed).toBe(0);
+    await expireLatest(agent, laterId);
+    expect(destroyed).toBe(1);
+  });
 });
 
 describe("readiness and manifest", () => {
@@ -281,22 +310,37 @@ describe("readiness and manifest", () => {
   test("generates a neutral manifest from config and deployed URL", () => {
     const manifest = v.parse(
       v.object({
-        display_information: v.object({
+        display_information: v.strictObject({
           description: v.string(),
           name: v.string(),
         }),
-        features: v.object({
-          agent_view: v.object({ agent_description: v.string() }),
-          app_home: v.object({
+        features: v.strictObject({
+          agent_view: v.strictObject({ agent_description: v.string() }),
+          app_home: v.strictObject({
             messages_tab_enabled: v.boolean(),
             messages_tab_read_only_enabled: v.boolean(),
           }),
+          bot_user: v.strictObject({
+            always_online: v.boolean(),
+            display_name: v.string(),
+          }),
         }),
-        settings: v.object({
-          event_subscriptions: v.object({
+        oauth_config: v.strictObject({
+          scopes: v.strictObject({
+            bot: v.array(v.string()),
+          }),
+        }),
+        settings: v.strictObject({
+          event_subscriptions: v.strictObject({
             bot_events: v.array(v.string()),
             request_url: v.string(),
           }),
+          interactivity: v.strictObject({
+            is_enabled: v.boolean(),
+          }),
+          org_deploy_enabled: v.boolean(),
+          socket_mode_enabled: v.boolean(),
+          token_rotation_enabled: v.boolean(),
         }),
       }),
       JSON.parse(
@@ -319,6 +363,54 @@ describe("readiness and manifest", () => {
       request_url: "https://agent.example.com/channels/slack/events",
     });
     expect(JSON.stringify(manifest)).not.toMatch(/xox[a-z]-|[UA][A-Z0-9]{8,}/u);
+  });
+
+  test("pins the exact Slack bot OAuth scopes", () => {
+    const manifest = v.parse(
+      v.object({
+        oauth_config: v.strictObject({
+          scopes: v.strictObject({
+            bot: v.array(v.string()),
+          }),
+        }),
+      }),
+      JSON.parse(
+        generateSlackManifest(config, "https://agent.example.com/path"),
+      ),
+    );
+    expect(manifest.oauth_config.scopes.bot).toEqual([
+      "app_mentions:read",
+      "assistant:write",
+      "chat:write",
+      "im:history",
+      "reactions:write",
+    ]);
+  });
+
+  test("disables interactivity, org deploy, socket mode, and token rotation", () => {
+    const manifest = v.parse(
+      v.object({
+        settings: v.strictObject({
+          event_subscriptions: v.strictObject({
+            bot_events: v.array(v.string()),
+            request_url: v.string(),
+          }),
+          interactivity: v.strictObject({
+            is_enabled: v.boolean(),
+          }),
+          org_deploy_enabled: v.boolean(),
+          socket_mode_enabled: v.boolean(),
+          token_rotation_enabled: v.boolean(),
+        }),
+      }),
+      JSON.parse(
+        generateSlackManifest(config, "https://agent.example.com/path"),
+      ),
+    );
+    expect(manifest.settings.interactivity).toEqual({ is_enabled: false });
+    expect(manifest.settings.org_deploy_enabled).toBe(false);
+    expect(manifest.settings.socket_mode_enabled).toBe(false);
+    expect(manifest.settings.token_rotation_enabled).toBe(false);
   });
 });
 

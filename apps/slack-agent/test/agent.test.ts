@@ -3,7 +3,11 @@ import { composeInstructions, defineAgentConfig } from "@agentic-slack/core";
 import type { ExpiryPayload, ExpirySchedule } from "@agentic-slack/core";
 
 import config from "../agent.config.ts";
-import { mockCloudflareWorkers } from "./module-mocks.ts";
+import type { CapturedCloudflareExtension } from "./module-mocks.ts";
+import {
+  mockCloudflareWorkers,
+  retentionExtendCapture,
+} from "./module-mocks.ts";
 
 // Snapshot the shipped values before the operator mock rebinds the config
 // module: the runtime tests below must drive the agent with a distinct
@@ -34,6 +38,53 @@ const operatorConfig = defineAgentConfig({
   },
 });
 
+class RecordingAgent {
+  cancels: string[] = [];
+  destroyed = 0;
+  listed: ExpirySchedule[] = [];
+  scheduled: {
+    callback: "expireConversation";
+    payload: ExpiryPayload;
+    seconds: number;
+  }[] = [];
+
+  cancelSchedule(id: string) {
+    this.cancels.push(id);
+    return Promise.resolve(true);
+  }
+
+  destroy() {
+    this.destroyed += 1;
+    return Promise.resolve();
+  }
+
+  listSchedules() {
+    return Promise.resolve(this.listed);
+  }
+
+  schedule(
+    seconds: number,
+    callback: "expireConversation",
+    payload: ExpiryPayload,
+  ) {
+    this.scheduled.push({ callback, payload, seconds });
+    return Promise.resolve({
+      callback,
+      id: `sched-${String(this.scheduled.length)}`,
+      payload,
+      time: this.scheduled.length,
+    } satisfies ExpirySchedule);
+  }
+}
+
+interface WiredRetentionAgent extends RecordingAgent {
+  expireConversation: (
+    payload: ExpiryPayload,
+    schedule: ExpirySchedule,
+  ) => Promise<void>;
+  refreshRetention: (surface: "private" | "channel") => Promise<void>;
+}
+
 const instructions: string[] = [];
 let resolvedModel = "";
 
@@ -58,12 +109,21 @@ await mock.module("@flue/runtime", () => ({
 const cloudflare = await import("@flue/runtime/cloudflare");
 await mock.module("@flue/runtime/cloudflare", () => ({
   ...cloudflare,
-  extend: () => ({ base: undefined }),
+  extend: (extension: CapturedCloudflareExtension) => {
+    retentionExtendCapture.extension = extension;
+    return extension;
+  },
 }));
 await mock.module("../agent.config.ts", () => ({ default: operatorConfig }));
-const { SlackAgent, refreshConfiguredRetention } = await import(
-  "../src/agent.ts"
-);
+const { SlackAgent } = await import("../src/agent.ts");
+
+const createRetentionAgent = (): WiredRetentionAgent => {
+  const factory = retentionExtendCapture.extension?.base;
+  if (factory === undefined) {
+    throw new Error("cloudflare.base was not registered");
+  }
+  return new (factory(RecordingAgent))();
+};
 
 test("ships four suggested prompts on the operator config", () => {
   expect(shippedPrompts).toEqual([
@@ -107,45 +167,41 @@ test("uses the model and owner instructions from the operator config", () => {
   expect(instructions).toEqual([...composeInstructions(operatorConfig)]);
 });
 
-test("schedules retention from the operator config days", async () => {
-  const scheduled: { callback: string; seconds: number; surface: string }[] =
-    [];
-  const agent = {
-    cancelSchedule() {
-      return Promise.resolve(true);
-    },
-    destroy() {
-      return Promise.resolve();
-    },
-    listSchedules() {
-      return Promise.resolve([]);
-    },
-    schedule(
-      seconds: number,
-      callback: "expireConversation",
-      payload: ExpiryPayload,
-    ) {
-      scheduled.push({ callback, seconds, surface: payload.surface });
-      return Promise.resolve({
-        callback,
-        id: "new",
-        payload,
-        time: 1,
-      } satisfies ExpirySchedule);
-    },
-  };
-  await refreshConfiguredRetention(agent, "private");
-  await refreshConfiguredRetention(agent, "channel");
-  expect(scheduled).toEqual([
+test("schedules three-day private and nine-day channel expiry on the extended Durable Object", async () => {
+  const agent = createRetentionAgent();
+  await agent.refreshRetention("private");
+  await agent.refreshRetention("channel");
+  expect(agent.scheduled).toEqual([
     {
       callback: "expireConversation",
-      seconds: 3 * 86_400,
-      surface: "private",
+      payload: { surface: "private" },
+      seconds: 259_200,
     },
     {
       callback: "expireConversation",
-      seconds: 9 * 86_400,
-      surface: "channel",
+      payload: { surface: "channel" },
+      seconds: 777_600,
     },
   ]);
+});
+
+test("destroys through expireLatest so a stale expiry cannot wipe a live conversation", async () => {
+  const agent = createRetentionAgent();
+  const stale: ExpirySchedule = {
+    callback: "expireConversation",
+    id: "stale",
+    payload: { surface: "private" },
+    time: 1,
+  };
+  const latest: ExpirySchedule = {
+    callback: "expireConversation",
+    id: "latest",
+    payload: { surface: "private" },
+    time: 2,
+  };
+  agent.listed = [stale, latest];
+  await agent.expireConversation({ surface: "private" }, stale);
+  expect(agent.destroyed).toBe(0);
+  await agent.expireConversation({ surface: "private" }, latest);
+  expect(agent.destroyed).toBe(1);
 });

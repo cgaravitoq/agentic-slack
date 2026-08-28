@@ -7,11 +7,7 @@ import type {
 type Fetcher = (input: string, init: RequestInit) => Promise<Response>;
 
 export const createLifecycleHandler =
-  <RuntimeContext>(
-    config: ResolvedAgentConfig<RuntimeContext>,
-    botToken: string,
-    fetcher?: Fetcher,
-  ) =>
+  (config: ResolvedAgentConfig, botToken: string, fetcher?: Fetcher) =>
   (lifecycle: RoutedSlackLifecycle): Promise<void> =>
     setSuggestedPrompts(
       { channelId: lifecycle.channelId, threadTs: lifecycle.threadTs },
