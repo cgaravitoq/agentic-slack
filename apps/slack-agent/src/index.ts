@@ -8,17 +8,11 @@ import {
 import { init, instrument, setProvider } from "@flue/runtime";
 import { createCloudflareTracing } from "@flue/runtime/cloudflare";
 import { cloudflareBindingProvider } from "@flue/runtime/cloudflare/workers-ai";
-import * as v from "valibot";
 import config from "../agent.config.ts";
 import { SlackAgent } from "./agent.ts";
 import { createApp } from "./app.ts";
 import type { WorkerBindings } from "./app.ts";
 import { createLifecycleHandler } from "./lifecycle.ts";
-
-const slackResponse = v.object({
-  error: v.optional(v.string()),
-  ok: v.optional(v.boolean()),
-});
 
 const bindings: WorkerBindings = env;
 const trusted = {
@@ -42,7 +36,7 @@ export default createApp(
       turn.surface,
     );
     if (turn.surface === "channel") {
-      const response = await fetch("https://slack.com/api/reactions.add", {
+      const reaction = fetch("https://slack.com/api/reactions.add", {
         body: JSON.stringify({
           channel: turn.channelId,
           name: "eyes",
@@ -54,12 +48,8 @@ export default createApp(
         },
         method: "POST",
       });
-      const result = v.parse(slackResponse, await response.json());
-      if (result.ok !== true) {
-        throw new Error(
-          `Slack reactions.add failed: ${result.error ?? response.status}`,
-        );
-      }
+      // oxlint-disable-next-line promise/prefer-await-to-then
+      void reaction.catch(() => null);
     }
     const handle = init(SlackAgent, { id: instanceId });
     await handle.dispatch({

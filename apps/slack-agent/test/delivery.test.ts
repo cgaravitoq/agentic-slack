@@ -18,7 +18,12 @@ import {
 import type { RoutedSlackTurn, SlackDeliveryStore } from "@agentic-slack/core";
 import type { FlueObservation } from "@flue/runtime";
 import {
+  COALESCE_CHARS,
+  COALESCE_MS,
   createStreamSanitizer,
+  MAX_RETRY_AFTER_MS,
+  MAX_RETRY_WAIT_MS,
+  retryDelayMs,
   sanitizeReply,
   STREAM_TAIL_LENGTH,
 } from "../../../packages/core/src/delivery.ts";
@@ -64,11 +69,7 @@ const taskChunk = v.strictObject({
 });
 const markdownAppendBody = v.strictObject({
   channel: v.string(),
-  markdown_text: v.pipe(
-    v.string(),
-    v.minLength(1),
-    v.maxLength(MAX_SLACK_APPEND_LENGTH),
-  ),
+  markdown_text: v.pipe(v.string(), v.minLength(1), v.maxLength(12_000)),
   ts: v.string(),
 });
 const taskAppendBody = v.strictObject({
@@ -101,6 +102,8 @@ interface FakeSlack {
 interface FakeSlackFailures {
   limit?: number;
   skip?: number;
+  status?: number;
+  retryAfter?: string;
 }
 
 // Concurrent fetches in one turn complete last-in first-out, so a uniform
@@ -128,7 +131,12 @@ const createLifoSettler = <T>() => {
 
 const createFakeSlack = (
   failures: Partial<Record<string, string>> = {},
-  { limit = Number.POSITIVE_INFINITY, skip = 0 }: FakeSlackFailures = {},
+  {
+    limit = Number.POSITIVE_INFINITY,
+    skip = 0,
+    status = 200,
+    retryAfter,
+  }: FakeSlackFailures = {},
 ): FakeSlack => {
   const calls: SlackCall[] = [];
   const accepted: SlackCall[] = [];
@@ -188,6 +196,13 @@ const createFakeSlack = (
       return settle(
         Response.json(
           rejected ? { error, ok: false } : { ok: true, ts: STREAM_TS },
+          {
+            headers:
+              rejected && retryAfter !== undefined
+                ? { "Retry-After": retryAfter }
+                : undefined,
+            status: rejected ? status : 200,
+          },
         ),
       ).then((response) => {
         calls.push(call);
@@ -289,8 +304,38 @@ describe("trusted Slack streaming delivery", () => {
     const appends = slack
       .methods()
       .filter((method) => method === "chat.appendStream").length;
-    expect(appends).toBeLessThan(20);
+    expect(appends).toBe(3);
+    expect(COALESCE_CHARS).toBe(1024);
+    expect(COALESCE_MS).toBe(300);
     expect(slack.markdown()).toBe(uncoalesced);
+  });
+
+  test("withholds a short sanitizer tail until finish", async () => {
+    const slack = createFakeSlack();
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("hello");
+    await Bun.sleep(400);
+
+    expect(slack.markdownChunks()).toEqual([]);
+
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.markdownChunks()).toEqual(["hello"]);
+  });
+
+  test("flushes a mid-size append on the coalesce timer before finish", async () => {
+    const slack = createFakeSlack();
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    const text = "n".repeat(600);
+    stream.append(text);
+    await Bun.sleep(400);
+
+    expect(slack.markdownChunks().length).toBeGreaterThan(0);
+    expect(slack.markdownChunks()[0]?.length).toBeGreaterThan(0);
+
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.markdown()).toBe(text);
   });
 
   test("omits the recipient identity outside channels", async () => {
@@ -447,27 +492,51 @@ describe("trusted Slack streaming delivery", () => {
     ).toHaveLength(1);
   });
 
-  test("splits an oversized reply into Slack-sized appends", async () => {
+  test("pins Slack's per-append budget to 12000 characters", () => {
     expect(MAX_SLACK_APPEND_LENGTH).toBe(12_000);
-    await Promise.all(
-      [13_000, 20_000].map(async (size) => {
-        const slack = createFakeSlack();
-        const stream = createSlackStream(
-          channelTarget,
-          BOT_TOKEN,
-          slack.fetcher,
-        );
-        stream.append("a".repeat(size));
-        await stream.finish(SLACK_DELIVERY_FALLBACK);
+  });
 
-        const chunks = slack.markdownChunks();
-        expect(chunks.length).toBeGreaterThan(1);
-        for (const chunk of chunks) {
-          expect(chunk.length).toBeLessThanOrEqual(12_000);
-        }
-        expect(chunks.join("")).toBe("a".repeat(size));
-      }),
+  test("truncates a streamed reply past Slack's safe message length", async () => {
+    const slack = createFakeSlack();
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("a".repeat(20_000));
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.markdown()).toHaveLength(3893);
+    expect(slack.markdown().endsWith("\n\n(truncated)")).toBe(true);
+    expect(
+      slack.methods().filter((method) => method === "chat.startStream"),
+    ).toHaveLength(1);
+    expect(
+      slack.methods().filter((method) => method === "chat.stopStream"),
+    ).toHaveLength(1);
+    for (const chunk of slack.markdownChunks()) {
+      expect(chunk.length).toBeLessThanOrEqual(12_000);
+    }
+  });
+
+  test("truncation does not emit a lone surrogate when an emoji straddles the cut", async () => {
+    const slack = createFakeSlack();
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append(`${"a".repeat(3879)}\u{1F600}${"b".repeat(100)}`);
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.markdown()).not.toMatch(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,
     );
+    expect(slack.markdown().endsWith("\n\n(truncated)")).toBe(true);
+  });
+
+  test("drops an append once the stream has closed", async () => {
+    const slack = createFakeSlack();
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+    const methods = slack.methods();
+    stream.append("n".repeat(600));
+    await Bun.sleep(400);
+
+    expect(slack.methods()).toEqual(methods);
   });
 
   test("delivers the fallback when the turn produced no text", async () => {
@@ -514,6 +583,20 @@ describe("trusted Slack streaming delivery", () => {
     expect(slack.markdown().endsWith("\n\n(truncated)")).toBe(true);
   });
 
+  test("reply-text truncation does not emit a lone surrogate when an emoji straddles the cut", async () => {
+    const loneSurrogate =
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+    const text = `${"a".repeat(3879)}\u{1F600}${"b".repeat(100)}`;
+    expect(sanitizeReply(text)).not.toMatch(loneSurrogate);
+
+    const slack = createFakeSlack();
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    await stream.finish(text);
+
+    expect(slack.markdown()).not.toMatch(loneSurrogate);
+    expect(slack.markdown().endsWith("\n\n(truncated)")).toBe(true);
+  });
+
   test("closes the stream on the failure path", async () => {
     const slack = createFakeSlack();
     const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
@@ -529,7 +612,7 @@ describe("trusted Slack streaming delivery", () => {
 
   test("delivers the failure notice after an append already rejected", async () => {
     const slack = createFakeSlack(
-      { "chat.appendStream": "rate_limited" },
+      { "chat.appendStream": "invalid_chunks" },
       { limit: 1 },
     );
     const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
@@ -548,7 +631,7 @@ describe("trusted Slack streaming delivery", () => {
 
   test("delivers the failure notice once when an append rejects mid-stream", async () => {
     const slack = createFakeSlack(
-      { "chat.appendStream": "rate_limited" },
+      { "chat.appendStream": "invalid_chunks" },
       { limit: 1, skip: 1 },
     );
     const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
@@ -563,7 +646,7 @@ describe("trusted Slack streaming delivery", () => {
     await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
 
     expect(failure).toEqual(
-      new Error("Slack chat.appendStream failed: rate_limited"),
+      new Error("Slack chat.appendStream failed: invalid_chunks"),
     );
     expect(slack.acceptedChunks()).toEqual([
       "a".repeat(88),
@@ -578,7 +661,7 @@ describe("trusted Slack streaming delivery", () => {
   });
 
   test("stops the stream and reports a rejected append", async () => {
-    const slack = createFakeSlack({ "chat.appendStream": "rate_limited" });
+    const slack = createFakeSlack({ "chat.appendStream": "invalid_chunks" });
     const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
     stream.append("hello");
     let failure: unknown;
@@ -588,7 +671,7 @@ describe("trusted Slack streaming delivery", () => {
       failure = error;
     }
     expect(failure).toEqual(
-      new Error("Slack chat.appendStream failed: rate_limited"),
+      new Error("Slack chat.appendStream failed: invalid_chunks"),
     );
     expect(slack.methods()).toEqual([
       "chat.startStream",
@@ -596,6 +679,159 @@ describe("trusted Slack streaming delivery", () => {
       "chat.appendStream",
       "chat.stopStream",
     ]);
+  });
+
+  test("retries a Slack rate_limited append until it succeeds", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { limit: 3, retryAfter: "0" },
+    );
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(
+      slack.methods().filter((method) => method === "chat.appendStream"),
+    ).toHaveLength(4);
+  });
+
+  test("retries HTTP 429 and 5xx using Retry-After without blocking on backoff", async () => {
+    const started = performance.now();
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { limit: 1, retryAfter: "0", status: 429 },
+    );
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(
+      slack.methods().filter((method) => method === "chat.appendStream"),
+    ).toHaveLength(2);
+    expect(performance.now() - started).toBeLessThan(100);
+
+    const serverError = createFakeSlack(
+      { "chat.appendStream": "internal_error" },
+      { limit: 1, retryAfter: "0", status: 503 },
+    );
+    const recovering = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      serverError.fetcher,
+    );
+    recovering.append("hello");
+    await recovering.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(serverError.acceptedChunks()).toEqual(["hello"]);
+  });
+
+  test("pins Retry-After to 2000ms per attempt and 4000ms across attempts", () => {
+    expect(MAX_RETRY_AFTER_MS).toBe(2000);
+    expect(MAX_RETRY_WAIT_MS).toBe(4000);
+  });
+
+  test("honours Retry-After below the cap", () => {
+    const response = new Response(null, { headers: { "Retry-After": "1" } });
+    expect(retryDelayMs(response, 0, 0)).toBe(1000);
+  });
+
+  test("caps Retry-After per attempt and across the retry budget", () => {
+    const response = new Response(null, { headers: { "Retry-After": "60" } });
+    expect(retryDelayMs(response, 0, 0)).toBe(2000);
+    expect(retryDelayMs(response, 1, 2000)).toBe(2000);
+    expect(retryDelayMs(response, 2, 4000)).toBe(0);
+  });
+
+  test("caps the wait call actually spends across Retry-After retries", async () => {
+    const started = performance.now();
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { limit: 3, retryAfter: "2", status: 429 },
+    );
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(performance.now() - started).toBeLessThan(5500);
+  }, 15_000);
+
+  test("stops retrying a retryable Slack error after four attempts", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { retryAfter: "0", status: 429 },
+    );
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("hello");
+    let failure: unknown;
+    try {
+      await stream.finish(SLACK_DELIVERY_FALLBACK);
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(failure).toEqual(new Error("Slack chat.appendStream failed: 429"));
+    expect(
+      slack.methods().filter((method) => method === "chat.appendStream"),
+    ).toHaveLength(8);
+  });
+
+  test("fails fast on a non-retryable Slack error", async () => {
+    const slack = createFakeSlack({ "chat.appendStream": "channel_not_found" });
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("hello");
+    let failure: unknown;
+    try {
+      await stream.finish(SLACK_DELIVERY_FALLBACK);
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(failure).toEqual(
+      new Error("Slack chat.appendStream failed: channel_not_found"),
+    );
+    expect(
+      slack.methods().filter((method) => method === "chat.appendStream"),
+    ).toHaveLength(2);
+  });
+
+  test("retries a Slack internal_error at HTTP 200 until it succeeds", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "internal_error" },
+      { limit: 1, retryAfter: "0", status: 200 },
+    );
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(
+      slack.methods().filter((method) => method === "chat.appendStream"),
+    ).toHaveLength(2);
+  });
+
+  test("fails fast on channel_not_found at HTTP 200", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "channel_not_found" },
+      { status: 200 },
+    );
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("hello");
+    let failure: unknown;
+    try {
+      await stream.finish(SLACK_DELIVERY_FALLBACK);
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(failure).toEqual(
+      new Error("Slack chat.appendStream failed: channel_not_found"),
+    );
+    expect(
+      slack.methods().filter((method) => method === "chat.appendStream"),
+    ).toHaveLength(2);
   });
 });
 
@@ -1013,6 +1249,17 @@ describe("stream sanitizer cutter", () => {
     const sanitizer = createStreamSanitizer();
     const output = sanitizer.push('PASSWORD = "hunter2"') + sanitizer.flush();
     expect(output).toBe("[internal configuration]");
+  });
+
+  test("redacts a secret in the released head, not only at flush", () => {
+    const sanitizer = createStreamSanitizer();
+    const payload = `<!channel> PASSWORD="hunter2" ${"x".repeat(600)}`;
+    expect(payload.length).toBeGreaterThan(STREAM_TAIL_LENGTH);
+    const emitted = sanitizer.push(payload);
+    expect(emitted.length).toBeGreaterThan(0);
+    expect(emitted).toContain("[internal configuration]");
+    expect(emitted).not.toContain("hunter2");
+    expect(emitted).not.toContain("<!channel>");
   });
 
   test("a mid-pair cut emits whole code points, never a lone surrogate", () => {

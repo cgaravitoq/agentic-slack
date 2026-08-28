@@ -41,6 +41,9 @@ interface HandleDispatchRequest {
 
 const slackCalls: SlackCall[] = [];
 const dispatched: { instanceId: string; request: HandleDispatchRequest }[] = [];
+let reactionError: string | undefined;
+let reactionHang = false;
+let reactionStatus = 200;
 let deltas: string[] = [];
 let toolChunks: ConversationStreamChunk[] = [];
 let replyText = "";
@@ -205,12 +208,23 @@ const capturingFetch: Pick<typeof globalThis, "fetch">["fetch"] = Object.assign(
       ),
       method: input.replace("https://slack.com/api/", ""),
     };
-    return settleFetch(Response.json({ ok: true, ts: STREAM_TS })).then(
-      (response) => {
-        slackCalls.push(recorded);
-        return response;
-      },
-    );
+    const isReaction = recorded.method === "reactions.add";
+    if (isReaction && reactionHang) {
+      slackCalls.push(recorded);
+      return Promise.withResolvers<Response>().promise;
+    }
+    const rejected = isReaction && reactionError !== undefined;
+    return settleFetch(
+      Response.json(
+        rejected
+          ? { error: reactionError, ok: false }
+          : { ok: true, ts: STREAM_TS },
+        { status: isReaction ? reactionStatus : 200 },
+      ),
+    ).then((response) => {
+      slackCalls.push(recorded);
+      return response;
+    });
   },
   { preconnect: originalFetch.preconnect },
 );
@@ -516,6 +530,9 @@ const taskChunks = () =>
 beforeEach(() => {
   slackCalls.length = 0;
   dispatched.length = 0;
+  reactionError = undefined;
+  reactionHang = false;
+  reactionStatus = 200;
   deltas = [];
   toolChunks = [];
   replyText = "";
@@ -1026,3 +1043,37 @@ test("routes successive top-level DMs to one instance and keeps channel threads 
     "slack:v1:T123:C777:192.0",
   ]);
 });
+
+test("a failed eyes reaction still dispatches the turn", async () => {
+  const fixtures: { error: string; status: number }[] = [
+    { error: "already_reacted", status: 200 },
+    { error: "not_in_channel", status: 200 },
+    { error: "missing_scope", status: 200 },
+    { error: "rate_limited", status: 429 },
+  ];
+  for (const fixture of fixtures) {
+    slackCalls.length = 0;
+    dispatched.length = 0;
+    reactionError = fixture.error;
+    reactionStatus = fixture.status;
+    deltas = ["Hello."];
+    replyText = "Hello.";
+
+    // oxlint-disable-next-line no-await-in-loop
+    expect(await runTurn(`Ev-react-${fixture.error}`)).toBe(200);
+    expect(dispatched).toHaveLength(1);
+    expect(streamedMarkdown()).toBe("Hello.");
+    expect(slackCalls[0]?.method).toBe("reactions.add");
+  }
+});
+
+test("a hanging eyes reaction still dispatches the turn", async () => {
+  reactionHang = true;
+  deltas = ["Hello."];
+  replyText = "Hello.";
+
+  expect(await runTurn("Ev-react-hang")).toBe(200);
+  expect(dispatched).toHaveLength(1);
+  expect(streamedMarkdown()).toBe("Hello.");
+  expect(slackCalls[0]?.method).toBe("reactions.add");
+}, 500);

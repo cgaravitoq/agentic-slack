@@ -15,6 +15,7 @@ export const STREAM_TAIL_LENGTH = 512;
 
 export const MAX_SLACK_MESSAGE_LENGTH = 3900;
 export const MAX_SLACK_APPEND_LENGTH = 12_000;
+const TRUNCATION_NOTICE = "\n\n(truncated)";
 
 export const SLACK_DELIVERY_FALLBACK =
   "I finished the turn but produced no reply. Please try again.";
@@ -46,6 +47,14 @@ const sanitizeTaskText = (text: string, fallback = ""): string => {
   return safe === "" ? fallback : safe;
 };
 
+const clipUtf16 = (text: string, room: number): string => {
+  if (room <= 0) {
+    return "";
+  }
+  const kept = text.slice(0, room);
+  return (/[\uD800-\uDBFF]$/u.test(kept) ? kept.slice(0, -1) : kept).trimEnd();
+};
+
 export const sanitizeReply = (
   text: string,
   maxLength = MAX_SLACK_MESSAGE_LENGTH,
@@ -55,7 +64,7 @@ export const sanitizeReply = (
     safe = "I could not produce a safe reply for that content.";
   }
   if (safe.length > maxLength) {
-    safe = `${safe.slice(0, maxLength - 20).trimEnd()}\n\n(truncated)`;
+    safe = `${clipUtf16(safe, maxLength - 20)}${TRUNCATION_NOTICE}`;
   }
   return safe;
 };
@@ -259,8 +268,39 @@ export const createSqlSlackDeliveryStore = (
 
 type SlackRequestBody = Record<string, string | SlackTaskChunk[]>;
 
-const COALESCE_CHARS = 1024;
-const COALESCE_MS = 300;
+export const COALESCE_CHARS = 1024;
+export const COALESCE_MS = 300;
+const MAX_SLACK_ATTEMPTS = 4;
+export const MAX_RETRY_AFTER_MS = 2000;
+export const MAX_RETRY_WAIT_MS = 4000;
+
+const retryableStatus = (status: number): boolean =>
+  status === 429 || status >= 500;
+
+export const retryDelayMs = (
+  response: Response,
+  attempt: number,
+  waitedMs: number,
+): number => {
+  const retryAfter = Number(response.headers.get("Retry-After"));
+  const requested =
+    Number.isFinite(retryAfter) && retryAfter >= 0
+      ? retryAfter * 1000
+      : Math.min(250 * 2 ** attempt, 4000);
+  return Math.min(
+    requested,
+    MAX_RETRY_AFTER_MS,
+    Math.max(0, MAX_RETRY_WAIT_MS - waitedMs),
+  );
+};
+
+const wait = async (ms: number) => {
+  const deferred = Promise.withResolvers<true>();
+  setTimeout(() => {
+    deferred.resolve(true);
+  }, ms);
+  await deferred.promise;
+};
 
 const toolOutputText = v.union([
   v.string(),
@@ -285,24 +325,57 @@ export const createSlackStream = (
   let closed = false;
   let failure: Error | undefined;
   let pending = "";
+  let streamed = 0;
+  let truncated = false;
   let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
 
   const call = async (method: string, body: SlackRequestBody) => {
-    const response = await fetcher(`https://slack.com/api/${method}`, {
-      body: JSON.stringify(body),
-      headers: {
-        authorization: `Bearer ${token}`,
-        "content-type": "application/json; charset=utf-8",
-      },
-      method: "POST",
-    });
-    const result = v.parse(slackResult, await response.json());
-    if (result.ok !== true) {
-      throw new Error(
+    let lastError: Error | undefined;
+    let waitedMs = 0;
+    for (let attempt = 0; attempt < MAX_SLACK_ATTEMPTS; attempt += 1) {
+      // oxlint-disable-next-line no-await-in-loop
+      const response = await fetcher(`https://slack.com/api/${method}`, {
+        body: JSON.stringify(body),
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json; charset=utf-8",
+        },
+        method: "POST",
+      });
+      if (retryableStatus(response.status)) {
+        lastError = new Error(`Slack ${method} failed: ${response.status}`);
+        if (attempt + 1 === MAX_SLACK_ATTEMPTS) {
+          throw lastError;
+        }
+        const delay = retryDelayMs(response, attempt, waitedMs);
+        waitedMs += delay;
+        // oxlint-disable-next-line no-await-in-loop
+        await wait(delay);
+        continue;
+      }
+      // oxlint-disable-next-line no-await-in-loop
+      const payload: unknown = await response.json();
+      const result = v.parse(slackResult, payload);
+      if (result.ok === true) {
+        return result;
+      }
+      lastError = new Error(
         `Slack ${method} failed: ${result.error ?? response.status}`,
       );
+      if (
+        (result.error !== "rate_limited" &&
+          result.error !== "internal_error" &&
+          result.error !== "service_unavailable") ||
+        attempt + 1 === MAX_SLACK_ATTEMPTS
+      ) {
+        throw lastError;
+      }
+      const delay = retryDelayMs(response, attempt, waitedMs);
+      waitedMs += delay;
+      // oxlint-disable-next-line no-await-in-loop
+      await wait(delay);
     }
-    return result;
+    throw lastError ?? new Error(`Slack ${method} failed`);
   };
 
   const start = async (): Promise<string> => {
@@ -332,21 +405,41 @@ export const createSlackStream = (
     return streamTs;
   };
 
+  const clipMarkdown = (markdown: string): string => {
+    if (truncated || markdown === "") {
+      return "";
+    }
+    if (streamed + markdown.length <= MAX_SLACK_MESSAGE_LENGTH) {
+      streamed += markdown.length;
+      return markdown;
+    }
+    const room = MAX_SLACK_MESSAGE_LENGTH - 20 - streamed;
+    let head = "";
+    if (room > 0) {
+      head = clipUtf16(markdown, room);
+    }
+    truncated = true;
+    const clipped = `${head}${TRUNCATION_NOTICE}`;
+    streamed += clipped.length;
+    return clipped;
+  };
+
   const send = async (markdown: string): Promise<void> => {
-    if (!markdown) {
+    const clipped = clipMarkdown(markdown);
+    if (!clipped) {
       return;
     }
     const ts = await start();
     for (
       let offset = 0;
-      offset < markdown.length;
+      offset < clipped.length;
       offset += MAX_SLACK_APPEND_LENGTH
     ) {
       // Appends must land in the order the model produced them.
       // oxlint-disable-next-line no-await-in-loop
       await call("chat.appendStream", {
         channel: channelId,
-        markdown_text: markdown.slice(offset, offset + MAX_SLACK_APPEND_LENGTH),
+        markdown_text: clipped.slice(offset, offset + MAX_SLACK_APPEND_LENGTH),
         ts,
       });
       appended = true;
@@ -455,6 +548,9 @@ export const createSlackStream = (
 
   return {
     append(delta) {
+      if (closed) {
+        return;
+      }
       bufferAppend(sanitizer.push(delta));
     },
     async fail(notice) {
