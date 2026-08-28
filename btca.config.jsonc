@@ -77,7 +77,7 @@
       "url": "https://github.com/AnswerDotAI/llms-txt",
       "branch": "main",
       "searchPaths": ["llms_txt", "nbs", "tests"],
-      "specialNotes": "Reference llms.txt parsing and failure behavior for @agentic-slack/plugin-llms-docs."
+      "specialNotes": "Reference llms.txt parsing and failure behavior."
     },
     {
       "name": "posthog",
@@ -90,7 +90,7 @@
         "frontend/src/queries",
         "products"
       ],
-      "specialNotes": "Reference HogQL aggregate-query contracts and API behavior for @agentic-slack/plugin-posthog."
+      "specialNotes": "Reference HogQL aggregate-query contracts and API behavior."
     }
   ]
 }

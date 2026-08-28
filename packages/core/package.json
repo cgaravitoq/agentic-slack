@@ -7,7 +7,6 @@
   "dependencies": {
     "@flue/runtime": "2.0.3",
     "@flue/slack": "2.0.3",
-    "hono": "4.12.32",
     "valibot": "1.4.2"
   }
 }
