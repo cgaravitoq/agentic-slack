@@ -1,28 +1,19 @@
 import * as v from "valibot";
 import type { ConversationSurface } from "./retention.ts";
 import type { RoutedSlackTurn } from "./slack.ts";
+import { clampTaskChunk, SLACK_TASK_FALLBACK_TITLE } from "./task-chunk.ts";
+import type { SlackTaskChunk, SlackTaskUpdate } from "./task-chunk.ts";
 
 const BROADCAST_RE = /<!(?:channel|here|everyone)(?:\|[^>]*)?>/giu;
 const SUBTEAM_RE = /<!subteam\^[^>]+>/giu;
 const CONTROL_OPENER_RE = /<(?=[@#!])/gu;
 const SLACK_TOKEN_RE = /\b(?:xox[a-z]|xapp)-[A-Za-z0-9-]+/gu;
 const SECRET_ASSIGNMENT_RE =
-  /(?:\\["'])?["']?\b[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|SIGNING_SECRET)[A-Z0-9_]*(?:\\["'])?["']?\s*[:=]\s*(?:\\"[^"\\]*\\"|\\'[^'\\]*\\'|"[^"]*"|'[^']*'|[^,\s"']+)/giu;
-
-// A redaction pattern that is still growing at the end of the buffer would be
-// split by an emit, so the tail it could still occupy is withheld instead.
-const OPEN_TAIL_RES = [
-  /<[^>]*$/u,
-  /\S+\s*$/u,
-  /\s+$/u,
-  /(?:\\["'])?["']?[A-Za-z0-9_]+(?:\\["'])?["']?\s*[:=]\s*(?:\\"[^"\\]*\\"|\\'[^'\\]*\\'|"[^"]*"|'[^']*'|\\"[^"\\]*\\?|\\'[^'\\]*\\?|"[^"]*|'[^']*|[^,\s"']*)\s*$/u,
-];
+  /(?:\\["'])?["']?\b[A-Z0-9_]{0,64}(?:TOKEN|SECRET|PASSWORD|API_KEY|SIGNING_SECRET)[A-Z0-9_]{0,64}(?:\\["'])?["']?\s{0,16}[:=]\s{0,16}(?:\\"[^"\\]{0,200}\\"|\\'[^'\\]{0,200}\\'|"[^"]{0,200}"|'[^']{0,200}'|[^,\s"']{1,200})/giu;
+export const STREAM_TAIL_LENGTH = 512;
 
 export const MAX_SLACK_MESSAGE_LENGTH = 3900;
 export const MAX_SLACK_APPEND_LENGTH = 12_000;
-export const MAX_SLACK_TASK_CHUNK_LENGTH = 256;
-
-export const SLACK_TASK_FALLBACK_TITLE = "Step";
 
 export const SLACK_DELIVERY_FALLBACK =
   "I finished the turn but produced no reply. Please try again.";
@@ -49,9 +40,6 @@ const redact = (text: string): string =>
     .replace(SECRET_ASSIGNMENT_RE, "[internal configuration]")
     .replaceAll(/\n{3,}/gu, "\n\n");
 
-// Task chunks are one-line labels, so the shared redaction runs over text
-// whose newlines have already collapsed. Length is left to `clampTaskChunk`,
-// which spends the budget across the whole chunk rather than per field.
 export const sanitizeTaskText = (text: string, fallback = ""): string => {
   const safe = redact(text).replaceAll(/\s+/gu, " ").trim();
   return safe === "" ? fallback : safe;
@@ -71,17 +59,6 @@ export const sanitizeReply = (
   return safe;
 };
 
-const openTailIndex = (buffer: string): number => {
-  let cut = buffer.length;
-  for (const pattern of OPEN_TAIL_RES) {
-    const match = pattern.exec(buffer);
-    if (match && match.index < cut) {
-      cut = match.index;
-    }
-  }
-  return cut;
-};
-
 export interface StreamSanitizer {
   push: (delta: string) => string;
   flush: () => string;
@@ -95,6 +72,21 @@ export const createStreamSanitizer = (): StreamSanitizer => {
     started ||= safe !== "";
     return safe;
   };
+  const release = (): string => {
+    if (buffer.length <= STREAM_TAIL_LENGTH) {
+      return "";
+    }
+    let cut = buffer.length - STREAM_TAIL_LENGTH;
+    if (/[\uDC00-\uDFFF]/u.test(buffer.charAt(cut))) {
+      cut -= 1;
+    }
+    if (cut <= 0) {
+      return "";
+    }
+    const head = buffer.slice(0, cut);
+    buffer = buffer.slice(cut);
+    return emit(head);
+  };
   return {
     flush() {
       const rest = buffer;
@@ -102,25 +94,20 @@ export const createStreamSanitizer = (): StreamSanitizer => {
       return emit(rest).trimEnd();
     },
     push(delta) {
-      buffer += delta;
-      const cut = openTailIndex(buffer);
-      if (cut === 0) {
-        return "";
+      let emitted = "";
+      for (
+        let offset = 0;
+        offset < delta.length;
+        offset += STREAM_TAIL_LENGTH
+      ) {
+        buffer += delta.slice(offset, offset + STREAM_TAIL_LENGTH);
+        emitted += release();
       }
-      const head = buffer.slice(0, cut);
-      buffer = buffer.slice(cut);
-      return emit(head);
+      return emitted;
     },
   };
 };
 
-// What the types enforce: the brand is module-private, so a destination cannot
-// be written as a literal (TS2741) nor have a field reassigned (TS2540), and
-// the frozen result rejects Object.assign at runtime. What they do not enforce:
-// object spread copies the brand, so `{ ...streamTargetFor(turn), channelId }`
-// still typechecks. The fence against that is the worker-level test "keeps the
-// wire destination on the routed channel, not one named in the turn text or the
-// deltas", which asserts the wire bodies against the routed event.
 const routedOrigin = Symbol("routedOrigin");
 
 export interface SlackStreamTarget {
@@ -141,106 +128,6 @@ export const streamTargetFor = (turn: RoutedSlackTurn): SlackStreamTarget =>
     surface: turn.surface,
     threadTs: turn.threadTs,
   });
-
-export type SlackTaskStatus = "pending" | "in_progress" | "complete" | "error";
-
-export interface SlackTaskUpdate {
-  id: string;
-  title: string;
-  status: SlackTaskStatus;
-  output?: string;
-}
-
-// Slack's `task_update` chunk, not the `task_card` block: the chunk keys the
-// task on `id` and takes `details`/`output` as plain strings, where the block
-// uses `task_id` and rich_text entities.
-// `id` is passed through unredacted because Slack never renders it: it is
-// only a correlation key, so the rendering-side attacks the sanitizer exists
-// to stop (broadcast pings, `<@...>` control sequences, markdown injection)
-// are unreachable through that field. An empty runtime id is stored as `_`
-// so the chunk stays a valid key. The budget path may still truncate the
-// id, and that is accepted. `title` and `output` are the visible text.
-interface SlackTaskChunk {
-  type: "task_update";
-  id: string;
-  title: string;
-  status: SlackTaskStatus;
-  output?: string;
-}
-
-// Slack budgets 256 characters per `task_update` chunk without splitting that
-// across its fields, and an oversized chunk comes back `invalid_chunks` - a
-// rejected append that would cost the user the whole reply. So the serialized
-// chunk is what gets measured, and the budget is spent in priority order: the
-// output first, then the title down to its fallback, and only then the id,
-// which is opaque. `title` is required, so it never empties.
-const taskChunkEncoder = new TextEncoder();
-
-// Measured in UTF-8 bytes, which is at least the character count Slack
-// documents: overshooting costs a shorter preview, undershooting costs the
-// reply. A UTF-16 length would undercount every non-ASCII result.
-const oversizeOf = (chunk: SlackTaskChunk): number =>
-  taskChunkEncoder.encode(JSON.stringify(chunk)).length -
-  MAX_SLACK_TASK_CHUNK_LENGTH;
-
-// The overflow is a byte count but a slice is indexed in UTF-16 units, so the
-// cut is scaled by the text's own bytes-per-unit rather than subtracted raw,
-// which would erase a multibyte field wholesale on the first pass.
-const trimTaskField = (text: string, overflow: number): string => {
-  const bytes = taskChunkEncoder.encode(text).length;
-  const drop =
-    bytes === 0 ? text.length : Math.ceil((overflow * text.length) / bytes);
-  const kept = text.slice(0, Math.max(0, text.length - drop));
-  // A slice can land between the halves of a surrogate pair, and the orphan
-  // would reach Slack escaped as a replacement character.
-  const whole = /[\uD800-\uDBFF]$/u.test(kept) ? kept.slice(0, -1) : kept;
-  return whole.trimEnd();
-};
-
-const shrinkTaskChunk = (
-  chunk: SlackTaskChunk,
-  overflow: number,
-): SlackTaskChunk | undefined => {
-  const { id, output, title, ...rest } = chunk;
-  if (output !== undefined) {
-    const kept = trimTaskField(output, overflow);
-    return kept === ""
-      ? { ...rest, id, title }
-      : { ...rest, id, output: kept, title };
-  }
-  if (title !== SLACK_TASK_FALLBACK_TITLE) {
-    const kept = trimTaskField(title, overflow);
-    return {
-      ...rest,
-      id,
-      title: kept === "" ? SLACK_TASK_FALLBACK_TITLE : kept,
-    };
-  }
-  if (id.length > 1) {
-    return {
-      ...rest,
-      id: id.slice(0, Math.max(1, id.length - overflow)),
-      title,
-    };
-  }
-  return undefined;
-};
-
-const clampTaskChunk = (chunk: SlackTaskChunk): SlackTaskChunk => {
-  let fitted = chunk;
-  let overflow = oversizeOf(fitted);
-  while (overflow > 0) {
-    const next = shrinkTaskChunk(fitted, overflow) ?? fitted;
-    // Identity is the no-progress case: shrink returned undefined, so
-    // `?? fitted` reused the current chunk and further passes cannot help.
-    if (next === fitted) {
-      return next;
-    }
-    fitted = next;
-    overflow = oversizeOf(next);
-  }
-  return fitted;
-};
 
 export interface SlackStream {
   append: (delta: string) => void;

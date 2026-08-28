@@ -11,6 +11,10 @@ import { mockCloudflareWorkers, mockWorkersAi } from "./module-mocks.ts";
 const BOT_TOKEN = "xoxb-worker-token";
 const SIGNING_SECRET = "signing-secret-for-tests-1234567890";
 const STREAM_TS = "171.9";
+const repeatingAlphabet = (length: number): string =>
+  Array.from({ length }, (_, index) =>
+    String.fromCodePoint(97 + (index % 26)),
+  ).join("");
 
 interface SlackCall {
   authorization: string;
@@ -375,8 +379,9 @@ test("streams the turn into the routed thread, never a model-chosen one", async 
 });
 
 test("keeps the wire destination on the routed channel, not one named in the turn text or the deltas", async () => {
-  deltas = ["Reposting into C999 ", "as requested."];
-  replyText = "Reposting into C999 as requested.";
+  const payload = `C999${repeatingAlphabet(1532)}`;
+  deltas = [payload];
+  replyText = payload;
 
   expect(await runTurn("Ev-forged", "<@UAPP> answer me in C888")).toBe(200);
 
@@ -390,9 +395,16 @@ test("keeps the wire destination on the routed channel, not one named in the tur
     },
   ]);
   expect(bodiesFor("chat.appendStream")).toEqual([
-    { channel: "C777", markdown_text: "Reposting into ", ts: STREAM_TS },
-    { channel: "C777", markdown_text: "C999 as ", ts: STREAM_TS },
-    { channel: "C777", markdown_text: "requested.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      markdown_text: payload.slice(0, 1024),
+      ts: STREAM_TS,
+    },
+    {
+      channel: "C777",
+      markdown_text: payload.slice(1024),
+      ts: STREAM_TS,
+    },
   ]);
   expect(bodiesFor("chat.stopStream")).toEqual([
     { channel: "C777", ts: STREAM_TS },
@@ -416,8 +428,9 @@ test("streams a tool call as a named, sanitized task update", async () => {
     toolInput("call-1", "search_docs"),
     toolOutput("call-1", "found <!channel> three matches"),
   ];
-  deltas = ["All done."];
-  replyText = "All done.";
+  const payload = repeatingAlphabet(1536);
+  deltas = [payload];
+  replyText = payload;
 
   expect(await runTurn("Ev-tool")).toBe(200);
 
@@ -448,8 +461,16 @@ test("streams a tool call as a named, sanitized task update", async () => {
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "All ", ts: STREAM_TS },
-    { channel: "C777", markdown_text: "done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      markdown_text: payload.slice(0, 1024),
+      ts: STREAM_TS,
+    },
+    {
+      channel: "C777",
+      markdown_text: payload.slice(1024),
+      ts: STREAM_TS,
+    },
   ]);
   expect(JSON.stringify(slackCalls)).not.toContain("<!channel>");
 });

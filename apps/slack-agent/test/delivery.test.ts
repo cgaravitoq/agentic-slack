@@ -9,6 +9,11 @@ import {
   SLACK_TASK_FALLBACK_TITLE,
   streamTargetFor,
 } from "@agentic-slack/core";
+import {
+  createStreamSanitizer,
+  sanitizeReply,
+  STREAM_TAIL_LENGTH,
+} from "../../../packages/core/src/delivery.ts";
 import type { RoutedSlackTurn } from "@agentic-slack/core";
 import * as v from "valibot";
 
@@ -271,18 +276,17 @@ describe("trusted Slack streaming delivery", () => {
     });
   });
 
-  test("emits one append per delta instead of a single buffered flush", async () => {
+  test("emits the prefix before flush once the withheld tail is exceeded", async () => {
     const slack = createFakeSlack();
     const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
-    stream.append("credential is xox");
-    stream.append("b-1234567890-abcdef done");
+    const text = "n".repeat(600);
+    stream.append(text);
     await stream.finish(SLACK_DELIVERY_FALLBACK);
 
-    expect(slack.markdownChunks()).toEqual([
-      "credential is ",
-      "[secret] ",
-      "done",
-    ]);
+    expect(slack.markdownChunks().length).toBeGreaterThan(1);
+    expect(slack.markdownChunks()[0]?.length).toBeGreaterThan(0);
+    expect(slack.markdownChunks()[0]?.length).toBeLessThan(text.length);
+    expect(slack.markdown()).toBe(text);
   });
 
   test("withholds a Slack token split across two deltas", async () => {
@@ -369,6 +373,27 @@ describe("trusted Slack streaming delivery", () => {
     );
   });
 
+  test("redacts pretty-printed secret assignments on the full emitted payload", async () => {
+    const cases: [string, string][] = [
+      ['{ "password": "hunter2"}', "{ [internal configuration]}"],
+      ['{ "api_key": "sk-live-1"},', "{ [internal configuration]},"],
+      ['["token": "abc123"]', "[[internal configuration]]"],
+    ];
+    await Promise.all(
+      cases.map(async ([payload, expected]) => {
+        const slack = createFakeSlack();
+        const stream = createSlackStream(
+          channelTarget,
+          BOT_TOKEN,
+          slack.fetcher,
+        );
+        stream.append(payload);
+        await stream.finish(SLACK_DELIVERY_FALLBACK);
+        expect(slack.markdown()).toBe(expected);
+      }),
+    );
+  });
+
   test("stops the stream once even when the failure path follows a throw", async () => {
     const slack = createFakeSlack({ "chat.stopStream": "channel_not_found" });
     const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
@@ -390,16 +415,26 @@ describe("trusted Slack streaming delivery", () => {
   });
 
   test("splits an oversized reply into Slack-sized appends", async () => {
-    const slack = createFakeSlack();
-    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
-    stream.append("a".repeat(MAX_SLACK_APPEND_LENGTH + 500));
-    await stream.finish(SLACK_DELIVERY_FALLBACK);
+    expect(MAX_SLACK_APPEND_LENGTH).toBe(12_000);
+    await Promise.all(
+      [13_000, 20_000].map(async (size) => {
+        const slack = createFakeSlack();
+        const stream = createSlackStream(
+          channelTarget,
+          BOT_TOKEN,
+          slack.fetcher,
+        );
+        stream.append("a".repeat(size));
+        await stream.finish(SLACK_DELIVERY_FALLBACK);
 
-    const appends = slack.calls.filter(
-      (call) => call.method === "chat.appendStream",
+        const chunks = slack.markdownChunks();
+        expect(chunks.length).toBeGreaterThan(1);
+        for (const chunk of chunks) {
+          expect(chunk.length).toBeLessThanOrEqual(12_000);
+        }
+        expect(chunks.join("")).toBe("a".repeat(size));
+      }),
     );
-    expect(appends).toHaveLength(2);
-    expect(slack.markdown()).toHaveLength(MAX_SLACK_APPEND_LENGTH + 500);
   });
 
   test("delivers the fallback when the turn produced no text", async () => {
@@ -454,8 +489,7 @@ describe("trusted Slack streaming delivery", () => {
 
     expect(slack.methods().at(-1)).toBe("chat.stopStream");
     expect(slack.markdownChunks()).toEqual([
-      "partial ",
-      "answer",
+      "partial answer",
       "I hit an error before finishing that reply. Please try again.",
     ]);
   });
@@ -470,7 +504,7 @@ describe("trusted Slack streaming delivery", () => {
     await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
 
     expect(slack.markdownChunks()).toEqual([
-      "partial ",
+      "partial answer",
       "I hit an error before finishing that reply. Please try again.",
     ]);
     expect(slack.acceptedChunks()).toEqual([
@@ -485,8 +519,8 @@ describe("trusted Slack streaming delivery", () => {
       { limit: 1, skip: 1 },
     );
     const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
-    stream.append("hello world ");
-    stream.append("more text ");
+    const prefix = "a".repeat(600);
+    stream.append(prefix);
     let failure: unknown;
     try {
       await stream.finish(SLACK_DELIVERY_FALLBACK);
@@ -499,7 +533,7 @@ describe("trusted Slack streaming delivery", () => {
       new Error("Slack chat.appendStream failed: rate_limited"),
     );
     expect(slack.acceptedChunks()).toEqual([
-      "hello ",
+      "a".repeat(88),
       SLACK_STREAM_FAILURE_NOTICE,
     ]);
     expect(slack.acceptedMethods()).toEqual([
@@ -557,11 +591,6 @@ describe("Slack task updates", () => {
     ).toEqual([
       JSON.stringify({
         channel: "C123",
-        markdown_text: "Looking it ",
-        ts: STREAM_TS,
-      }),
-      JSON.stringify({
-        channel: "C123",
         chunks: [
           {
             id: "call-1",
@@ -587,12 +616,7 @@ describe("Slack task updates", () => {
       }),
       JSON.stringify({
         channel: "C123",
-        markdown_text: "up. Found ",
-        ts: STREAM_TS,
-      }),
-      JSON.stringify({
-        channel: "C123",
-        markdown_text: "three.",
+        markdown_text: "Looking it up. Found three.",
         ts: STREAM_TS,
       }),
     ]);
@@ -869,6 +893,128 @@ describe("Slack task updates", () => {
         type: "task_update",
       },
     ]);
+  });
+});
+
+const repeatingAlphabet = (length: number): string =>
+  Array.from({ length }, (_, index) =>
+    String.fromCodePoint(97 + (index % 26)),
+  ).join("");
+
+describe("stream sanitizer cutter", () => {
+  test("the withheld tail is 512 characters", () => {
+    expect(STREAM_TAIL_LENGTH).toBe(512);
+  });
+
+  test("the longest secret-assignment match is shorter than the withheld tail", () => {
+    const name = `\\"'${"A".repeat(64)}SIGNING_SECRET${"A".repeat(64)}\\""`;
+    const value = `\\"${"x".repeat(200)}\\"`;
+    const assignment = (spaces: number) =>
+      `${name}${" ".repeat(spaces)}=${" ".repeat(spaces)}${value}`;
+    let maxSpaces = 0;
+    for (let spaces = 0; spaces <= 800; spaces += 1) {
+      if (sanitizeReply(assignment(spaces)) === "[internal configuration]") {
+        maxSpaces = spaces;
+      }
+    }
+    const longest = assignment(maxSpaces);
+    expect(longest.length).toBe(385);
+    expect(385).toBeLessThan(512);
+  });
+
+  test("4000 space-free single-character pushes finish under a second and emit before flush", () => {
+    const text = repeatingAlphabet(4000);
+    const sanitizer = createStreamSanitizer();
+    const started = performance.now();
+    const emissions: string[] = [];
+    const collect = (piece: string) => {
+      if (piece !== "") {
+        emissions.push(piece);
+      }
+    };
+    for (const char of text) {
+      collect(sanitizer.push(char));
+    }
+    const elapsed = performance.now() - started;
+    collect(sanitizer.flush());
+    expect(elapsed).toBeLessThan(1000);
+    const expected = Array.from(
+      { length: 3488 },
+      (_, index) => text[index] ?? "",
+    );
+    expected.push(text.slice(3488));
+    expect(emissions).toEqual(expected);
+  });
+
+  test("400 Japanese characters produce more than one emission", () => {
+    const text = Array.from({ length: 912 }, (_, index) =>
+      String.fromCodePoint(0x30_41 + (index % 86)),
+    ).join("");
+    const sanitizer = createStreamSanitizer();
+    const emissions: string[] = [];
+    const collect = (piece: string) => {
+      if (piece !== "") {
+        emissions.push(piece);
+      }
+    };
+    collect(sanitizer.push(text));
+    collect(sanitizer.flush());
+    expect(emissions).toEqual([text.slice(0, 400), text.slice(400)]);
+  });
+
+  test("a 3-tail unique push emits prefix blocks then the withheld tail in order", () => {
+    const text = repeatingAlphabet(1536);
+    const sanitizer = createStreamSanitizer();
+    const emissions: string[] = [];
+    const collect = (piece: string) => {
+      if (piece !== "") {
+        emissions.push(piece);
+      }
+    };
+    collect(sanitizer.push(text));
+    collect(sanitizer.flush());
+    expect(emissions).toEqual([text.slice(0, 1024), text.slice(1024)]);
+  });
+
+  test("redacts an accidental configuration echo on the full emitted payload", () => {
+    const sanitizer = createStreamSanitizer();
+    const output = sanitizer.push('PASSWORD = "hunter2"') + sanitizer.flush();
+    expect(output).toBe("[internal configuration]");
+  });
+
+  test("a mid-pair cut emits whole code points, never a lone surrogate", () => {
+    const text = `${"😀".repeat(600)}a`;
+    const sanitizer = createStreamSanitizer();
+    const emissions: string[] = [];
+    const collect = (piece: string) => {
+      if (piece !== "") {
+        emissions.push(piece);
+      }
+    };
+    collect(sanitizer.push(text));
+    collect(sanitizer.flush());
+    expect(emissions).toEqual(["😀".repeat(344), `${"😀".repeat(256)}a`]);
+    for (const chunk of emissions) {
+      expect(chunk).not.toMatch(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,
+      );
+    }
+  });
+
+  test("a first cut that emits nothing still strips leading whitespace later", () => {
+    const sanitizer = createStreamSanitizer();
+    const emissions: string[] = [];
+    const collect = (piece: string) => {
+      if (piece !== "") {
+        emissions.push(piece);
+      }
+    };
+    collect(sanitizer.push(`${" ".repeat(600)}hello`));
+    collect(sanitizer.flush());
+    expect(emissions).toEqual(["hello"]);
+    for (const chunk of emissions) {
+      expect(chunk).not.toMatch(/^\s/u);
+    }
   });
 });
 

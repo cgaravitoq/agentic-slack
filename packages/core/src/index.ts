@@ -14,18 +14,16 @@ export {
   createSlackStream,
   MAX_SLACK_APPEND_LENGTH,
   MAX_SLACK_MESSAGE_LENGTH,
-  MAX_SLACK_TASK_CHUNK_LENGTH,
   SLACK_DELIVERY_FALLBACK,
   SLACK_STREAM_FAILURE_NOTICE,
-  SLACK_TASK_FALLBACK_TITLE,
   streamTargetFor,
 } from "./delivery.ts";
-export type {
-  SlackStream,
-  SlackStreamTarget,
-  SlackTaskStatus,
-  SlackTaskUpdate,
-} from "./delivery.ts";
+export type { SlackStream, SlackStreamTarget } from "./delivery.ts";
+export {
+  MAX_SLACK_TASK_CHUNK_LENGTH,
+  SLACK_TASK_FALLBACK_TITLE,
+} from "./task-chunk.ts";
+export type { SlackTaskStatus, SlackTaskUpdate } from "./task-chunk.ts";
 export { generateSlackManifest } from "./manifest.ts";
 export { composeInstructions } from "./prompt.ts";
 export {
