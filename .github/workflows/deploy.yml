@@ -14,16 +14,47 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: staging
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.3.14
       - run: bun install --frozen-lockfile
       - run: bun run verify
-      - run: bun run db:migrate:staging
-      - run: bun run deploy:staging
+      - name: Migrate staging D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: bun run db:migrate:staging
+      - name: Deploy staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -o pipefail
+          bun run deploy:staging 2>&1 | tee "$RUNNER_TEMP/deploy.log"
+          url=$(grep -Eo 'https://[A-Za-z0-9.-]+\.workers\.dev' "$RUNNER_TEMP/deploy.log" | head -n 1)
+          if [ -z "$url" ]; then
+            echo "Deploy output did not include a workers.dev URL"
+            exit 1
+          fi
+          echo "WORKER_URL=$url" >> "$GITHUB_ENV"
+      - name: Check deployed health
+        run: |
+          bun --eval '
+          const url = `${process.env.WORKER_URL}/health`;
+          const response = await fetch(url);
+          const body = await response.json();
+          const missing = Array.isArray(body.missing) ? body.missing : [];
+          if (response.status !== 200 || body.status !== "ready" || missing.length > 0) {
+            const listed = missing.length > 0 ? missing.join(", ") : "(unspecified)";
+            throw new Error(
+              `Deployed worker is not ready (HTTP ${response.status}): missing ${listed}`,
+            );
+          }
+          console.log("Deployed worker is ready");
+          '

@@ -70,27 +70,6 @@
         "packages/miniflare"
       ],
       "specialNotes": "Reference the Cloudflare build, dry-deploy, and local-runtime seams used by this repository."
-    },
-    {
-      "name": "llms-txt",
-      "type": "git",
-      "url": "https://github.com/AnswerDotAI/llms-txt",
-      "branch": "main",
-      "searchPaths": ["llms_txt", "nbs", "tests"],
-      "specialNotes": "Reference llms.txt parsing and failure behavior."
-    },
-    {
-      "name": "posthog",
-      "type": "git",
-      "url": "https://github.com/PostHog/posthog",
-      "branch": "master",
-      "searchPaths": [
-        "posthog/hogql",
-        "posthog/api",
-        "frontend/src/queries",
-        "products"
-      ],
-      "specialNotes": "Reference HogQL aggregate-query contracts and API behavior."
     }
   ]
 }

@@ -66,7 +66,7 @@ export interface SlackCoreEnv {
   Bindings: SlackCoreBindings;
 }
 
-export const routeSlackEvent = (
+const routeSlackEvent = (
   payload: SlackEventsApiPayload,
 ): RoutedSlackEvent | null => {
   if (!isEventCallbackEnvelope(payload)) {

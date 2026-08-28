@@ -40,7 +40,7 @@ const redact = (text: string): string =>
     .replace(SECRET_ASSIGNMENT_RE, "[internal configuration]")
     .replaceAll(/\n{3,}/gu, "\n\n");
 
-export const sanitizeTaskText = (text: string, fallback = ""): string => {
+const sanitizeTaskText = (text: string, fallback = ""): string => {
   const safe = redact(text).replaceAll(/\s+/gu, " ").trim();
   return safe === "" ? fallback : safe;
 };

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://unpkg.com/knip@6/schema-jsonc.json",
+  "includeEntryExports": true,
+  "ignoreDependencies": [
+    // Specifier cloudflare:workers is a Workers runtime virtual module.
+    "cloudflare"
+  ],
+  "ignoreIssues": {
+    // Flue requires export const cloudflare = extend(...) on "use agent" modules.
+    "apps/slack-agent/src/agent.ts": ["exports"],
+    // Flue loads this file by convention; the default export is the project config.
+    "apps/slack-agent/flue.config.ts": ["exports"]
+  },
+  "workspaces": {
+    "apps/slack-agent": {
+      "entry": ["flue.config.ts"]
+    }
+  }
+}

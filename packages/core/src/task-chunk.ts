@@ -2,7 +2,7 @@ export const MAX_SLACK_TASK_CHUNK_LENGTH = 256;
 
 export const SLACK_TASK_FALLBACK_TITLE = "Step";
 
-export type SlackTaskStatus = "pending" | "in_progress" | "complete" | "error";
+type SlackTaskStatus = "pending" | "in_progress" | "complete" | "error";
 
 export interface SlackTaskUpdate {
   id: string;

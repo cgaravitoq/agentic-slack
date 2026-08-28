@@ -20,7 +20,8 @@
     "build": "vite build --config apps/slack-agent/vite.config.ts",
     "deploy:dry": "CLOUDFLARE_ENV=staging bun run build && wrangler deploy --dry-run --config apps/slack-agent/dist/agentic_slack/wrangler.json",
     "deploy:staging": "CLOUDFLARE_ENV=staging bun run build && wrangler deploy --config apps/slack-agent/dist/agentic_slack/wrangler.json",
-    "verify": "bun run format:check && bun run lint && bun run typecheck && bun test && bun run deploy:dry"
+    "knip": "knip",
+    "verify": "bun run format:check && bun run lint && bun run typecheck && bun test && bun run knip && bun run deploy:dry"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.8",
@@ -28,6 +29,7 @@
     "@cloudflare/workers-types": "5.20260804.1",
     "@flue/vite": "2.0.3",
     "@types/bun": "1.3.14",
+    "knip": "6.33.0",
     "oxlint": "1.78.0",
     "oxlint-tsgolint": "7.0.2001",
     "typescript": "7.0.2",

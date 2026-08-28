@@ -9,7 +9,10 @@
     "head_sampling_rate": 1,
     "traces": { "enabled": true }
   },
+  "limits": { "cpu_ms": 30000 },
   "d1_databases": [{ "binding": "DB" }],
+  // Flue injects the Durable Object binding at build time, not the SQLite
+  // class migration. Removing this tag deploys a DO without storage.
   "migrations": [
     {
       "tag": "flue-class-FlueSlackAgentAgent",
