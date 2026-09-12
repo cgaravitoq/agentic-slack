@@ -4,10 +4,8 @@ import {
   defineAgentConfig,
   setSuggestedPrompts,
 } from "@agentic-slack/core";
-import type {
-  ConversationLifecycleAgent,
-  SlackCoreBindings,
-} from "@agentic-slack/core";
+import type { SlackCoreBindings } from "@agentic-slack/core";
+import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
 import * as v from "valibot";
 import { createApp } from "../src/app.ts";
 import { createLifecycleHandler } from "../src/lifecycle.ts";

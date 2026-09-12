@@ -12,14 +12,13 @@ export interface SlackTaskUpdate {
 }
 
 // Slack's `task_update` chunk, not the `task_card` block: the chunk keys the
-// task on `id` and takes `details`/`output` as plain strings, where the block
-// uses `task_id` and rich_text entities.
-// `id` is passed through unredacted because Slack never renders it: it is
-// only a correlation key, so the rendering-side attacks the sanitizer exists
-// to stop (broadcast pings, `<@...>` control sequences, markdown injection)
-// are unreachable through that field. An empty runtime id is stored as `_`
-// so the chunk stays a valid key. The budget path may still truncate the
-// id, and that is accepted. `title` and `output` are the visible text.
+// task on `id` and takes `output` as a plain string, where the block uses
+// `task_id` and rich_text entities.
+// `id` goes unredacted because Slack never renders it: it is only a
+// correlation key, so pings, `<@...>` control sequences and markdown
+// injection cannot reach the conversation through it. An empty runtime id is
+// stored as `_` so the chunk keeps a valid key; `title` and `output` are the
+// visible text.
 export interface SlackTaskChunk {
   type: "task_update";
   id: string;
@@ -28,17 +27,15 @@ export interface SlackTaskChunk {
   output?: string;
 }
 
-// Slack budgets 256 characters per `task_update` chunk without splitting that
-// across its fields, and an oversized chunk comes back `invalid_chunks` - a
-// rejected append that would cost the user the whole reply. So the serialized
-// chunk is what gets measured, and the budget is spent in priority order: the
-// output first, then the title down to its fallback, and only then the id,
-// which is opaque. `title` is required, so it never empties.
+// Slack budgets 256 characters for the whole serialized `task_update` chunk
+// without splitting that across its fields, and an oversized chunk comes back
+// `invalid_chunks`, which costs the user the reply. The budget is therefore
+// spent in priority order: output first, then the title down to its fallback,
+// and only then the opaque id.
 const taskChunkEncoder = new TextEncoder();
 
 // Measured in UTF-8 bytes, which is at least the character count Slack
-// documents: overshooting costs a shorter preview, undershooting costs the
-// reply. A UTF-16 length would undercount every non-ASCII result.
+// documents; a UTF-16 length would undercount every non-ASCII result.
 const oversizeOf = (chunk: SlackTaskChunk): number =>
   taskChunkEncoder.encode(JSON.stringify(chunk)).length -
   MAX_SLACK_TASK_CHUNK_LENGTH;
@@ -91,8 +88,7 @@ export const clampTaskChunk = (chunk: SlackTaskChunk): SlackTaskChunk => {
   let overflow = oversizeOf(fitted);
   while (overflow > 0) {
     const next = shrinkTaskChunk(fitted, overflow) ?? fitted;
-    // Identity is the no-progress case: shrink returned undefined, so
-    // `?? fitted` reused the current chunk and further passes cannot help.
+    // Identity means no progress: another pass cannot help.
     if (next === fitted) {
       return next;
     }

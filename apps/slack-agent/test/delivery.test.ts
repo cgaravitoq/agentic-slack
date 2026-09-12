@@ -1,32 +1,36 @@
 import { describe, expect, test } from "bun:test";
 import {
   applySlackDeliveryEvent,
-  createSlackStream,
-  evictLiveSlackDelivery,
   finishSlackDelivery,
-  MAX_SLACK_APPEND_LENGTH,
-  MAX_SLACK_MESSAGE_LENGTH,
-  MAX_SLACK_TASK_CHUNK_LENGTH,
   openSlackDelivery,
-  SLACK_DELIVERY_FALLBACK,
-  slackDeliveryBinding,
   slackEventFromObservation,
-  SLACK_STREAM_FAILURE_NOTICE,
-  SLACK_TASK_FALLBACK_TITLE,
-  streamTargetFor,
 } from "@agentic-slack/core";
 import type { RoutedSlackTurn, SlackDeliveryStore } from "@agentic-slack/core";
 import type { FlueObservation } from "@flue/runtime";
+// `createSlackStream` takes a nominal target, so it and the two helpers that
+// build one come from the same module rather than from the package entry.
 import {
   COALESCE_CHARS,
   COALESCE_MS,
+  createSlackStream,
   createStreamSanitizer,
+  evictLiveSlackDelivery,
   MAX_RETRY_AFTER_MS,
   MAX_RETRY_WAIT_MS,
+  MAX_SLACK_APPEND_LENGTH,
+  MAX_SLACK_MESSAGE_LENGTH,
   retryDelayMs,
   sanitizeReply,
+  SLACK_DELIVERY_FALLBACK,
+  slackDeliveryBinding,
+  SLACK_STREAM_FAILURE_NOTICE,
   STREAM_TAIL_LENGTH,
+  streamTargetFor,
 } from "../../../packages/core/src/delivery.ts";
+import {
+  MAX_SLACK_TASK_CHUNK_LENGTH,
+  SLACK_TASK_FALLBACK_TITLE,
+} from "../../../packages/core/src/task-chunk.ts";
 import * as v from "valibot";
 
 const BOT_TOKEN = "xoxb-trusted-token";
@@ -1468,18 +1472,7 @@ describe("durable Slack delivery", () => {
 
   test("does not throw or double-post when finish hits a Slack error and is retried", async () => {
     const slack = createFakeSlack({ "chat.stopStream": "channel_not_found" });
-    const rows = new Map<
-      string,
-      NonNullable<ReturnType<SlackDeliveryStore["load"]>>
-    >();
-    const store: SlackDeliveryStore = {
-      load(instanceId) {
-        return rows.get(instanceId);
-      },
-      save(instanceId, record) {
-        rows.set(instanceId, record);
-      },
-    };
+    const store = memoryStore();
     openSlackDelivery(
       store,
       "i1",

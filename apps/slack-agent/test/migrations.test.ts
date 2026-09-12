@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { claimAndRun, claimEvent, releaseEvent } from "@agentic-slack/core";
+import {
+  claimAndRun,
+  claimEvent,
+  releaseEvent,
+} from "../../../packages/core/src/dedup.ts";
 import * as v from "valibot";
 
 const bindings = v.array(

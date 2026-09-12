@@ -3,22 +3,22 @@ import { fileURLToPath } from "node:url";
 import * as v from "valibot";
 
 import {
-  claimAndRun,
   CLOUDFLARE_TRACING_CONTENT,
   composeInstructions,
   defineAgentConfig,
   expireLatest,
   generateSlackManifest,
   missingReadiness,
-  MODEL,
   replaceRetention,
   setSuggestedPrompts,
 } from "@agentic-slack/core";
 import {
   CHANNEL_RETENTION_DAYS,
   MAX_SUGGESTED_PROMPTS,
+  MODEL,
   PRIVATE_RETENTION_DAYS,
 } from "../../../packages/core/src/config.ts";
+import { claimAndRun } from "../../../packages/core/src/dedup.ts";
 import { CORE_INSTRUCTIONS } from "../../../packages/core/src/prompt.ts";
 
 interface PrepareStatementDouble {

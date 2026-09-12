@@ -41,7 +41,6 @@ const oxlintReport = v.object({
 });
 
 const lintFixtures = async (): Promise<Map<string, string[]>> => {
-  // Inside the repository so widened ignore patterns cannot hide the fixtures.
   const directory = await mkdtemp(
     path.join(import.meta.dirname, ".anti-slop-"),
   );

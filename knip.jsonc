@@ -5,14 +5,6 @@
     // Specifier cloudflare:workers is a Workers runtime virtual module.
     "cloudflare"
   ],
-  "ignoreIssues": {
-    // Flue requires export const cloudflare = extend(...) on "use agent" modules.
-    "apps/slack-agent/src/agent.ts": ["exports"],
-    // Flue loads this file by convention; the default export is the project config.
-    "apps/slack-agent/flue.config.ts": ["exports"],
-    // The Worker's default export is handed to the Workers runtime, not imported.
-    "apps/slack-agent/src/index.ts": ["exports"]
-  },
   "workspaces": {
     "apps/slack-agent": {
       // The `!` suffix marks a production entry: Flue builds the Worker from

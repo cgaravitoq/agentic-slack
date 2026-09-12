@@ -27,6 +27,8 @@ setProvider(
   cloudflareBindingProvider({ binding: bindings.AI, gateway: false }),
 );
 
+// The Workers runtime calls this default export; no repo code imports it.
+/** @public */
 export default createApp(
   trusted,
   async (turn, instanceId, turnBindings) => {

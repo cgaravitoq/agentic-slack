@@ -676,13 +676,10 @@ const runSlackAlarmDelivery = async (
     token,
     fetcher,
   );
-  try {
-    feedSlackStream(stream, work.events);
-    await stream.finish(replyTrailer(work.replyText));
-  } catch (error: unknown) {
-    await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
-    throw error;
-  }
+  feedSlackStream(stream, work.events);
+  // No `fail` on the way out: `finish` already sent the failure notice and
+  // closed the stream before it rethrows.
+  await stream.finish(replyTrailer(work.replyText));
 };
 
 const emptyRecord = (binding: SlackDeliveryBinding): SlackDeliveryRecord => ({

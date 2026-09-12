@@ -1,10 +1,10 @@
 import { afterAll, beforeEach, expect, mock, test } from "bun:test";
-import type { ConversationLifecycleAgent } from "@agentic-slack/core";
+import { slackDeliveryBindingSchema } from "@agentic-slack/core";
 import {
   evictLiveSlackDelivery,
   SLACK_DELIVERY_FALLBACK,
-  slackDeliveryBindingSchema,
-} from "@agentic-slack/core";
+} from "../../../packages/core/src/delivery.ts";
+import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
 import type {
   Agent,
   ConversationStreamChunk,

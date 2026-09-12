@@ -95,7 +95,7 @@ interface RetentionAgent {
   destroy: () => Promise<void>;
 }
 
-export const refreshConfiguredRetention = (
+const refreshConfiguredRetention = (
   agent: RetentionAgent,
   surface: "private" | "channel",
 ): Promise<void> =>
@@ -106,6 +106,8 @@ export const refreshConfiguredRetention = (
     config.retention.channelDays,
   );
 
+// The Flue runtime imports this export by name; no repo code does.
+/** @public */
 export const cloudflare = extend<RetentionAgent>({
   base: (Base) =>
     class extends Base {
