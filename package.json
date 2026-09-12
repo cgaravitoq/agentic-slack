@@ -21,6 +21,7 @@
     "deploy:dry": "CLOUDFLARE_ENV=staging bun run build && wrangler deploy --dry-run --config apps/slack-agent/dist/agentic_slack/wrangler.json",
     "deploy:staging": "CLOUDFLARE_ENV=staging bun run build && wrangler deploy --config apps/slack-agent/dist/agentic_slack/wrangler.json",
     "knip": "knip",
+    "knip:production": "knip --production",
     "verify": "bun run format:check && bun run lint && bun run typecheck && bun test && bun run knip && bun run deploy:dry"
   },
   "devDependencies": {

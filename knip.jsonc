@@ -9,11 +9,16 @@
     // Flue requires export const cloudflare = extend(...) on "use agent" modules.
     "apps/slack-agent/src/agent.ts": ["exports"],
     // Flue loads this file by convention; the default export is the project config.
-    "apps/slack-agent/flue.config.ts": ["exports"]
+    "apps/slack-agent/flue.config.ts": ["exports"],
+    // The Worker's default export is handed to the Workers runtime, not imported.
+    "apps/slack-agent/src/index.ts": ["exports"]
   },
   "workspaces": {
     "apps/slack-agent": {
-      "entry": ["flue.config.ts"]
+      // The `!` suffix marks a production entry: Flue builds the Worker from
+      // the `app` path in flue.config.ts, and wrangler.jsonc has no `main`
+      // because Flue injects it at build time, so Knip cannot infer either.
+      "entry": ["flue.config.ts", "src/index.ts!"]
     }
   }
 }
