@@ -1,4 +1,4 @@
-import type { ConversationStreamChunk, FlueObservation } from "@flue/runtime";
+import type { FlueObservation } from "@flue/runtime";
 import * as v from "valibot";
 import type { ConversationSurface } from "./retention.ts";
 import type { RoutedSlackTurn } from "./slack.ts";
@@ -583,44 +583,6 @@ const toolErrorText = (event: {
   return v.parse(toolOutputText, event.result);
 };
 
-const slackEventsFromChunks = (
-  chunks: readonly ConversationStreamChunk[],
-): SlackDeliveryEvent[] => {
-  const events: SlackDeliveryEvent[] = [];
-  for (const chunk of chunks) {
-    if (chunk.type === "message-delta" && chunk.kind === "text") {
-      events.push({ text: chunk.delta, type: "text" });
-      continue;
-    }
-    if (chunk.type === "tool-input") {
-      events.push({
-        id: chunk.toolCallId,
-        name: chunk.toolName,
-        type: "tool-start",
-      });
-      continue;
-    }
-    if (chunk.type === "tool-output") {
-      events.push({
-        error: false,
-        id: chunk.toolCallId,
-        output: v.parse(toolOutputText, chunk.output),
-        type: "tool-result",
-      });
-      continue;
-    }
-    if (chunk.type === "tool-output-error") {
-      events.push({
-        error: true,
-        id: chunk.toolCallId,
-        output: chunk.errorText,
-        type: "tool-result",
-      });
-    }
-  }
-  return events;
-};
-
 export const slackEventFromObservation = (
   event: FlueObservation,
 ): SlackDeliveryEvent | "fail" | undefined => {
@@ -704,10 +666,8 @@ const runSlackAlarmDelivery = async (
   binding: SlackDeliveryBinding,
   token: string,
   work: {
-    events?: readonly SlackDeliveryEvent[];
-    chunks?: readonly ConversationStreamChunk[];
+    events: readonly SlackDeliveryEvent[];
     replyText: string;
-    error?: Error;
   },
   fetcher: Fetcher = fetch,
 ): Promise<void> => {
@@ -717,13 +677,7 @@ const runSlackAlarmDelivery = async (
     fetcher,
   );
   try {
-    feedSlackStream(
-      stream,
-      work.events ?? slackEventsFromChunks(work.chunks ?? []),
-    );
-    if (work.error !== undefined) {
-      throw work.error;
-    }
+    feedSlackStream(stream, work.events);
     await stream.finish(replyTrailer(work.replyText));
   } catch (error: unknown) {
     await stream.fail(SLACK_STREAM_FAILURE_NOTICE);

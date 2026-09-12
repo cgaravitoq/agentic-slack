@@ -228,6 +228,21 @@ const createFakeSlack = (
   };
 };
 
+const memoryStore = (): SlackDeliveryStore => {
+  const rows = new Map<
+    string,
+    NonNullable<ReturnType<SlackDeliveryStore["load"]>>
+  >();
+  return {
+    load(instanceId) {
+      return rows.get(instanceId);
+    },
+    save(instanceId, record) {
+      rows.set(instanceId, record);
+    },
+  };
+};
+
 const routedTurn: RoutedSlackTurn = {
   appId: "A123",
   channelId: "C123",
@@ -1363,6 +1378,94 @@ describe("observation delivery mapping", () => {
 });
 
 describe("durable Slack delivery", () => {
+  test("replays durable tool events in record order and the reply text exactly once", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const preamble = "n".repeat(600);
+    openSlackDelivery(
+      store,
+      "i1",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("i1");
+    applySlackDeliveryEvent(store, "i1", { text: preamble, type: "text" });
+    applySlackDeliveryEvent(store, "i1", {
+      id: "call-1",
+      name: "search_docs",
+      type: "tool-start",
+    });
+    applySlackDeliveryEvent(store, "i1", {
+      error: false,
+      id: "call-1",
+      output: "found three",
+      type: "tool-result",
+    });
+    applySlackDeliveryEvent(store, "i1", { text: "Done.", type: "text" });
+
+    await finishSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.taskChunks()).toEqual([
+      {
+        id: "call-1",
+        status: "in_progress",
+        title: "search_docs",
+        type: "task_update",
+      },
+      {
+        id: "call-1",
+        output: "found three",
+        status: "complete",
+        title: "search_docs",
+        type: "task_update",
+      },
+    ]);
+    expect(slack.markdownChunks()).toEqual([`${preamble}Done.`]);
+    expect(
+      slack.methods().filter((method) => method === "chat.startStream"),
+    ).toHaveLength(1);
+    expect(
+      slack.methods().filter((method) => method === "chat.stopStream"),
+    ).toHaveLength(1);
+  });
+
+  test("tells the user and closes the record when the durable replay fails", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "channel_not_found" },
+      { limit: 1 },
+    );
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "i1",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("i1");
+    applySlackDeliveryEvent(store, "i1", {
+      id: "call-1",
+      name: "search_docs",
+      type: "tool-start",
+    });
+    applySlackDeliveryEvent(store, "i1", { text: "hello", type: "text" });
+
+    await finishSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([SLACK_STREAM_FAILURE_NOTICE]);
+    expect(
+      slack.methods().filter((method) => method === "chat.startStream"),
+    ).toHaveLength(1);
+    expect(
+      slack.methods().filter((method) => method === "chat.stopStream"),
+    ).toHaveLength(1);
+
+    const calls = slack.calls.length;
+    await finishSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+    expect(slack.calls).toHaveLength(calls);
+  });
+
   test("does not throw or double-post when finish hits a Slack error and is retried", async () => {
     const slack = createFakeSlack({ "chat.stopStream": "channel_not_found" });
     const rows = new Map<
