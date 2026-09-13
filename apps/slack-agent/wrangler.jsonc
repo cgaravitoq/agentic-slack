@@ -25,13 +25,7 @@
     "staging": {
       "name": "agentic-slack-staging",
       "ai": { "binding": "AI" },
-      "d1_databases": [
-        {
-          "binding": "DB",
-          "database_name": "agentic-slack-staging",
-          "database_id": "44078cb4-e76b-4b2d-b90e-e7dc0138fdbe"
-        }
-      ]
+      "d1_databases": [{ "binding": "DB" }]
     }
   }
 }

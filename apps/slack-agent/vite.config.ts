@@ -7,7 +7,7 @@ export default defineConfig({
     flue(),
     cloudflare({
       config: flueWorkerConfig(),
-      configPath: "wrangler.jsonc",
+      configPath: process.env.WORKER_CONFIG ?? "wrangler.jsonc",
     }),
   ],
   root: import.meta.dirname,

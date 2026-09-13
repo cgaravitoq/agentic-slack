@@ -29,3 +29,4 @@ jobs:
       - run: bun test
       - run: bun run knip
       - run: bun run deploy:dry
+      - run: bun audit
