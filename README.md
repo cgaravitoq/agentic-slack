@@ -17,6 +17,7 @@ It is self-hosted in your Cloudflare account; it is not a cloud-independent runt
 ![A real Slack thread where Bloop turns a fictional release plan into a checklist, then keeps the task owners while moving the release to Monday.](assets/slack-demo.png)
 
 Live conversation with the deployed agent, using a fictional release plan.
+Personal identity and channel details have been redacted from the screenshot.
 The follow-up changes the deadline without repeating the task owners, demonstrating context retained within the thread.
 
 ```mermaid
