@@ -651,12 +651,18 @@ const feedSlackStream = (
 const replyTrailer = (replyText: string): string =>
   replyText === "" ? SLACK_DELIVERY_FALLBACK : replyText;
 
+const HIGH_SURROGATE_TAIL = /[\uD800-\uDBFF]$/u;
+const ORPHAN_LOW_SURROGATE_TAIL = /(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]$/u;
+
+// At the cap no later delta can complete a trailing high half, and the low half
+// that follows one already dropped here arrives without its partner.
 const clipDurableText = (text: string): string => {
-  if (text.length <= MAX_DURABLE_REPLY_LENGTH) {
-    return text;
-  }
   const kept = text.slice(0, MAX_DURABLE_REPLY_LENGTH);
-  return /[\uD800-\uDBFF]$/u.test(kept) ? kept.slice(0, -1) : kept;
+  const atCap = kept.length === MAX_DURABLE_REPLY_LENGTH;
+  return (atCap && HIGH_SURROGATE_TAIL.test(kept)) ||
+    ORPHAN_LOW_SURROGATE_TAIL.test(kept)
+    ? kept.slice(0, -1)
+    : kept;
 };
 
 const appendDurableText = (current: string, delta: string): string =>
