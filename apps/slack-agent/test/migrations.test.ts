@@ -272,6 +272,7 @@ describe("D1 migration schema", () => {
       .all();
     expect(survivors).toHaveLength(stale - sweepBatchLimit);
     expect(await claimEvent(db, String(survivors[0].event_id))).toBe(false);
+    expect(await staleCount(db)).toEqual([{ stale: stale - sweepBatchLimit }]);
 
     expect(await claimEvent(db, "Ev-batch-again")).toBe(true);
     expect(await staleCount(db)).toEqual([{ stale: 0 }]);
