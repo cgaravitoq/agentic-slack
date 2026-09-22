@@ -476,15 +476,14 @@ export const createSlackStream = (
     return clipped;
   };
 
-  const send = async (markdown: string, budget: RetryBudget): Promise<void> => {
-    const clipped = clipMarkdown(markdown);
-    if (!clipped) {
+  const post = async (markdown: string, budget: RetryBudget): Promise<void> => {
+    if (!markdown) {
       return;
     }
     const ts = await start(budget);
     for (
       let offset = 0;
-      offset < clipped.length;
+      offset < markdown.length;
       offset += MAX_SLACK_APPEND_LENGTH
     ) {
       // Appends must land in the order the model produced them.
@@ -493,7 +492,7 @@ export const createSlackStream = (
         "chat.appendStream",
         {
           channel: channelId,
-          markdown_text: clipped.slice(
+          markdown_text: markdown.slice(
             offset,
             offset + MAX_SLACK_APPEND_LENGTH,
           ),
@@ -503,6 +502,10 @@ export const createSlackStream = (
       );
       appended = true;
     }
+  };
+
+  const send = async (markdown: string, budget: RetryBudget): Promise<void> => {
+    await post(clipMarkdown(markdown), budget);
   };
 
   // A task update rides the same append call as reply text but never sets
@@ -601,7 +604,10 @@ export const createSlackStream = (
     if (always || !appended || failure !== undefined) {
       const notice =
         failure === undefined ? trailer : SLACK_STREAM_FAILURE_NOTICE;
-      await attempt(() => send(sanitizeReply(notice), closingBudget));
+      // `post`, not `send`: the closing word is not stream content, and a reply
+      // that already hit the content cap would otherwise clip it away and leave
+      // the user with a truncated answer and no sign the turn broke.
+      await attempt(() => post(sanitizeReply(notice), closingBudget));
     }
     const ts = streamTs;
     if (ts === undefined) {

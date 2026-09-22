@@ -606,6 +606,23 @@ describe("trusted Slack streaming delivery", () => {
     }
   });
 
+  test("delivers the failure notice on a reply that already hit the content cap", async () => {
+    const slack = createFakeSlack();
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("a".repeat(20_000));
+    await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+
+    const delivered = slack.acceptedChunks();
+    expect(delivered.slice(0, -1).join("")).toHaveLength(
+      MAX_SLACK_MESSAGE_LENGTH - 7,
+    );
+    expect(delivered.slice(0, -1).join("").endsWith("\n\n(truncated)")).toBe(
+      true,
+    );
+    expect(delivered.at(-1)).toBe(SLACK_STREAM_FAILURE_NOTICE);
+    expect(slack.acceptedMethods().at(-1)).toBe("chat.stopStream");
+  });
+
   test("truncation does not emit a lone surrogate when an emoji straddles the cut", async () => {
     const slack = createFakeSlack();
     const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
