@@ -12,16 +12,52 @@ const bindings = v.array(
   v.union([v.string(), v.number(), v.bigint(), v.boolean(), v.null()]),
 );
 
+// Reproduces wrangler's compareMigrationPaths: it orders by the parsed leading
+// number, which only coincides with lexicographic order while every name is
+// zero-padded to the same width.
+const leadingMigrationNumber = (segment: string): number => {
+  const digits = /^\d+/u.exec(segment.split("_")[0]);
+  return digits === null ? Number.NaN : Number(digits[0]);
+};
+
+const compareSegments = (a: string, b: string): number => {
+  const aNumber = leadingMigrationNumber(a);
+  const bNumber = leadingMigrationNumber(b);
+  if (aNumber !== bNumber) {
+    if (Number.isFinite(aNumber) && Number.isFinite(bNumber)) {
+      return aNumber - bNumber;
+    }
+    if (Number.isFinite(aNumber)) {
+      return -1;
+    }
+    if (Number.isFinite(bNumber)) {
+      return 1;
+    }
+  }
+  return a < b ? -1 : Number(a > b);
+};
+
+const compareMigrationPaths = (a: string, b: string): number => {
+  const aSegments = a.split("/");
+  const bSegments = b.split("/");
+  const shared = Math.min(aSegments.length, bSegments.length);
+  for (const [index, segment] of aSegments.slice(0, shared).entries()) {
+    const comparison = compareSegments(segment, bSegments[index]);
+    if (comparison !== 0) {
+      return comparison;
+    }
+  }
+  return aSegments.length - bSegments.length;
+};
+
 const migrationsDir = new URL("../migrations/", import.meta.url);
 const migrationEntries = await readdir(migrationsDir);
-// wrangler d1 migrations apply runs files lexicographically; match that order.
 const migrationFiles = migrationEntries
   .filter((name) => name.endsWith(".sql"))
-  .toSorted();
+  .toSorted(compareMigrationPaths);
 const migrationSources = await Promise.all(
   migrationFiles.map((name) => Bun.file(new URL(name, migrationsDir)).text()),
 );
-const schema = migrationSources.join("\n");
 
 // Pinned independently of dedup.ts so mutating the retention constant goes red.
 const retentionSeconds = 7 * 24 * 60 * 60;
@@ -37,7 +73,10 @@ const isD1Database = (value: PrepareDouble): value is D1Database => {
 
 const migrated = (): D1Database => {
   const sqlite = new Database(":memory:");
-  sqlite.run(schema);
+  // wrangler d1 migrations apply runs one file per statement batch, in order.
+  for (const source of migrationSources) {
+    sqlite.run(source);
+  }
   const db = {
     prepare(sql: string) {
       const statement = sqlite.query(sql);
@@ -64,6 +103,18 @@ const migrated = (): D1Database => {
 };
 
 describe("D1 migration schema", () => {
+  test("applies every migration file in wrangler's order", () => {
+    expect(migrationFiles).toEqual([
+      "0001_seen_events.sql",
+      "0002_seen_events_created_at.sql",
+    ]);
+    expect(
+      ["10_tenth.sql", "9_ninth.sql", "0002_second.sql"].toSorted(
+        compareMigrationPaths,
+      ),
+    ).toEqual(["0002_second.sql", "9_ninth.sql", "10_tenth.sql"]);
+  });
+
   test("supports the exact dedup statements the worker issues", async () => {
     const db = migrated();
 
