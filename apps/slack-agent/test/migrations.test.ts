@@ -23,6 +23,9 @@ const migrationSources = await Promise.all(
 );
 const schema = migrationSources.join("\n");
 
+// Pinned independently of dedup.ts so mutating the retention constant goes red.
+const retentionSeconds = 7 * 24 * 60 * 60;
+
 interface PrepareDouble {
   readonly prepare?: unknown;
 }
@@ -97,7 +100,6 @@ describe("D1 migration schema", () => {
 
   test("sweeps only rows older than the retention window", async () => {
     const db = migrated();
-    const retentionSeconds = 7 * 24 * 60 * 60;
     await db
       .prepare(
         "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
@@ -119,6 +121,37 @@ describe("D1 migration schema", () => {
     expect(results).toEqual([
       { event_id: "Ev-claimed" },
       { event_id: "Ev-recent" },
+    ]);
+  });
+
+  test("runs the claimed handler when the retention sweep fails", async () => {
+    const db = migrated();
+    await db
+      .prepare(
+        "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
+      )
+      .bind("Ev-expired", retentionSeconds + 60)
+      .run();
+    await db
+      .prepare(
+        "CREATE TRIGGER reject_sweep BEFORE DELETE ON seen_events BEGIN SELECT RAISE(ABORT, 'sweep failed'); END",
+      )
+      .run();
+
+    let runs = 0;
+    await claimAndRun(db, "Ev-sweep", () => {
+      runs += 1;
+      return Promise.resolve();
+    });
+
+    expect(runs).toBe(1);
+    expect(await claimEvent(db, "Ev-sweep")).toBe(false);
+    const { results } = await db
+      .prepare("SELECT event_id FROM seen_events ORDER BY event_id")
+      .all();
+    expect(results).toEqual([
+      { event_id: "Ev-expired" },
+      { event_id: "Ev-sweep" },
     ]);
   });
 });
