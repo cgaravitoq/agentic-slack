@@ -113,6 +113,15 @@ const migrated = (): MigratedDatabase => {
   return { db, prepared };
 };
 
+const rejection = async (operation: Promise<unknown>): Promise<string> => {
+  try {
+    await operation;
+    return "resolved";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+};
+
 const staleCount = async (db: D1Database): Promise<unknown[]> => {
   const { results } = await db
     .prepare(
@@ -282,5 +291,26 @@ describe("D1 migration schema", () => {
       { event_id: "Ev-expired" },
       { event_id: "Ev-sweep" },
     ]);
+  });
+
+  test("propagates a failing claim instead of reporting one", async () => {
+    const { db } = migrated();
+    await db
+      .prepare(
+        "CREATE TRIGGER reject_claim BEFORE INSERT ON seen_events BEGIN SELECT RAISE(ABORT, 'claim failed'); END",
+      )
+      .run();
+
+    expect(await rejection(claimEvent(db, "Ev-blocked"))).toBe("claim failed");
+
+    let runs = 0;
+    const failure = await rejection(
+      claimAndRun(db, "Ev-blocked", () => {
+        runs += 1;
+        return Promise.resolve();
+      }),
+    );
+    expect(failure).toBe("claim failed");
+    expect(runs).toBe(0);
   });
 });
