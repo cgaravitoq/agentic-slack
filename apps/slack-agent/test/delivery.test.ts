@@ -769,9 +769,9 @@ describe("trusted Slack streaming delivery", () => {
     expect(serverError.acceptedChunks()).toEqual(["hello"]);
   });
 
-  test("pins Retry-After to 2000ms per attempt and 4000ms across attempts", () => {
-    expect(MAX_RETRY_AFTER_MS).toBe(2000);
-    expect(MAX_RETRY_WAIT_MS).toBe(4000);
+  test("pins the honoured wait to one Slack window", () => {
+    expect(MAX_RETRY_AFTER_MS).toBe(60_000);
+    expect(MAX_RETRY_WAIT_MS).toBe(60_000);
   });
 
   test("honours Retry-After below the cap", () => {
@@ -780,25 +780,36 @@ describe("trusted Slack streaming delivery", () => {
   });
 
   test("caps Retry-After per attempt and across the retry budget", () => {
-    const response = new Response(null, { headers: { "Retry-After": "60" } });
-    expect(retryDelayMs(response, 0, 0)).toBe(2000);
-    expect(retryDelayMs(response, 1, 2000)).toBe(2000);
-    expect(retryDelayMs(response, 2, 4000)).toBe(0);
+    const response = new Response(null, { headers: { "Retry-After": "90" } });
+    expect(retryDelayMs(response, 0, 0)).toBe(60_000);
+    expect(retryDelayMs(response, 1, 45_000)).toBe(15_000);
+    expect(retryDelayMs(response, 2, 60_000)).toBe(0);
   });
 
-  test("caps the wait call actually spends across Retry-After retries", async () => {
-    const started = performance.now();
+  test("keeps waiting through each announced window within the phase budget", async () => {
+    const waits: number[] = [];
     const slack = createFakeSlack(
       { "chat.appendStream": "rate_limited" },
       { limit: 3, retryAfter: "2", status: 429 },
     );
-    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      slack.fetcher,
+      (ms) => {
+        waits.push(ms);
+        return Promise.resolve();
+      },
+    );
     stream.append("hello");
     await stream.finish(SLACK_DELIVERY_FALLBACK);
 
     expect(slack.acceptedChunks()).toEqual(["hello"]);
-    expect(performance.now() - started).toBeLessThan(5500);
-  }, 15_000);
+    expect(waits.filter((ms) => ms > 0)).toEqual([2000, 2000, 2000]);
+    expect(waits.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(
+      MAX_RETRY_WAIT_MS,
+    );
+  });
 
   test("stops retrying a retryable Slack error after four attempts", async () => {
     const slack = createFakeSlack(
