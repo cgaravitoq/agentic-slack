@@ -290,16 +290,21 @@ interface RetryBudget {
 const retryableStatus = (status: number): boolean =>
   status === 429 || status >= 500;
 
+// An absent header is not a zero-second window: `Number(null)` is 0, and
+// reading it as one announced wait leaves the backoff below unreachable.
+const announcedRetryMs = (response: Response): number | undefined => {
+  const header = response.headers.get("Retry-After");
+  const seconds = header === null ? Number.NaN : Number(header);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined;
+};
+
 export const retryDelayMs = (
   response: Response,
   attempt: number,
   waitedMs: number,
 ): number => {
-  const retryAfter = Number(response.headers.get("Retry-After"));
   const requested =
-    Number.isFinite(retryAfter) && retryAfter >= 0
-      ? retryAfter * 1000
-      : Math.min(250 * 2 ** attempt, 4000);
+    announcedRetryMs(response) ?? Math.min(250 * 2 ** attempt, 4000);
   return Math.min(
     requested,
     MAX_RETRY_AFTER_MS,

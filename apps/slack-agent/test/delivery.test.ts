@@ -828,6 +828,39 @@ describe("trusted Slack streaming delivery", () => {
     expect(retryDelayMs(response, 0, 0)).toBe(1000);
   });
 
+  test("backs off exponentially when Slack announces no window", () => {
+    const response = new Response(null);
+    expect(retryDelayMs(response, 0, 0)).toBe(250);
+    expect(retryDelayMs(response, 1, 0)).toBe(500);
+    expect(retryDelayMs(response, 2, 0)).toBe(1000);
+    expect(retryDelayMs(response, 5, 0)).toBe(4000);
+  });
+
+  test("treats Retry-After: 0 as the zero-second window it announces", () => {
+    const response = new Response(null, { headers: { "Retry-After": "0" } });
+    expect(retryDelayMs(response, 2, 0)).toBe(0);
+  });
+
+  test("backs off between attempts on a 5xx that carries no Retry-After", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "internal_error" },
+      { limit: 3, status: 503 },
+    );
+    const sleeper = createAwaitedSleep(slack.fetcher);
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      sleeper.fetcher,
+      sleeper.sleep,
+    );
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(sleeper.waits).toEqual([250, 500, 1000]);
+    expect(sleeper.ranAhead).toEqual([]);
+  });
+
   test("caps Retry-After per attempt and across the retry budget", () => {
     const response = new Response(null, { headers: { "Retry-After": "90" } });
     expect(retryDelayMs(response, 0, 0)).toBe(60_000);
