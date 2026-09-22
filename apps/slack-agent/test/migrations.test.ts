@@ -62,6 +62,8 @@ const migrationSources = await Promise.all(
 // Pinned independently of dedup.ts so mutating the retention constant goes red.
 const retentionSeconds = 7 * 24 * 60 * 60;
 
+const sweepIndex = "idx_seen_events_created_at";
+
 interface PrepareDouble {
   readonly prepare?: unknown;
 }
@@ -71,14 +73,21 @@ const isD1Database = (value: PrepareDouble): value is D1Database => {
   return typeof entry?.[1] === "function";
 };
 
-const migrated = (): D1Database => {
+interface MigratedDatabase {
+  readonly db: D1Database;
+  readonly prepared: string[];
+}
+
+const migrated = (): MigratedDatabase => {
   const sqlite = new Database(":memory:");
   // wrangler d1 migrations apply runs one file per statement batch, in order.
   for (const source of migrationSources) {
     sqlite.run(source);
   }
+  const prepared: string[] = [];
   const db = {
     prepare(sql: string) {
+      prepared.push(sql);
       const statement = sqlite.query(sql);
       let params: v.InferOutput<typeof bindings> = [];
       return {
@@ -99,7 +108,7 @@ const migrated = (): D1Database => {
   if (!isD1Database(db)) {
     throw new Error("Invalid D1 test database");
   }
-  return db;
+  return { db, prepared };
 };
 
 describe("D1 migration schema", () => {
@@ -115,8 +124,41 @@ describe("D1 migration schema", () => {
     ).toEqual(["0002_second.sql", "9_ninth.sql", "10_tenth.sql"]);
   });
 
+  test("indexes created_at and plans the sweep through that index", async () => {
+    const { db, prepared } = migrated();
+
+    const { results: indexes } = await db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'seen_events' ORDER BY name",
+      )
+      .all();
+    expect(indexes).toEqual([
+      { name: sweepIndex },
+      { name: "sqlite_autoindex_seen_events_1" },
+    ]);
+
+    const { results: columns } = await db
+      .prepare(`PRAGMA index_info('${sweepIndex}')`)
+      .all();
+    expect(columns).toEqual([{ cid: 1, name: "created_at", seqno: 0 }]);
+
+    expect(await claimEvent(db, "Ev-plan")).toBe(true);
+    const sweeps = prepared.filter((sql) => sql.startsWith("DELETE"));
+    expect(sweeps).toHaveLength(1);
+
+    const { results: plan } = await db
+      .prepare(`EXPLAIN QUERY PLAN ${sweeps[0]}`)
+      .bind(retentionSeconds, 1)
+      .all();
+    const details = plan.map((step) => step.detail);
+    expect(details).toContain(
+      `SEARCH seen_events USING COVERING INDEX ${sweepIndex} (created_at<?)`,
+    );
+    expect(details).not.toContain("SCAN seen_events");
+  });
+
   test("supports the exact dedup statements the worker issues", async () => {
-    const db = migrated();
+    const { db } = migrated();
 
     expect(await claimEvent(db, "Ev-first")).toBe(true);
     expect(await claimEvent(db, "Ev-first")).toBe(false);
@@ -128,7 +170,7 @@ describe("D1 migration schema", () => {
   });
 
   test("keeps a failed event claimable and a succeeded event deduplicated", async () => {
-    const db = migrated();
+    const { db } = migrated();
     let failure: unknown;
     try {
       await claimAndRun(db, "Ev-retry", () =>
@@ -150,7 +192,7 @@ describe("D1 migration schema", () => {
   });
 
   test("sweeps only rows older than the retention window", async () => {
-    const db = migrated();
+    const { db } = migrated();
     await db
       .prepare(
         "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
@@ -176,7 +218,7 @@ describe("D1 migration schema", () => {
   });
 
   test("runs the claimed handler when the retention sweep fails", async () => {
-    const db = migrated();
+    const { db } = migrated();
     await db
       .prepare(
         "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
