@@ -59,8 +59,10 @@ const migrationSources = await Promise.all(
   migrationFiles.map((name) => Bun.file(new URL(name, migrationsDir)).text()),
 );
 
-// Pinned independently of dedup.ts so mutating the retention constant goes red.
+// Pinned here rather than imported from dedup.ts so that changing either
+// constant reds these tests instead of moving them.
 const retentionSeconds = 7 * 24 * 60 * 60;
+const sweepBatchLimit = 1000;
 
 const sweepIndex = "idx_seen_events_created_at";
 
@@ -111,6 +113,15 @@ const migrated = (): MigratedDatabase => {
   return { db, prepared };
 };
 
+const staleCount = async (db: D1Database): Promise<unknown[]> => {
+  const { results } = await db
+    .prepare(
+      "SELECT count(*) AS stale FROM seen_events WHERE event_id LIKE 'Ev-stale-%'",
+    )
+    .all();
+  return results;
+};
+
 describe("D1 migration schema", () => {
   test("applies every migration file in wrangler's order", () => {
     expect(migrationFiles).toEqual([
@@ -148,7 +159,7 @@ describe("D1 migration schema", () => {
 
     const { results: plan } = await db
       .prepare(`EXPLAIN QUERY PLAN ${sweeps[0]}`)
-      .bind(retentionSeconds, 1)
+      .bind(retentionSeconds, sweepBatchLimit)
       .all();
     const details = plan.map((step) => step.detail);
     expect(details).toContain(
@@ -197,13 +208,13 @@ describe("D1 migration schema", () => {
       .prepare(
         "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
       )
-      .bind("Ev-expired", retentionSeconds + 60)
+      .bind("Ev-expired", retentionSeconds + 1)
       .run();
     await db
       .prepare(
         "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
       )
-      .bind("Ev-recent", 60)
+      .bind("Ev-recent", retentionSeconds - 1)
       .run();
 
     expect(await claimEvent(db, "Ev-claimed")).toBe(true);
@@ -217,13 +228,38 @@ describe("D1 migration schema", () => {
     ]);
   });
 
+  test("sweeps one batch at a time and leaves the remainder behind", async () => {
+    const { db } = migrated();
+    const stale = sweepBatchLimit + 2;
+    await db
+      .prepare(
+        "INSERT INTO seen_events (event_id, created_at) WITH RECURSIVE counter(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM counter WHERE i < ?2) SELECT 'Ev-stale-' || i, unixepoch() - ?1 FROM counter",
+      )
+      .bind(retentionSeconds + 1, stale)
+      .run();
+
+    expect(await claimEvent(db, "Ev-batch")).toBe(true);
+    expect(await staleCount(db)).toEqual([{ stale: stale - sweepBatchLimit }]);
+
+    const { results: survivors } = await db
+      .prepare(
+        "SELECT event_id FROM seen_events WHERE event_id LIKE 'Ev-stale-%' ORDER BY rowid",
+      )
+      .all();
+    expect(survivors).toHaveLength(stale - sweepBatchLimit);
+    expect(await claimEvent(db, String(survivors[0].event_id))).toBe(false);
+
+    expect(await claimEvent(db, "Ev-batch-again")).toBe(true);
+    expect(await staleCount(db)).toEqual([{ stale: 0 }]);
+  });
+
   test("runs the claimed handler when the retention sweep fails", async () => {
     const { db } = migrated();
     await db
       .prepare(
         "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
       )
-      .bind("Ev-expired", retentionSeconds + 60)
+      .bind("Ev-expired", retentionSeconds + 1)
       .run();
     await db
       .prepare(
