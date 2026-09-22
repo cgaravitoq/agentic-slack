@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { readdir } from "node:fs/promises";
 import {
   claimAndRun,
   claimEvent,
@@ -11,9 +12,16 @@ const bindings = v.array(
   v.union([v.string(), v.number(), v.bigint(), v.boolean(), v.null()]),
 );
 
-const schema = await Bun.file(
-  new URL("../migrations/0001_seen_events.sql", import.meta.url),
-).text();
+const migrationsDir = new URL("../migrations/", import.meta.url);
+const migrationEntries = await readdir(migrationsDir);
+// wrangler d1 migrations apply runs files lexicographically; match that order.
+const migrationFiles = migrationEntries
+  .filter((name) => name.endsWith(".sql"))
+  .toSorted();
+const migrationSources = await Promise.all(
+  migrationFiles.map((name) => Bun.file(new URL(name, migrationsDir)).text()),
+);
+const schema = migrationSources.join("\n");
 
 interface PrepareDouble {
   readonly prepare?: unknown;
@@ -32,6 +40,9 @@ const migrated = (): D1Database => {
       const statement = sqlite.query(sql);
       let params: v.InferOutput<typeof bindings> = [];
       return {
+        all() {
+          return Promise.resolve({ results: statement.all(...params) });
+        },
         bind(...values: unknown[]) {
           params = v.parse(bindings, values);
           return this;
