@@ -20,7 +20,7 @@ import {
   MAX_RETRY_WAIT_MS,
   MAX_SLACK_APPEND_LENGTH,
   MAX_SLACK_MESSAGE_LENGTH,
-  retryDelayMs,
+  retryWait,
   sanitizeReply,
   SLACK_DELIVERY_FALLBACK,
   slackDeliveryBinding,
@@ -825,20 +825,20 @@ describe("trusted Slack streaming delivery", () => {
 
   test("honours Retry-After below the cap", () => {
     const response = new Response(null, { headers: { "Retry-After": "1" } });
-    expect(retryDelayMs(response, 0, 0)).toBe(1000);
+    expect(retryWait(response, 0, 0)).toEqual({ delayMs: 1000, last: false });
   });
 
   test("backs off exponentially when Slack announces no window", () => {
     const response = new Response(null);
-    expect(retryDelayMs(response, 0, 0)).toBe(250);
-    expect(retryDelayMs(response, 1, 0)).toBe(500);
-    expect(retryDelayMs(response, 2, 0)).toBe(1000);
-    expect(retryDelayMs(response, 5, 0)).toBe(4000);
+    expect(retryWait(response, 0, 0)).toEqual({ delayMs: 250, last: false });
+    expect(retryWait(response, 1, 0).delayMs).toBe(500);
+    expect(retryWait(response, 2, 0).delayMs).toBe(1000);
+    expect(retryWait(response, 5, 0).delayMs).toBe(4000);
   });
 
   test("treats Retry-After: 0 as the zero-second window it announces", () => {
     const response = new Response(null, { headers: { "Retry-After": "0" } });
-    expect(retryDelayMs(response, 2, 0)).toBe(0);
+    expect(retryWait(response, 2, 0)).toEqual({ delayMs: 0, last: false });
   });
 
   test("backs off between attempts on a 5xx that carries no Retry-After", async () => {
@@ -861,11 +861,14 @@ describe("trusted Slack streaming delivery", () => {
     expect(sleeper.ranAhead).toEqual([]);
   });
 
-  test("caps Retry-After per attempt and across the retry budget", () => {
+  test("spends what the phase can fund and marks that wait its last", () => {
     const response = new Response(null, { headers: { "Retry-After": "90" } });
-    expect(retryDelayMs(response, 0, 0)).toBe(60_000);
-    expect(retryDelayMs(response, 1, 45_000)).toBe(15_000);
-    expect(retryDelayMs(response, 2, 60_000)).toBe(0);
+    expect(retryWait(response, 0, 0)).toEqual({ delayMs: 60_000, last: true });
+    expect(retryWait(response, 1, 45_000)).toEqual({
+      delayMs: 15_000,
+      last: true,
+    });
+    expect(retryWait(response, 2, 60_000)).toEqual({ delayMs: 0, last: true });
   });
 
   test("keeps waiting through each announced window within the phase budget", async () => {
@@ -951,6 +954,34 @@ describe("trusted Slack streaming delivery", () => {
     expect(elapsed).toBeLessThan(11_000);
   }, 20_000);
 
+  test("stops the phase once Slack asks for more than its budget can fund", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { retryAfter: "90", status: 429 },
+    );
+    const sleeper = createAwaitedSleep(slack.fetcher);
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      sleeper.fetcher,
+      sleeper.sleep,
+    );
+    stream.append("hello");
+    let failure: unknown;
+    try {
+      await stream.finish(SLACK_DELIVERY_FALLBACK);
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(failure).toEqual(new Error("Slack chat.appendStream failed: 429"));
+    expect(sleeper.waits).toEqual([MAX_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS]);
+    expect(
+      slack.methods().filter((method) => method === "chat.appendStream"),
+    ).toHaveLength(2);
+    expect(sleeper.ranAhead).toEqual([]);
+  });
+
   test("honours the announced window up to the phase budget and no further", async () => {
     const slack = createFakeSlack(
       { "chat.appendStream": "rate_limited" },
@@ -964,14 +995,17 @@ describe("trusted Slack streaming delivery", () => {
       sleeper.sleep,
     );
     stream.append("hello");
-    await stream.finish(SLACK_DELIVERY_FALLBACK);
+    let failure: unknown;
+    try {
+      await stream.finish(SLACK_DELIVERY_FALLBACK);
+    } catch (error: unknown) {
+      failure = error;
+    }
 
-    expect(slack.acceptedChunks()).toEqual(["hello"]);
-    expect(sleeper.waits).toEqual([MAX_RETRY_AFTER_MS, 0, 0]);
+    expect(failure).toEqual(new Error("Slack chat.appendStream failed: 429"));
+    expect(slack.acceptedChunks()).toEqual([SLACK_STREAM_FAILURE_NOTICE]);
+    expect(sleeper.waits).toEqual([MAX_RETRY_AFTER_MS, 0, MAX_RETRY_AFTER_MS]);
     expect(sleeper.ranAhead).toEqual([]);
-    expect(sleeper.waits.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(
-      MAX_RETRY_WAIT_MS,
-    );
   });
 
   test("gives the failure notice its own window after the stream spends the content budget", async () => {

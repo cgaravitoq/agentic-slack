@@ -298,18 +298,31 @@ const announcedRetryMs = (response: Response): number | undefined => {
   return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined;
 };
 
-export const retryDelayMs = (
+interface RetryWait {
+  readonly delayMs: number;
+  readonly last: boolean;
+}
+
+// Slack announces the seconds left in the window it just closed, so the part of
+// that window a phase can still fund is not wasted: it is a part the next phase
+// no longer has to wait. It cannot end the window on its own though, so a wait
+// short of what Slack asked for is the phase's last one. Retrying after it only
+// spends attempts at zero delay against a server that has already said no.
+export const retryWait = (
   response: Response,
   attempt: number,
   waitedMs: number,
-): number => {
+): RetryWait => {
   const requested =
     announcedRetryMs(response) ?? Math.min(250 * 2 ** attempt, 4000);
-  return Math.min(
-    requested,
+  const affordable = Math.min(
     MAX_RETRY_AFTER_MS,
     Math.max(0, MAX_RETRY_WAIT_MS - waitedMs),
   );
+  return {
+    delayMs: Math.min(requested, affordable),
+    last: requested > affordable,
+  };
 };
 
 const wait = async (ms: number) => {
@@ -353,6 +366,17 @@ export const createSlackStream = (
   // must not be able to swallow the notice as well.
   const closingBudget: RetryBudget = { waitedMs: 0 };
 
+  const retry = async (
+    response: Response,
+    attempt: number,
+    budget: RetryBudget,
+  ): Promise<boolean> => {
+    const { delayMs, last } = retryWait(response, attempt, budget.waitedMs);
+    budget.waitedMs += delayMs;
+    await sleep(delayMs);
+    return !last;
+  };
+
   const call = async (
     method: string,
     body: SlackRequestBody,
@@ -374,10 +398,10 @@ export const createSlackStream = (
         if (attempt + 1 === MAX_SLACK_ATTEMPTS) {
           throw lastError;
         }
-        const delay = retryDelayMs(response, attempt, budget.waitedMs);
-        budget.waitedMs += delay;
         // oxlint-disable-next-line no-await-in-loop
-        await sleep(delay);
+        if (!(await retry(response, attempt, budget))) {
+          throw lastError;
+        }
         continue;
       }
       // oxlint-disable-next-line no-await-in-loop
@@ -397,10 +421,10 @@ export const createSlackStream = (
       ) {
         throw lastError;
       }
-      const delay = retryDelayMs(response, attempt, budget.waitedMs);
-      budget.waitedMs += delay;
       // oxlint-disable-next-line no-await-in-loop
-      await sleep(delay);
+      if (!(await retry(response, attempt, budget))) {
+        throw lastError;
+      }
     }
     throw lastError ?? new Error(`Slack ${method} failed`);
   };
