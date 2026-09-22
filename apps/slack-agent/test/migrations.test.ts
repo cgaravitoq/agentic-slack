@@ -50,11 +50,13 @@ const compareMigrationPaths = (a: string, b: string): number => {
   return aSegments.length - bSegments.length;
 };
 
+const applyOrder = (entries: readonly string[]): string[] =>
+  entries
+    .filter((name) => name.endsWith(".sql"))
+    .toSorted(compareMigrationPaths);
+
 const migrationsDir = new URL("../migrations/", import.meta.url);
-const migrationEntries = await readdir(migrationsDir);
-const migrationFiles = migrationEntries
-  .filter((name) => name.endsWith(".sql"))
-  .toSorted(compareMigrationPaths);
+const migrationFiles = applyOrder(await readdir(migrationsDir));
 const migrationSources = await Promise.all(
   migrationFiles.map((name) => Bun.file(new URL(name, migrationsDir)).text()),
 );
@@ -76,6 +78,7 @@ const isD1Database = (value: PrepareDouble): value is D1Database => {
 };
 
 interface MigratedDatabase {
+  readonly batches: string[];
   readonly db: D1Database;
   readonly prepared: string[];
 }
@@ -83,7 +86,9 @@ interface MigratedDatabase {
 const migrated = (): MigratedDatabase => {
   const sqlite = new Database(":memory:");
   // wrangler d1 migrations apply runs one file per statement batch, in order.
+  const batches: string[] = [];
   for (const source of migrationSources) {
+    batches.push(source);
     sqlite.run(source);
   }
   const prepared: string[] = [];
@@ -110,7 +115,7 @@ const migrated = (): MigratedDatabase => {
   if (!isD1Database(db)) {
     throw new Error("Invalid D1 test database");
   }
-  return { db, prepared };
+  return { batches, db, prepared };
 };
 
 const rejection = async (operation: Promise<unknown>): Promise<string> => {
@@ -138,10 +143,20 @@ describe("D1 migration schema", () => {
       "0002_seen_events_created_at.sql",
     ]);
     expect(
-      ["10_tenth.sql", "9_ninth.sql", "0002_second.sql"].toSorted(
-        compareMigrationPaths,
-      ),
+      applyOrder([
+        "10_tenth.sql",
+        "notes.md",
+        "9_ninth.sql",
+        "0002_second.sql",
+      ]),
     ).toEqual(["0002_second.sql", "9_ninth.sql", "10_tenth.sql"]);
+  });
+
+  test("applies one statement batch per migration file", () => {
+    const { batches } = migrated();
+    expect(batches).toHaveLength(migrationFiles.length);
+    expect(batches[0]).not.toContain("CREATE INDEX");
+    expect(batches[1]).toContain("CREATE INDEX");
   });
 
   test("indexes created_at and plans the sweep through that index", async () => {
