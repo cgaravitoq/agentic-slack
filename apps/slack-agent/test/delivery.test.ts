@@ -104,12 +104,16 @@ interface FakeSlack {
 }
 
 // `skip` occurrences of a method are answered ok before the next `limit` are
-// rejected, so a transient mid-stream failure can be staged.
+// rejected, so a transient mid-stream failure can be staged. With `windowMs`
+// the method instead stays rejected until that much simulated time has passed,
+// announcing the seconds left exactly as Slack does.
 interface FakeSlackFailures {
   limit?: number;
+  now?: () => number;
   skip?: number;
   status?: number;
   retryAfter?: string;
+  windowMs?: number;
 }
 
 // Concurrent fetches in one turn complete last-in first-out, so a uniform
@@ -139,15 +143,19 @@ const createFakeSlack = (
   failures: Partial<Record<string, string>> = {},
   {
     limit = Number.POSITIVE_INFINITY,
+    now,
     skip = 0,
     status = 200,
     retryAfter,
+    windowMs,
   }: FakeSlackFailures = {},
 ): FakeSlack => {
   const calls: SlackCall[] = [];
   const accepted: SlackCall[] = [];
   const seen = new Map<string, number>();
   const settle = createLifoSettler<Response>();
+  const clock = (): number => now?.() ?? performance.now();
+  const windowEnd = windowMs === undefined ? undefined : clock() + windowMs;
   const chunksOf = (recorded: SlackCall[]) =>
     recorded
       .filter((call) => call.method === "chat.appendStream")
@@ -197,15 +205,24 @@ const createFakeSlack = (
       const error = failures[method];
       const occurrence = (seen.get(method) ?? 0) + 1;
       seen.set(method, occurrence);
+      const remaining =
+        windowEnd === undefined ? undefined : windowEnd - clock();
       const rejected =
-        error !== undefined && occurrence > skip && occurrence <= skip + limit;
+        error !== undefined &&
+        (remaining === undefined
+          ? occurrence > skip && occurrence <= skip + limit
+          : remaining > 0);
+      const announced =
+        remaining === undefined
+          ? retryAfter
+          : String(Math.max(1, Math.ceil(remaining / 1000)));
       return settle(
         Response.json(
           rejected ? { error, ok: false } : { ok: true, ts: STREAM_TS },
           {
             headers:
-              rejected && retryAfter !== undefined
-                ? { "Retry-After": retryAfter }
+              rejected && announced !== undefined
+                ? { "Retry-After": announced }
                 : undefined,
             status: rejected ? status : 200,
           },
@@ -808,6 +825,81 @@ describe("trusted Slack streaming delivery", () => {
     expect(waits.filter((ms) => ms > 0)).toEqual([2000, 2000, 2000]);
     expect(waits.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(
       MAX_RETRY_WAIT_MS,
+    );
+  });
+
+  test("waits out the window that blocked the append instead of giving up inside it", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { status: 429, windowMs: 7000 },
+    );
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    const started = performance.now();
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+    const elapsed = performance.now() - started;
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(elapsed).toBeGreaterThanOrEqual(6500);
+    expect(elapsed).toBeLessThan(11_000);
+  }, 20_000);
+
+  test("honours the announced window up to the phase budget and no further", async () => {
+    const waits: number[] = [];
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { limit: 3, retryAfter: "60", status: 429 },
+    );
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      slack.fetcher,
+      (ms) => {
+        waits.push(ms);
+        return Promise.resolve();
+      },
+    );
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(waits.filter((ms) => ms > 0)).toEqual([MAX_RETRY_AFTER_MS]);
+    expect(waits.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(
+      MAX_RETRY_WAIT_MS,
+    );
+  });
+
+  test("gives the failure notice its own window after the stream spends the content budget", async () => {
+    const clock = { now: 0 };
+    const waits: number[] = [];
+    const slack = createFakeSlack(
+      { "chat.startStream": "rate_limited" },
+      { now: () => clock.now, status: 429, windowMs: 65_000 },
+    );
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      slack.fetcher,
+      (ms) => {
+        waits.push(ms);
+        clock.now += ms;
+        return Promise.resolve();
+      },
+    );
+    stream.append("hello");
+    let failure: unknown;
+    try {
+      await stream.finish(SLACK_DELIVERY_FALLBACK);
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(failure).toEqual(new Error("Slack chat.startStream failed: 429"));
+    expect(slack.acceptedChunks()).toEqual([SLACK_STREAM_FAILURE_NOTICE]);
+    expect(slack.acceptedMethods().at(-1)).toBe("chat.stopStream");
+    expect(waits.filter((ms) => ms > 0)).toEqual([60_000, 5000]);
+    expect(waits.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(
+      MAX_RETRY_WAIT_MS * 2,
     );
   });
 
