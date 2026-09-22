@@ -16,6 +16,10 @@ export const STREAM_TAIL_LENGTH = 512;
 export const MAX_SLACK_MESSAGE_LENGTH = 3900;
 export const MAX_SLACK_APPEND_LENGTH = 12_000;
 const TRUNCATION_NOTICE = "\n\n(truncated)";
+// A replay can only deliver the prefix Slack still accepts, and the margin
+// keeps a redaction match that straddles the visible cut redacting the same way
+// it does on the live path (the sanitizer tail already assumes that bound).
+const MAX_DURABLE_REPLY_LENGTH = MAX_SLACK_MESSAGE_LENGTH + STREAM_TAIL_LENGTH;
 
 export const SLACK_DELIVERY_FALLBACK =
   "I finished the turn but produced no reply. Please try again.";
@@ -647,17 +651,100 @@ const feedSlackStream = (
 const replyTrailer = (replyText: string): string =>
   replyText === "" ? SLACK_DELIVERY_FALLBACK : replyText;
 
+const clipDurableText = (text: string): string => {
+  if (text.length <= MAX_DURABLE_REPLY_LENGTH) {
+    return text;
+  }
+  const kept = text.slice(0, MAX_DURABLE_REPLY_LENGTH);
+  return /[\uD800-\uDBFF]$/u.test(kept) ? kept.slice(0, -1) : kept;
+};
+
+const appendDurableText = (current: string, delta: string): string =>
+  current.length >= MAX_DURABLE_REPLY_LENGTH
+    ? current
+    : clipDurableText(current + delta);
+
+// One merged text event per run of deltas: a replay only ever needs the text,
+// and an event per 4-character delta is what made every save quadratic.
+const applyRecordEvent = (
+  record: SlackDeliveryRecord,
+  event: SlackDeliveryEvent,
+): void => {
+  if (event.type !== "text") {
+    record.events.push(event);
+    return;
+  }
+  record.replyText = appendDurableText(record.replyText, event.text);
+  const last = record.events.at(-1);
+  if (last?.type === "text") {
+    last.text = appendDurableText(last.text, event.text);
+    return;
+  }
+  record.events.push({ text: clipDurableText(event.text), type: "text" });
+};
+
 interface LiveSlackDelivery {
+  flushTimer: ReturnType<typeof setTimeout> | undefined;
+  pendingText: number;
+  record: SlackDeliveryRecord;
   stream: SlackStream;
   toolNames: Map<string, string>;
 }
 
 const liveDeliveries = new Map<string, LiveSlackDelivery>();
 
+const flushLiveDelivery = (
+  store: SlackDeliveryStore,
+  instanceId: string,
+  live: LiveSlackDelivery,
+): void => {
+  if (live.flushTimer !== undefined) {
+    clearTimeout(live.flushTimer);
+    live.flushTimer = undefined;
+  }
+  live.pendingText = 0;
+  store.save(instanceId, live.record);
+};
+
+const scheduleFlush = (
+  store: SlackDeliveryStore,
+  instanceId: string,
+  live: LiveSlackDelivery,
+): void => {
+  live.flushTimer ??= setTimeout(() => {
+    live.flushTimer = undefined;
+    flushLiveDelivery(store, instanceId, live);
+  }, COALESCE_MS);
+};
+
+const closeLiveDelivery = (
+  store: SlackDeliveryStore,
+  instanceId: string,
+  live: LiveSlackDelivery | undefined,
+  record: SlackDeliveryRecord,
+): void => {
+  liveDeliveries.delete(instanceId);
+  record.closed = true;
+  if (live === undefined) {
+    store.save(instanceId, record);
+    return;
+  }
+  flushLiveDelivery(store, instanceId, live);
+};
+
 export const evictLiveSlackDelivery = (instanceId?: string): void => {
   if (instanceId === undefined) {
+    for (const live of liveDeliveries.values()) {
+      if (live.flushTimer !== undefined) {
+        clearTimeout(live.flushTimer);
+      }
+    }
     liveDeliveries.clear();
     return;
+  }
+  const live = liveDeliveries.get(instanceId);
+  if (live?.flushTimer !== undefined) {
+    clearTimeout(live.flushTimer);
   }
   liveDeliveries.delete(instanceId);
 };
@@ -697,16 +784,19 @@ export const openSlackDelivery = (
   token: string,
   fetcher: Fetcher = fetch,
 ): void => {
+  if (liveDeliveries.has(instanceId)) {
+    return;
+  }
   const existing = store.load(instanceId);
   const record =
     existing !== undefined && !existing.closed
       ? existing
       : emptyRecord(binding);
   store.save(instanceId, record);
-  if (liveDeliveries.has(instanceId)) {
-    return;
-  }
   liveDeliveries.set(instanceId, {
+    flushTimer: undefined,
+    pendingText: 0,
+    record,
     stream: createSlackStream(
       streamTargetFromBinding(record.binding),
       token,
@@ -721,19 +811,28 @@ export const applySlackDeliveryEvent = (
   instanceId: string,
   event: SlackDeliveryEvent,
 ): void => {
+  const live = liveDeliveries.get(instanceId);
+  if (live !== undefined) {
+    applyRecordEvent(live.record, event);
+    applyDeliveryEvent(live.stream, live.toolNames, event);
+    if (event.type !== "text") {
+      flushLiveDelivery(store, instanceId, live);
+      return;
+    }
+    live.pendingText += event.text.length;
+    if (live.pendingText >= COALESCE_CHARS) {
+      flushLiveDelivery(store, instanceId, live);
+      return;
+    }
+    scheduleFlush(store, instanceId, live);
+    return;
+  }
   const record = store.load(instanceId);
   if (record === undefined || record.closed) {
     return;
   }
-  record.events.push(event);
-  if (event.type === "text") {
-    record.replyText += event.text;
-  }
+  applyRecordEvent(record, event);
   store.save(instanceId, record);
-  const live = liveDeliveries.get(instanceId);
-  if (live !== undefined) {
-    applyDeliveryEvent(live.stream, live.toolNames, event);
-  }
 };
 
 export const failSlackDelivery = async (
@@ -742,12 +841,12 @@ export const failSlackDelivery = async (
   token: string,
   fetcher: Fetcher = fetch,
 ): Promise<void> => {
-  const record = store.load(instanceId);
+  const live = liveDeliveries.get(instanceId);
+  const record = live?.record ?? store.load(instanceId);
   if (record === undefined || record.closed) {
     return;
   }
   record.failed = true;
-  const live = liveDeliveries.get(instanceId);
   try {
     if (live !== undefined) {
       await live.stream.fail(SLACK_STREAM_FAILURE_NOTICE);
@@ -761,9 +860,7 @@ export const failSlackDelivery = async (
     feedSlackStream(stream, record.events);
     await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
   } finally {
-    liveDeliveries.delete(instanceId);
-    record.closed = true;
-    store.save(instanceId, record);
+    closeLiveDelivery(store, instanceId, live, record);
   }
 };
 
@@ -773,7 +870,8 @@ export const finishSlackDelivery = async (
   token: string,
   fetcher: Fetcher = fetch,
 ): Promise<void> => {
-  const record = store.load(instanceId);
+  const live = liveDeliveries.get(instanceId);
+  const record = live?.record ?? store.load(instanceId);
   if (record === undefined || record.closed) {
     return;
   }
@@ -782,7 +880,6 @@ export const finishSlackDelivery = async (
     return;
   }
   const trailer = replyTrailer(record.replyText);
-  const live = liveDeliveries.get(instanceId);
   try {
     if (live !== undefined) {
       await live.stream.finish(trailer);
@@ -801,8 +898,6 @@ export const finishSlackDelivery = async (
     // Slack already received the failure notice. Throwing would fail a
     // completed turn and the runtime would retry the submission, posting twice.
   } finally {
-    liveDeliveries.delete(instanceId);
-    record.closed = true;
-    store.save(instanceId, record);
+    closeLiveDelivery(store, instanceId, live, record);
   }
 };
