@@ -1946,6 +1946,39 @@ describe("durable Slack delivery", () => {
     expect(slack.markdown()).not.toContain(SLACK_DELIVERY_FALLBACK);
   });
 
+  test("waits out a window that blocks the alarm replay's startStream", async () => {
+    const slack = createFakeSlack(
+      { "chat.startStream": "rate_limited" },
+      { status: 429, windowMs: 1500 },
+    );
+    const store = serializingStore();
+    openSlackDelivery(
+      store,
+      "blocked-replay",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("blocked-replay");
+    applySlackDeliveryEvent(store, "blocked-replay", {
+      text: "hello",
+      type: "text",
+    });
+    const started = performance.now();
+    await finishSlackDelivery(
+      store,
+      "blocked-replay",
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    const elapsed = performance.now() - started;
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(slack.acceptedMethods().at(-1)).toBe("chat.stopStream");
+    expect(elapsed).toBeGreaterThanOrEqual(1200);
+    expect(elapsed).toBeLessThan(6000);
+  }, 20_000);
+
   test("saves the coalesced text when the flush timer fires", async () => {
     const answer = "b".repeat(50);
     const slack = createFakeSlack();
