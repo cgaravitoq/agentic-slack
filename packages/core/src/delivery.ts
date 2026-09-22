@@ -275,27 +275,54 @@ type SlackRequestBody = Record<string, string | SlackTaskChunk[]>;
 export const COALESCE_CHARS = 1024;
 export const COALESCE_MS = 300;
 const MAX_SLACK_ATTEMPTS = 4;
-export const MAX_RETRY_AFTER_MS = 2000;
-export const MAX_RETRY_WAIT_MS = 4000;
+// A throttled Slack call answers with the seconds left in the window it just
+// closed, and a Tier 2 window is one minute, so a wait past this is not the
+// window that blocked the call.
+export const MAX_RETRY_AFTER_MS = 60_000;
+// One pool per phase, shared by every attempt in it: what a wait spends is gone
+// for the attempts behind it, so a phase never sits out more than one window.
+export const MAX_RETRY_WAIT_MS = 60_000;
+
+interface RetryBudget {
+  waitedMs: number;
+}
 
 const retryableStatus = (status: number): boolean =>
   status === 429 || status >= 500;
 
-export const retryDelayMs = (
+// An absent header is not a zero-second window: `Number(null)` is 0, and
+// reading it as one announced wait leaves the backoff below unreachable.
+const announcedRetryMs = (response: Response): number | undefined => {
+  const header = response.headers.get("Retry-After");
+  const seconds = header === null ? Number.NaN : Number(header);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined;
+};
+
+interface RetryWait {
+  readonly delayMs: number;
+  readonly last: boolean;
+}
+
+// Slack announces the seconds left in the window it just closed, so the part of
+// that window a phase can still fund is not wasted: it is a part the next phase
+// no longer has to wait. It cannot end the window on its own though, so a wait
+// short of what Slack asked for is the phase's last one. Retrying after it only
+// spends attempts at zero delay against a server that has already said no.
+export const retryWait = (
   response: Response,
   attempt: number,
   waitedMs: number,
-): number => {
-  const retryAfter = Number(response.headers.get("Retry-After"));
+): RetryWait => {
   const requested =
-    Number.isFinite(retryAfter) && retryAfter >= 0
-      ? retryAfter * 1000
-      : Math.min(250 * 2 ** attempt, 4000);
-  return Math.min(
-    requested,
+    announcedRetryMs(response) ?? Math.min(250 * 2 ** attempt, 4000);
+  const affordable = Math.min(
     MAX_RETRY_AFTER_MS,
     Math.max(0, MAX_RETRY_WAIT_MS - waitedMs),
   );
+  return {
+    delayMs: Math.min(requested, affordable),
+    last: requested > affordable,
+  };
 };
 
 const wait = async (ms: number) => {
@@ -320,6 +347,7 @@ export const createSlackStream = (
   target: SlackStreamTarget,
   token: string,
   fetcher: Fetcher = fetch,
+  sleep: (ms: number) => Promise<void> = wait,
 ): SlackStream => {
   const { channelId } = target;
   const sanitizer = createStreamSanitizer();
@@ -332,10 +360,29 @@ export const createSlackStream = (
   let streamed = 0;
   let truncated = false;
   let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
+  const contentBudget: RetryBudget = { waitedMs: 0 };
+  // The notice is the last thing this stream can say to the user, so it starts
+  // from its own window: a stream body that already spent the content budget
+  // must not be able to swallow the notice as well.
+  const closingBudget: RetryBudget = { waitedMs: 0 };
 
-  const call = async (method: string, body: SlackRequestBody) => {
+  const retry = async (
+    response: Response,
+    attempt: number,
+    budget: RetryBudget,
+  ): Promise<boolean> => {
+    const { delayMs, last } = retryWait(response, attempt, budget.waitedMs);
+    budget.waitedMs += delayMs;
+    await sleep(delayMs);
+    return !last;
+  };
+
+  const call = async (
+    method: string,
+    body: SlackRequestBody,
+    budget: RetryBudget,
+  ) => {
     let lastError: Error | undefined;
-    let waitedMs = 0;
     for (let attempt = 0; attempt < MAX_SLACK_ATTEMPTS; attempt += 1) {
       // oxlint-disable-next-line no-await-in-loop
       const response = await fetcher(`https://slack.com/api/${method}`, {
@@ -351,10 +398,10 @@ export const createSlackStream = (
         if (attempt + 1 === MAX_SLACK_ATTEMPTS) {
           throw lastError;
         }
-        const delay = retryDelayMs(response, attempt, waitedMs);
-        waitedMs += delay;
         // oxlint-disable-next-line no-await-in-loop
-        await wait(delay);
+        if (!(await retry(response, attempt, budget))) {
+          throw lastError;
+        }
         continue;
       }
       // oxlint-disable-next-line no-await-in-loop
@@ -374,15 +421,15 @@ export const createSlackStream = (
       ) {
         throw lastError;
       }
-      const delay = retryDelayMs(response, attempt, waitedMs);
-      waitedMs += delay;
       // oxlint-disable-next-line no-await-in-loop
-      await wait(delay);
+      if (!(await retry(response, attempt, budget))) {
+        throw lastError;
+      }
     }
     throw lastError ?? new Error(`Slack ${method} failed`);
   };
 
-  const start = async (): Promise<string> => {
+  const start = async (budget: RetryBudget): Promise<string> => {
     if (streamTs !== undefined) {
       return streamTs;
     }
@@ -401,6 +448,7 @@ export const createSlackStream = (
             task_display_mode: "timeline",
             thread_ts: target.threadTs,
           },
+      budget,
     );
     if (result.ts === undefined) {
       throw new Error("Slack chat.startStream returned no stream ts");
@@ -428,32 +476,45 @@ export const createSlackStream = (
     return clipped;
   };
 
-  const send = async (markdown: string): Promise<void> => {
-    const clipped = clipMarkdown(markdown);
-    if (!clipped) {
+  const post = async (markdown: string, budget: RetryBudget): Promise<void> => {
+    if (!markdown) {
       return;
     }
-    const ts = await start();
+    const ts = await start(budget);
     for (
       let offset = 0;
-      offset < clipped.length;
+      offset < markdown.length;
       offset += MAX_SLACK_APPEND_LENGTH
     ) {
       // Appends must land in the order the model produced them.
       // oxlint-disable-next-line no-await-in-loop
-      await call("chat.appendStream", {
-        channel: channelId,
-        markdown_text: clipped.slice(offset, offset + MAX_SLACK_APPEND_LENGTH),
-        ts,
-      });
+      await call(
+        "chat.appendStream",
+        {
+          channel: channelId,
+          markdown_text: markdown.slice(
+            offset,
+            offset + MAX_SLACK_APPEND_LENGTH,
+          ),
+          ts,
+        },
+        budget,
+      );
       appended = true;
     }
   };
 
+  const send = async (markdown: string, budget: RetryBudget): Promise<void> => {
+    await post(clipMarkdown(markdown), budget);
+  };
+
   // A task update rides the same append call as reply text but never sets
   // `appended`: a turn that only ran tools still owes the user a reply.
-  const sendTask = async (update: SlackTaskUpdate): Promise<void> => {
-    const ts = await start();
+  const sendTask = async (
+    update: SlackTaskUpdate,
+    budget: RetryBudget,
+  ): Promise<void> => {
+    const ts = await start(budget);
     const output =
       update.output === undefined ? "" : sanitizeTaskText(update.output);
     const chunk: SlackTaskChunk = {
@@ -465,11 +526,15 @@ export const createSlackStream = (
     if (output !== "") {
       chunk.output = output;
     }
-    await call("chat.appendStream", {
-      channel: channelId,
-      chunks: [clampTaskChunk(chunk)],
-      ts,
-    });
+    await call(
+      "chat.appendStream",
+      {
+        channel: channelId,
+        chunks: [clampTaskChunk(chunk)],
+        ts,
+      },
+      budget,
+    );
   };
 
   const attempt = async (work: () => Promise<void>): Promise<void> => {
@@ -506,7 +571,7 @@ export const createSlackStream = (
     const markdown = pending;
     pending = "";
     if (markdown) {
-      enqueue(() => send(markdown));
+      enqueue(() => send(markdown, contentBudget));
     }
   };
 
@@ -531,7 +596,7 @@ export const createSlackStream = (
     }
     closed = true;
     flushPending();
-    enqueue(() => send(sanitizer.flush()));
+    enqueue(() => send(sanitizer.flush(), contentBudget));
     await queue;
     // A recorded failure must reach the user on whichever path closes the
     // stream: otherwise they keep the partial content with nothing telling them
@@ -539,14 +604,17 @@ export const createSlackStream = (
     if (always || !appended || failure !== undefined) {
       const notice =
         failure === undefined ? trailer : SLACK_STREAM_FAILURE_NOTICE;
-      await attempt(() => send(sanitizeReply(notice)));
+      // `post`, not `send`: the closing word is not stream content, and a reply
+      // that already hit the content cap would otherwise clip it away and leave
+      // the user with a truncated answer and no sign the turn broke.
+      await attempt(() => post(sanitizeReply(notice), closingBudget));
     }
     const ts = streamTs;
     if (ts === undefined) {
       return;
     }
     await attempt(async () => {
-      await call("chat.stopStream", { channel: channelId, ts });
+      await call("chat.stopStream", { channel: channelId, ts }, closingBudget);
     });
   };
 
@@ -571,7 +639,7 @@ export const createSlackStream = (
         return;
       }
       flushPending();
-      enqueue(() => sendTask(update));
+      enqueue(() => sendTask(update, contentBudget));
     },
   };
 };
