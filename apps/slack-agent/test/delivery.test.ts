@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   applySlackDeliveryEvent,
+  failSlackDelivery,
   finishSlackDelivery,
   openSlackDelivery,
   slackEventFromObservation,
@@ -1468,6 +1469,128 @@ describe("durable Slack delivery", () => {
     const calls = slack.calls.length;
     await finishSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
     expect(slack.calls).toHaveLength(calls);
+  });
+
+  test("appends the failure notice from the durable record once the live stream is evicted", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "i1",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("i1");
+    applySlackDeliveryEvent(store, "i1", {
+      id: "call-1",
+      name: "search_docs",
+      type: "tool-start",
+    });
+    applySlackDeliveryEvent(store, "i1", {
+      text: "partial answer",
+      type: "text",
+    });
+
+    await failSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "partial answer",
+      SLACK_STREAM_FAILURE_NOTICE,
+    ]);
+    expect(
+      slack.methods().filter((method) => method === "chat.stopStream"),
+    ).toHaveLength(1);
+    expect(store.load("i1")?.closed).toBe(true);
+  });
+
+  test("does not grow the durable record when an event arrives after finish", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "i1",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    applySlackDeliveryEvent(store, "i1", { text: "hello", type: "text" });
+
+    await finishSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+    const closed = JSON.stringify(store.load("i1"));
+
+    applySlackDeliveryEvent(store, "i1", { text: " and more", type: "text" });
+    applySlackDeliveryEvent(store, "i1", {
+      id: "call-2",
+      name: "later",
+      type: "tool-start",
+    });
+
+    expect(JSON.stringify(store.load("i1"))).toBe(closed);
+    expect(store.load("i1")?.closed).toBe(true);
+  });
+
+  test("keeps the durable record bounded and merged while a long reply streams", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "i1",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    for (let index = 0; index < 2500; index += 1) {
+      applySlackDeliveryEvent(store, "i1", { text: "abcd", type: "text" });
+    }
+    await finishSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+
+    const record = store.load("i1");
+    expect(record?.replyText).toHaveLength(
+      MAX_SLACK_MESSAGE_LENGTH + STREAM_TAIL_LENGTH,
+    );
+    expect(
+      record?.events.filter((event) => event.type === "text"),
+    ).toHaveLength(1);
+  });
+
+  test("replays a long reply as the same text the live stream sends", async () => {
+    const answer = "n".repeat(100_000);
+    const liveSlack = createFakeSlack();
+    const liveStore = memoryStore();
+    openSlackDelivery(
+      liveStore,
+      "live",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      liveSlack.fetcher,
+    );
+    applySlackDeliveryEvent(liveStore, "live", { text: answer, type: "text" });
+    await finishSlackDelivery(liveStore, "live", BOT_TOKEN, liveSlack.fetcher);
+
+    const replaySlack = createFakeSlack();
+    const replayStore = memoryStore();
+    openSlackDelivery(
+      replayStore,
+      "replay",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      replaySlack.fetcher,
+    );
+    evictLiveSlackDelivery("replay");
+    applySlackDeliveryEvent(replayStore, "replay", {
+      text: answer,
+      type: "text",
+    });
+    await finishSlackDelivery(
+      replayStore,
+      "replay",
+      BOT_TOKEN,
+      replaySlack.fetcher,
+    );
+
+    expect(liveSlack.markdown()).toContain("(truncated)");
+    expect(replaySlack.markdown()).toBe(liveSlack.markdown());
   });
 
   test("does not throw or double-post when finish hits a Slack error and is retried", async () => {
