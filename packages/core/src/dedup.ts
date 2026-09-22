@@ -1,4 +1,5 @@
 const SEEN_EVENT_RETENTION_SECONDS = 7 * 24 * 60 * 60;
+const SWEEP_BATCH_LIMIT = 1000;
 
 export const claimEvent = async (
   db: D1Database,
@@ -13,10 +14,16 @@ export const claimEvent = async (
   if (result.meta.changes === 0) {
     return false;
   }
-  await db
-    .prepare("DELETE FROM seen_events WHERE created_at < unixepoch() - ?1")
-    .bind(SEEN_EVENT_RETENTION_SECONDS)
-    .run();
+  try {
+    await db
+      .prepare(
+        "DELETE FROM seen_events WHERE rowid IN (SELECT rowid FROM seen_events WHERE created_at < unixepoch() - ?1 LIMIT ?2)",
+      )
+      .bind(SEEN_EVENT_RETENTION_SECONDS, SWEEP_BATCH_LIMIT)
+      .run();
+  } catch {
+    // The claim already committed; propagating would fail the claim, so Slack's retry would deduplicate to changes === 0 and drop the event.
+  }
   return true;
 };
 
