@@ -279,8 +279,9 @@ const MAX_SLACK_ATTEMPTS = 4;
 // closed, and a Tier 2 window is one minute, so a wait past this is not the
 // window that blocked the call.
 export const MAX_RETRY_AFTER_MS = 60_000;
-// A phase of a stream waits out at most that one window before it must deliver
-// or fail.
+// One pool per phase, shared by every attempt in it: a phase that spends the
+// whole minute on its first wait has nothing left for the attempts behind it,
+// which is why such a wait ends the phase.
 export const MAX_RETRY_WAIT_MS = 60_000;
 
 interface RetryBudget {
