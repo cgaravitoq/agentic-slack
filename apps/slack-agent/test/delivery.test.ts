@@ -1051,7 +1051,7 @@ describe("trusted Slack streaming delivery", () => {
     expect(failure).toEqual(new Error("Slack chat.startStream failed: 429"));
     expect(slack.acceptedChunks()).toEqual([SLACK_STREAM_FAILURE_NOTICE]);
     expect(slack.acceptedMethods().at(-1)).toBe("chat.stopStream");
-    expect(sleeper.waits.filter((ms) => ms > 0)).toEqual([60_000, 5000]);
+    expect(sleeper.waits).toEqual([60_000, 5000]);
     expect(sleeper.ranAhead).toEqual([]);
     expect(sleeper.waits.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(
       MAX_RETRY_WAIT_MS * 2,
