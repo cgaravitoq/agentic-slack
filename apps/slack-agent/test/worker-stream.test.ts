@@ -562,6 +562,9 @@ test("builds the durable delivery store once and flushes it on the coalesce boun
   expect(await runTurn("Ev-store-batch")).toBe(200);
 
   expect(createTableCount).toBe(1);
+  // Bounded from below too: a policy that stops flushing saves only the open
+  // and the close, and an upper bound alone cannot see that.
+  expect(saveCount - saves).toBeGreaterThanOrEqual(3);
   expect(saveCount - saves).toBeLessThanOrEqual(4);
   expect(streamedMarkdown()).toBe(replyText);
 });
