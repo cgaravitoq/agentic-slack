@@ -32,8 +32,15 @@ import { extend, getCloudflareContext } from "@flue/runtime/cloudflare";
 import * as v from "valibot";
 import config from "../agent.config.ts";
 
-const deliveryStore = (): SlackDeliveryStore =>
-  createSqlSlackDeliveryStore(getCloudflareContext().storage.sql);
+let cachedStore: SlackDeliveryStore | undefined;
+
+// Rebuilding the store re-runs its CREATE TABLE on every observation.
+const deliveryStore = (): SlackDeliveryStore => {
+  cachedStore ??= createSqlSlackDeliveryStore(
+    getCloudflareContext().storage.sql,
+  );
+  return cachedStore;
+};
 
 const botToken = (): string => env.SLACK_BOT_TOKEN;
 
