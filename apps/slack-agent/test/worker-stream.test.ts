@@ -143,9 +143,12 @@ await mock.module("@flue/runtime", () => ({
   setProvider: () => {},
 }));
 const sqlRows = new Map<string, string>();
+let createTableCount = 0;
+let saveCount = 0;
 const fakeSql = {
   exec(query: string, ...bindings: unknown[]) {
     if (query.includes("CREATE TABLE")) {
+      createTableCount += 1;
       return { toArray: () => [] };
     }
     if (query.trimStart().startsWith("SELECT")) {
@@ -154,6 +157,7 @@ const fakeSql = {
         toArray: () => (payload === undefined ? [] : [{ payload }]),
       };
     }
+    saveCount += 1;
     sqlRows.set(String(bindings[0]), String(bindings[1]));
     return { toArray: () => [] };
   },
@@ -543,6 +547,23 @@ beforeEach(() => {
 
 afterAll(() => {
   globalThis.fetch = originalFetch;
+});
+
+test("builds the durable delivery store once and flushes it on the coalesce boundary", async () => {
+  deltas = ["warm"];
+  replyText = "warm";
+  expect(await runTurn("Ev-store-warm")).toBe(200);
+  expect(createTableCount).toBe(1);
+
+  deltas = Array.from({ length: 300 }, () => repeatingAlphabet(4));
+  replyText = deltas.join("");
+  const saves = saveCount;
+  slackCalls.length = 0;
+  expect(await runTurn("Ev-store-batch")).toBe(200);
+
+  expect(createTableCount).toBe(1);
+  expect(saveCount - saves).toBeLessThanOrEqual(4);
+  expect(streamedMarkdown()).toBe(replyText);
 });
 
 test("streams the turn into the routed thread, never a model-chosen one", async () => {
