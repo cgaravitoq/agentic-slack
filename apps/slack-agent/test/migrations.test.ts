@@ -94,4 +94,31 @@ describe("D1 migration schema", () => {
     await claimAndRun(db, "Ev-retry", succeed);
     expect(completed).toBe(1);
   });
+
+  test("sweeps only rows older than the retention window", async () => {
+    const db = migrated();
+    const retentionSeconds = 7 * 24 * 60 * 60;
+    await db
+      .prepare(
+        "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
+      )
+      .bind("Ev-expired", retentionSeconds + 60)
+      .run();
+    await db
+      .prepare(
+        "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
+      )
+      .bind("Ev-recent", 60)
+      .run();
+
+    expect(await claimEvent(db, "Ev-claimed")).toBe(true);
+
+    const { results } = await db
+      .prepare("SELECT event_id FROM seen_events ORDER BY event_id")
+      .all();
+    expect(results).toEqual([
+      { event_id: "Ev-claimed" },
+      { event_id: "Ev-recent" },
+    ]);
+  });
 });
