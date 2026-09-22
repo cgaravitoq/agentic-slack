@@ -687,6 +687,7 @@ interface LiveSlackDelivery {
   flushTimer: ReturnType<typeof setTimeout> | undefined;
   pendingText: number;
   record: SlackDeliveryRecord;
+  store: SlackDeliveryStore;
   stream: SlackStream;
   toolNames: Map<string, string>;
 }
@@ -694,7 +695,6 @@ interface LiveSlackDelivery {
 const liveDeliveries = new Map<string, LiveSlackDelivery>();
 
 const flushLiveDelivery = (
-  store: SlackDeliveryStore,
   instanceId: string,
   live: LiveSlackDelivery,
 ): void => {
@@ -703,17 +703,13 @@ const flushLiveDelivery = (
     live.flushTimer = undefined;
   }
   live.pendingText = 0;
-  store.save(instanceId, live.record);
+  live.store.save(instanceId, live.record);
 };
 
-const scheduleFlush = (
-  store: SlackDeliveryStore,
-  instanceId: string,
-  live: LiveSlackDelivery,
-): void => {
+const scheduleFlush = (instanceId: string, live: LiveSlackDelivery): void => {
   live.flushTimer ??= setTimeout(() => {
     live.flushTimer = undefined;
-    flushLiveDelivery(store, instanceId, live);
+    flushLiveDelivery(instanceId, live);
   }, COALESCE_MS);
 };
 
@@ -729,24 +725,22 @@ const closeLiveDelivery = (
     store.save(instanceId, record);
     return;
   }
-  flushLiveDelivery(store, instanceId, live);
+  flushLiveDelivery(instanceId, live);
 };
 
 export const evictLiveSlackDelivery = (instanceId?: string): void => {
   if (instanceId === undefined) {
-    for (const live of liveDeliveries.values()) {
-      if (live.flushTimer !== undefined) {
-        clearTimeout(live.flushTimer);
-      }
+    for (const [id, live] of liveDeliveries) {
+      flushLiveDelivery(id, live);
     }
     liveDeliveries.clear();
     return;
   }
   const live = liveDeliveries.get(instanceId);
-  if (live?.flushTimer !== undefined) {
-    clearTimeout(live.flushTimer);
+  if (live !== undefined) {
+    flushLiveDelivery(instanceId, live);
+    liveDeliveries.delete(instanceId);
   }
-  liveDeliveries.delete(instanceId);
 };
 
 const runSlackAlarmDelivery = async (
@@ -797,6 +791,7 @@ export const openSlackDelivery = (
     flushTimer: undefined,
     pendingText: 0,
     record,
+    store,
     stream: createSlackStream(
       streamTargetFromBinding(record.binding),
       token,
@@ -816,15 +811,15 @@ export const applySlackDeliveryEvent = (
     applyRecordEvent(live.record, event);
     applyDeliveryEvent(live.stream, live.toolNames, event);
     if (event.type !== "text") {
-      flushLiveDelivery(store, instanceId, live);
+      flushLiveDelivery(instanceId, live);
       return;
     }
     live.pendingText += event.text.length;
     if (live.pendingText >= COALESCE_CHARS) {
-      flushLiveDelivery(store, instanceId, live);
+      flushLiveDelivery(instanceId, live);
       return;
     }
-    scheduleFlush(store, instanceId, live);
+    scheduleFlush(instanceId, live);
     return;
   }
   const record = store.load(instanceId);
