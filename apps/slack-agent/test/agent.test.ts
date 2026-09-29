@@ -100,10 +100,11 @@ const instructions: string[] = [];
 const mcpConnections: McpConnectionDefinition[] = [];
 let resolvedModel = "";
 
-await mockCloudflareWorkers({
+const workerEnv = {
   CRM_MCP_TOKEN: "crm-test-token",
   SLACK_BOT_TOKEN: "xoxb-test-token",
-});
+};
+await mockCloudflareWorkers(workerEnv);
 const runtime = await import("@flue/runtime");
 await mock.module("@flue/runtime", () => ({
   ...runtime,
@@ -194,6 +195,9 @@ test("mounts each configured MCP server with its bearer read from the Worker sec
   });
   const auth = v.parse(v.function(), crm?.auth);
   expect(await auth()).toBe("crm-test-token");
+  workerEnv.CRM_MCP_TOKEN = "crm-rotated-token";
+  expect(await auth()).toBe("crm-rotated-token");
+  workerEnv.CRM_MCP_TOKEN = "crm-test-token";
   expect(docs).toEqual({
     name: "docs",
     optional: true,
