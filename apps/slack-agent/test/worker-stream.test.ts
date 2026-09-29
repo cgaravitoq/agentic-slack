@@ -15,7 +15,11 @@ import type {
   FlueObservationSubscriber,
 } from "@flue/runtime";
 import * as v from "valibot";
-import { mockCloudflareWorkers, mockWorkersAi } from "./module-mocks.ts";
+import {
+  mockCloudflareWorkers,
+  mockWorkersAi,
+  workerWaitUntil,
+} from "./module-mocks.ts";
 
 const BOT_TOKEN = "xoxb-worker-token";
 const SIGNING_SECRET = "signing-secret-for-tests-1234567890";
@@ -602,6 +606,7 @@ beforeEach(() => {
   reactionError = undefined;
   reactionHang = false;
   reactionStatus = 200;
+  workerWaitUntil.length = 0;
   deltas = [];
   toolChunks = [];
   replyText = "";
@@ -1220,3 +1225,13 @@ test("a hanging eyes reaction still dispatches the turn", async () => {
   expect(streamedMarkdown()).toBe("Hello.");
   expect(slackCalls[0]?.method).toBe("reactions.add");
 }, 500);
+
+test("keeps the eyes reaction alive past the ack", async () => {
+  reactionHang = true;
+
+  const { status } = await admitTurn(await signedMention("Ev-react-alive"));
+
+  expect(status).toBe(200);
+  expect(slackCalls[0]?.method).toBe("reactions.add");
+  expect(workerWaitUntil).toHaveLength(1);
+});

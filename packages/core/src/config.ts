@@ -70,7 +70,11 @@ const resolveMcpServer = (server: McpServerConfig): McpServerConfig => {
   }
   const resolved: McpServerConfig = { ...server, name, url };
   if (server.authSecret !== undefined) {
-    resolved.authSecret = server.authSecret.trim();
+    const authSecret = server.authSecret.trim();
+    if (!authSecret) {
+      throw new Error(`Agent MCP server ${name} requires an authSecret`);
+    }
+    resolved.authSecret = authSecret;
   }
   return Object.freeze(resolved);
 };
