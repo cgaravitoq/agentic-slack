@@ -439,18 +439,21 @@ const signedDirectMessage = async (
   });
 };
 
+// The ingress awaits the claim and the dispatch, so it defers nothing to the
+// request's context; the worker's own `waitUntil` is where the reaction lives.
+// `deferred` is collected so a test can assert the ingress left nothing behind.
 const admitTurn = async (
   request: Request,
-): Promise<{ pending: Promise<unknown>[]; status: number }> => {
-  const pending: Promise<unknown>[] = [];
+): Promise<{ deferred: Promise<unknown>[]; status: number }> => {
+  const deferred: Promise<unknown>[] = [];
   const response = await app.request(request, undefined, testBindings(), {
     passThroughOnException() {},
     props: {},
     waitUntil(promise: Promise<unknown>) {
-      pending.push(promise);
+      deferred.push(promise);
     },
   });
-  return { pending, status: response.status };
+  return { deferred, status: response.status };
 };
 
 const observationEnvelope = (
@@ -563,10 +566,11 @@ const deliverFromAlarm = async (evictLive = false): Promise<void> => {
 };
 
 const runTurn = async (eventId: string, text?: string): Promise<number> => {
-  const { pending, status } = await admitTurn(
+  const { deferred, status } = await admitTurn(
     await signedMention(eventId, text),
   );
-  await Promise.all(pending);
+  expect(deferred).toEqual([]);
+  await Promise.all(workerWaitUntil);
   await deliverFromAlarm();
   return status;
 };
@@ -1044,9 +1048,10 @@ test("returns 200 without awaiting delivery, and the DO alarm path streams the r
   deltas = ["Hello ", "there, done."];
   replyText = "Hello there, done.";
 
-  const { pending, status } = await admitTurn(await signedMention("Ev-ack"));
+  const { deferred, status } = await admitTurn(await signedMention("Ev-ack"));
   expect(status).toBe(200);
-  await Promise.all(pending);
+  expect(deferred).toEqual([]);
+  await Promise.all(workerWaitUntil);
 
   expect(bodiesFor("chat.startStream")).toEqual([]);
   expect(bodiesFor("chat.appendStream")).toEqual([]);
@@ -1077,9 +1082,10 @@ test("delivers the durable reply after the isolate drops its live stream handle"
   deltas = ["Hello ", "there, done."];
   replyText = "Hello there, done.";
 
-  const { pending, status } = await admitTurn(await signedMention("Ev-evict"));
+  const { deferred, status } = await admitTurn(await signedMention("Ev-evict"));
   expect(status).toBe(200);
-  await Promise.all(pending);
+  expect(deferred).toEqual([]);
+  await Promise.all(workerWaitUntil);
   await deliverFromAlarm(true);
 
   expect(bodiesFor("chat.appendStream")).toEqual([
@@ -1141,11 +1147,12 @@ test("finishes with the reply text accumulated in durable state", async () => {
   deltas = ["The complete answer."];
   replyText = "The complete answer.";
 
-  const { pending, status } = await admitTurn(
+  const { deferred, status } = await admitTurn(
     await signedMention("Ev-reply-text"),
   );
   expect(status).toBe(200);
-  await Promise.all(pending);
+  expect(deferred).toEqual([]);
+  await Promise.all(workerWaitUntil);
   await deliverFromAlarm(true);
 
   expect(streamedMarkdown()).toBe("The complete answer.");
@@ -1159,19 +1166,20 @@ test("routes successive top-level DMs to one instance and keeps channel threads 
   const first = await admitTurn(
     await signedDirectMessage("Ev-dm-1", "181.1", "first"),
   );
-  await Promise.all(first.pending);
   const second = await admitTurn(
     await signedDirectMessage("Ev-dm-2", "182.2", "second"),
   );
-  await Promise.all(second.pending);
   const mentionA = await admitTurn(
     await signedMention("Ev-mention-a", "<@UAPP> one", "191.0"),
   );
-  await Promise.all(mentionA.pending);
   const mentionB = await admitTurn(
     await signedMention("Ev-mention-b", "<@UAPP> two", "192.0"),
   );
-  await Promise.all(mentionB.pending);
+  for (const turn of [first, second, mentionA, mentionB]) {
+    expect(turn.status).toBe(200);
+    expect(turn.deferred).toEqual([]);
+  }
+  await Promise.all(workerWaitUntil);
 
   expect(dispatched.map((entry) => entry.instanceId)).toEqual([
     "slack:v1:T123:D777:D777",
@@ -1220,8 +1228,17 @@ test("a hanging eyes reaction still dispatches the turn", async () => {
   deltas = ["Hello."];
   replyText = "Hello.";
 
-  expect(await runTurn("Ev-react-hang")).toBe(200);
+  // Not `runTurn`: draining the worker's deferred promises would wait on the
+  // reaction that never resolves, and the ack must not.
+  const { deferred, status } = await admitTurn(
+    await signedMention("Ev-react-hang"),
+  );
+
+  expect(status).toBe(200);
+  expect(deferred).toEqual([]);
+  expect(workerWaitUntil).toHaveLength(1);
   expect(dispatched).toHaveLength(1);
+  await deliverFromAlarm();
   expect(streamedMarkdown()).toBe("Hello.");
   expect(slackCalls[0]?.method).toBe("reactions.add");
 }, 500);
