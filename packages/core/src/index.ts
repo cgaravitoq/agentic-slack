@@ -1,3 +1,19 @@
+export {
+  APPROVAL_TTL_SECONDS,
+  canonicalJson,
+  createApprovalFetch,
+  createApprovalNotifier,
+  createApprovalStore,
+  decisionMessage,
+  handleApprovalInteraction,
+} from "./approval.ts";
+export type {
+  ApprovalDecision,
+  ApprovalGateContext,
+  ApprovalNotifier,
+  ApprovalRequest,
+  ApprovalStore,
+} from "./approval.ts";
 export { setSuggestedPrompts } from "./assistant.ts";
 export { CLOUDFLARE_TRACING_CONTENT, defineAgentConfig } from "./config.ts";
 export type { ResolvedAgentConfig } from "./config.ts";
@@ -28,3 +44,4 @@ export type {
   SlackCoreBindings,
   TrustedSlackConfig,
 } from "./slack.ts";
+export type { SlackBlockActionsPayload } from "@flue/slack";

@@ -1,5 +1,6 @@
 import { createSlackChannel } from "@flue/slack";
 import type {
+  SlackBlockActionsPayload,
   SlackEventCallbackPayload,
   SlackEventsApiPayload,
 } from "@flue/slack";
@@ -189,6 +190,10 @@ export const createSlackIngress = (
     lifecycle: RoutedSlackLifecycle,
     env: SlackCoreBindings,
   ) => Promise<void>,
+  handleInteraction?: (
+    payload: SlackBlockActionsPayload,
+    env: SlackCoreBindings,
+  ) => Promise<void>,
 ) => {
   const identityComplete = Boolean(
     trusted.signingSecret &&
@@ -222,6 +227,24 @@ export const createSlackIngress = (
         return ack(200);
       }
       return await claimThenAcknowledge(c.env.DB, routed.eventId, run);
+    },
+    async interactions({ c, payload }): Promise<Response> {
+      if (
+        !identityComplete ||
+        !handleInteraction ||
+        payload.type !== "block_actions" ||
+        payload.team?.id !== trusted.teamId ||
+        payload.api_app_id !== trusted.appId
+      ) {
+        return ack(200);
+      }
+      try {
+        await handleInteraction(payload, c.env);
+        return ack(200);
+      } catch (error: unknown) {
+        console.error("Slack interaction handling failed", error);
+        return ack(500);
+      }
     },
     signingSecret: identityComplete
       ? trusted.signingSecret

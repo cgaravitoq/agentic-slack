@@ -12,6 +12,7 @@ import config from "../agent.config.ts";
 import { SlackAgent } from "./agent.ts";
 import { createApp } from "./app.ts";
 import type { WorkerBindings } from "./app.ts";
+import { createApprovalHandler } from "./approval.ts";
 import { createLifecycleHandler } from "./lifecycle.ts";
 
 const bindings: WorkerBindings = env;
@@ -73,4 +74,5 @@ export default createApp(
     });
   },
   createLifecycleHandler(config, trusted.botToken),
+  createApprovalHandler(trusted.botToken),
 );

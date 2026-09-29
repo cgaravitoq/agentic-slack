@@ -1,3 +1,4 @@
+import { approvalInstructions } from "./approval.ts";
 import type { ResolvedAgentConfig } from "./config.ts";
 
 export const CORE_INSTRUCTIONS = Object.freeze([
@@ -11,4 +12,8 @@ export const CORE_INSTRUCTIONS = Object.freeze([
 export const composeInstructions = (
   config: ResolvedAgentConfig,
 ): readonly string[] =>
-  Object.freeze([...CORE_INSTRUCTIONS, config.ownerInstructions]);
+  Object.freeze([
+    ...CORE_INSTRUCTIONS,
+    config.ownerInstructions,
+    ...approvalInstructions(config),
+  ]);

@@ -17,6 +17,7 @@ interface McpServerConfig {
   authSecret?: string;
   tools?: string[];
   optional?: boolean;
+  requireApproval?: readonly string[];
 }
 
 export interface AgentConfig {
@@ -59,6 +60,34 @@ const resolveSuggestedPrompt = (prompt: SuggestedPrompt): SuggestedPrompt => {
 const isHttpsUrl = (value: string): boolean =>
   URL.canParse(value) && new URL(value).protocol === "https:";
 
+const resolveRequireApproval = (
+  server: string,
+  names: readonly string[],
+  tools: readonly string[] | undefined,
+): readonly string[] => {
+  const required = new Set<string>();
+  for (const entry of names) {
+    const tool = entry.trim();
+    if (!tool) {
+      throw new Error(
+        `Agent MCP server ${server} requires a tool name in requireApproval`,
+      );
+    }
+    if (required.has(tool)) {
+      throw new Error(
+        `Agent MCP server ${server} requires approval for ${tool} twice`,
+      );
+    }
+    if (tools !== undefined && !tools.includes(tool)) {
+      throw new Error(
+        `Agent MCP server ${server} requires approval for ${tool}, which its tools allowlist does not name`,
+      );
+    }
+    required.add(tool);
+  }
+  return Object.freeze([...required]);
+};
+
 const resolveMcpServer = (server: McpServerConfig): McpServerConfig => {
   const name = server.name.trim();
   if (!name) {
@@ -75,6 +104,13 @@ const resolveMcpServer = (server: McpServerConfig): McpServerConfig => {
       throw new Error(`Agent MCP server ${name} requires an authSecret`);
     }
     resolved.authSecret = authSecret;
+  }
+  if (server.requireApproval !== undefined) {
+    resolved.requireApproval = resolveRequireApproval(
+      name,
+      server.requireApproval,
+      server.tools,
+    );
   }
   return Object.freeze(resolved);
 };

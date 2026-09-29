@@ -4,6 +4,9 @@ import { env } from "cloudflare:workers";
 import {
   applySlackDeliveryEvent,
   composeInstructions,
+  createApprovalFetch,
+  createApprovalNotifier,
+  createApprovalStore,
   createSqlSlackDeliveryStore,
   expireLatest,
   failSlackDelivery,
@@ -14,6 +17,7 @@ import {
   slackEventFromObservation,
 } from "@agentic-slack/core";
 import type {
+  ApprovalGateContext,
   ExpiryPayload,
   ExpirySchedule,
   SlackDeliveryBinding,
@@ -58,6 +62,37 @@ const botToken = (): string => env.SLACK_BOT_TOKEN;
 const workerSecret = (name: string): string =>
   v.parse(v.object({ [name]: v.pipe(v.string(), v.nonEmpty()) }), env)[name];
 
+// Flue mounts an MCP server's tools whole, and a gated call has to be stopped
+// on its way to the server, so the approval sits in the connection's transport
+// instead of in the tool set: the gate sees the exact call, refuses it before
+// anything leaves the Worker, and forwards it once a person approves that call.
+const approvalFetch = (
+  requireApproval: readonly string[],
+  instanceId: string,
+) => {
+  const context = (): ApprovalGateContext | undefined => {
+    const record = deliveryStore().load(instanceId);
+    if (record === undefined) {
+      return undefined;
+    }
+    return {
+      appId: env.SLACK_APP_ID,
+      channelId: record.binding.channelId,
+      conversationId: instanceId,
+      requesterId: record.binding.recipientUserId,
+      surface: record.binding.surface,
+      teamId: record.binding.recipientTeamId,
+      threadTs: record.binding.threadTs,
+    };
+  };
+  return createApprovalFetch({
+    context,
+    gated: (tool) => requireApproval.includes(tool),
+    notifier: createApprovalNotifier(botToken()),
+    store: createApprovalStore(env.DB),
+  });
+};
+
 const startSlackTurnDelivery = (
   instanceId: string,
   binding: SlackDeliveryBinding,
@@ -90,10 +125,19 @@ export const SlackAgent = (props: AgentProps) => {
   for (const skill of config.skills) {
     useSkill(skill);
   }
-  for (const { authSecret, ...server } of config.mcpServers) {
+  for (const { authSecret, requireApproval, ...server } of config.mcpServers) {
     const connection: McpConnectionDefinition = { ...server };
     if (authSecret !== undefined) {
       connection.auth = () => workerSecret(authSecret);
+    }
+    if (requireApproval !== undefined && requireApproval.length > 0) {
+      // Flue types the transport's fetch as the global one, which also carries
+      // the runtime's `preconnect` hint; forwarding it keeps the wrapper
+      // indistinguishable from the fetch it replaces.
+      connection.fetch = Object.assign(
+        approvalFetch(requireApproval, props.id),
+        { preconnect: fetch.preconnect },
+      );
     }
     useMcpConnection(connection);
   }
