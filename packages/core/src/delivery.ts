@@ -197,6 +197,7 @@ export type SlackDeliveryEvent =
 interface SlackDeliveryRecord {
   binding: SlackDeliveryBinding;
   events: SlackDeliveryEvent[];
+  joinedBindings: SlackDeliveryBinding[];
   replyText: string;
   failed: boolean;
   closed: boolean;
@@ -233,6 +234,9 @@ const slackDeliveryRecordSchema = v.object({
     ]),
   ),
   failed: v.boolean(),
+  // Absent on a record written before a response could carry more than one
+  // requesting thread, and those records are still readable.
+  joinedBindings: v.optional(v.array(slackDeliveryBindingSchema), []),
   replyText: v.string(),
 });
 
@@ -854,8 +858,50 @@ const emptyRecord = (binding: SlackDeliveryBinding): SlackDeliveryRecord => ({
   closed: false,
   events: [],
   failed: false,
+  joinedBindings: [],
   replyText: "",
 });
+
+const sameDestination = (
+  left: SlackDeliveryBinding,
+  right: SlackDeliveryBinding,
+): boolean =>
+  left.channelId === right.channelId && left.threadTs === right.threadTs;
+
+const ownsDestination = (
+  record: SlackDeliveryRecord,
+  binding: SlackDeliveryBinding,
+): boolean =>
+  [record.binding, ...record.joinedBindings].some((candidate) =>
+    sameDestination(candidate, binding),
+  );
+
+// Flue joins a dispatch to a busy instance into the live response, so one
+// response carries a `useAgentStart()` run per requesting thread. Every one of
+// those threads is owed the reply, so a delivery that joins an open record
+// adds its destination instead of being dropped.
+const adoptDestination = (
+  record: SlackDeliveryRecord,
+  binding: SlackDeliveryBinding,
+): boolean => {
+  if (ownsDestination(record, binding)) {
+    return false;
+  }
+  record.joinedBindings.push(binding);
+  return true;
+};
+
+// Every requesting thread is owed its own reply, so one destination failing
+// must not deny the others: the failing stream has already told its own
+// thread, and rethrowing would fail a completed turn, which the runtime would
+// then retry and post twice.
+const settleDestination = async (work: () => Promise<void>): Promise<void> => {
+  try {
+    await work();
+  } catch {
+    // Deliberate: that thread already carries its own outcome.
+  }
+};
 
 export const openSlackDelivery = (
   store: SlackDeliveryStore,
@@ -864,14 +910,25 @@ export const openSlackDelivery = (
   token: string,
   fetcher: Fetcher = fetch,
 ): void => {
-  if (liveDeliveries.has(instanceId)) {
+  const live = liveDeliveries.get(instanceId);
+  if (live !== undefined) {
+    if (adoptDestination(live.record, binding)) {
+      flushLiveDelivery(instanceId, live);
+    }
     return;
   }
   const existing = store.load(instanceId);
+  // A record left open by an interrupted turn belongs to the thread that
+  // opened it. Only that thread, or one that already joined its response,
+  // resumes it; a later turn starts its own record so its reply cannot land in
+  // the interrupted turn's thread.
   const record =
-    existing !== undefined && !existing.closed
+    existing !== undefined &&
+    !existing.closed &&
+    ownsDestination(existing, binding)
       ? existing
       : emptyRecord(binding);
+  adoptDestination(record, binding);
   store.save(instanceId, record);
   liveDeliveries.set(instanceId, {
     flushTimer: undefined,
@@ -916,6 +973,21 @@ export const applySlackDeliveryEvent = (
   store.save(instanceId, record);
 };
 
+const replaySlackFailure = async (
+  binding: SlackDeliveryBinding,
+  token: string,
+  events: readonly SlackDeliveryEvent[],
+  fetcher: Fetcher = fetch,
+): Promise<void> => {
+  const stream = createSlackStream(
+    streamTargetFromBinding(binding),
+    token,
+    fetcher,
+  );
+  feedSlackStream(stream, events);
+  await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+};
+
 export const failSlackDelivery = async (
   store: SlackDeliveryStore,
   instanceId: string,
@@ -928,19 +1000,20 @@ export const failSlackDelivery = async (
     return;
   }
   record.failed = true;
+  const primary =
+    live === undefined
+      ? () => replaySlackFailure(record.binding, token, record.events, fetcher)
+      : () => live.stream.fail(SLACK_STREAM_FAILURE_NOTICE);
   try {
-    if (live !== undefined) {
-      await live.stream.fail(SLACK_STREAM_FAILURE_NOTICE);
-      return;
-    }
-    const stream = createSlackStream(
-      streamTargetFromBinding(record.binding),
-      token,
-      fetcher,
-    );
-    feedSlackStream(stream, record.events);
-    await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+    await primary();
   } finally {
+    await Promise.all(
+      record.joinedBindings.map((binding) =>
+        settleDestination(() =>
+          replaySlackFailure(binding, token, record.events, fetcher),
+        ),
+      ),
+    );
     closeLiveDelivery(store, instanceId, live, record);
   }
 };
@@ -961,23 +1034,23 @@ export const finishSlackDelivery = async (
     return;
   }
   const trailer = replyTrailer(record.replyText);
+  const replay = {
+    events: record.events.filter((event) => event.type !== "text"),
+    replyText: trailer,
+  };
+  const primary =
+    live === undefined
+      ? () => runSlackAlarmDelivery(record.binding, token, replay, fetcher)
+      : () => live.stream.finish(trailer);
   try {
-    if (live !== undefined) {
-      await live.stream.finish(trailer);
-      return;
-    }
-    await runSlackAlarmDelivery(
-      record.binding,
-      token,
-      {
-        events: record.events.filter((event) => event.type !== "text"),
-        replyText: trailer,
-      },
-      fetcher,
+    await settleDestination(primary);
+    await Promise.all(
+      record.joinedBindings.map((binding) =>
+        settleDestination(() =>
+          runSlackAlarmDelivery(binding, token, replay, fetcher),
+        ),
+      ),
     );
-  } catch {
-    // Slack already received the failure notice. Throwing would fail a
-    // completed turn and the runtime would retry the submission, posting twice.
   } finally {
     closeLiveDelivery(store, instanceId, live, record);
   }

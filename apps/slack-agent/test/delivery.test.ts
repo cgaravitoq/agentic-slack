@@ -1716,6 +1716,62 @@ const markedAnswer = (length: number): string => {
 };
 
 describe("durable Slack delivery", () => {
+  const startStreamThreads = (slack: FakeSlack): string[] =>
+    slack.calls
+      .filter((call) => call.method === "chat.startStream")
+      .map((call) => v.parse(startStreamBody, call.body).thread_ts);
+  const privateBindings = () => {
+    const first = slackDeliveryBinding(privateTarget);
+    return { first, second: { ...first, threadTs: "182.2" } };
+  };
+
+  // Flue joins a dispatch to a busy instance into the live response, so one
+  // response carries several `useAgentStart()` runs — one per requesting
+  // thread. Every one of those threads is owed the reply.
+  test("replies in every thread whose delivery joined the same response", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const { first, second } = privateBindings();
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    applySlackDeliveryEvent(store, "dm", { text: "xray1xray2", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
+
+    expect(startStreamThreads(slack)).toEqual(["171.2", "182.2"]);
+    expect(
+      slack.methods().filter((method) => method === "chat.stopStream"),
+    ).toHaveLength(2);
+    expect(slack.markdown()).toBe("xray1xray2xray1xray2");
+  });
+
+  test("does not repeat a thread that joins the same response twice", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const { first, second } = privateBindings();
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    applySlackDeliveryEvent(store, "dm", { text: "xray1xray2", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
+
+    expect(startStreamThreads(slack)).toEqual(["171.2", "182.2"]);
+  });
+
+  // A record left open by an interrupted turn belongs to the thread that
+  // opened it; the next turn's thread must not inherit it.
+  test("starts a fresh record when an interrupted turn left one open", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const { first, second } = privateBindings();
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    evictLiveSlackDelivery("dm");
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    applySlackDeliveryEvent(store, "dm", { text: "second only", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
+
+    expect(startStreamThreads(slack)).toEqual(["182.2"]);
+  });
+
   test("replays durable tool events in record order and the reply text exactly once", async () => {
     const slack = createFakeSlack();
     const store = memoryStore();
