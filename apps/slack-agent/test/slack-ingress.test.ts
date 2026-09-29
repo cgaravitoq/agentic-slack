@@ -515,6 +515,59 @@ describe("assistant thread lifecycle", () => {
     ]);
   });
 
+  // A permanent Slack refusal is not a transient failure: retrying it three
+  // times only burns Slack's redeliveries, so the ack must not turn it into a
+  // 500. The claim stays, which also dedupes the redelivery.
+  test("answers 200 when Slack refuses the assistant prompts for good", async () => {
+    const db = new FakeD1();
+    let attempts = 0;
+    const reported: unknown[][] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      reported.push(args);
+    };
+    try {
+      const channel = createSlackIngress(
+        trusted,
+        () => Promise.resolve(),
+        createLifecycleHandler(
+          defineAgentConfig({
+            description: "Answers Slack conversations.",
+            name: "Operator Agent",
+            ownerInstructions: "Prefer short answers.",
+            suggestedPrompts: [{ message: "What changed?", title: "Recap" }],
+          }),
+          trusted.botToken,
+          () => {
+            attempts += 1;
+            return Promise.resolve(
+              Response.json({ error: "not_allowed", ok: false }),
+            );
+          },
+        ),
+      );
+      const bindings = testBindings(db);
+      const deliver = async () =>
+        await channel
+          .route()
+          .request(
+            await signedRequest(assistantThreadStarted),
+            undefined,
+            bindings,
+          );
+
+      const first = await deliver();
+      const redelivered = await deliver();
+      expect(first.status).toBe(200);
+      expect(redelivered.status).toBe(200);
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(attempts).toBe(1);
+    expect(reported).toHaveLength(1);
+  });
+
   test("rejects lifecycle events from a foreign workspace or app", async () => {
     const db = new FakeD1();
     const lifecycles: string[] = [];
