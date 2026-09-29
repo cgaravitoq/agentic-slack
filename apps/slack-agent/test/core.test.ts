@@ -610,6 +610,19 @@ describe("MCP servers", () => {
       }),
     ).toThrow("Agent MCP server crm is configured twice");
   });
+
+  test("rejects a server whose authSecret is empty after trimming", () => {
+    for (const authSecret of ["", " "]) {
+      expect(() =>
+        defineAgentConfig({
+          ...required,
+          mcpServers: [
+            { authSecret, name: "crm", url: "https://mcp.example.test/mcp" },
+          ],
+        }),
+      ).toThrow("Agent MCP server crm requires an authSecret");
+    }
+  });
 });
 
 describe("Agent Skills", () => {
@@ -631,8 +644,16 @@ describe("Agent Skills", () => {
   });
 
   test("keeps the configured skills in order", () => {
-    const configured = defineAgentConfig({ ...required, skills: [refunds] });
-    expect(configured.skills).toEqual([refunds]);
+    const escalations = defineSkill({
+      description: "Escalate an unresolved case to a specialist.",
+      instructions: "Summarize the case, then hand it off.",
+      name: "escalations",
+    });
+    const configured = defineAgentConfig({
+      ...required,
+      skills: [refunds, escalations],
+    });
+    expect(configured.skills).toEqual([refunds, escalations]);
     expect(Object.isFrozen(configured.skills)).toBe(true);
   });
 
