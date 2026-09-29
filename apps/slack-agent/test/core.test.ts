@@ -644,8 +644,16 @@ describe("Agent Skills", () => {
   });
 
   test("keeps the configured skills in order", () => {
-    const configured = defineAgentConfig({ ...required, skills: [refunds] });
-    expect(configured.skills).toEqual([refunds]);
+    const escalations = defineSkill({
+      description: "Escalate an unresolved case to a specialist.",
+      instructions: "Summarize the case, then hand it off.",
+      name: "escalations",
+    });
+    const configured = defineAgentConfig({
+      ...required,
+      skills: [refunds, escalations],
+    });
+    expect(configured.skills).toEqual([refunds, escalations]);
     expect(Object.isFrozen(configured.skills)).toBe(true);
   });
 
