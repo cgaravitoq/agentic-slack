@@ -37,7 +37,7 @@ const slackResult = v.object({
   ts: v.optional(v.string()),
 });
 
-const redact = (text: string): string =>
+export const redact = (text: string): string =>
   text
     .replace(BROADCAST_RE, "")
     .replace(SUBTEAM_RE, "")

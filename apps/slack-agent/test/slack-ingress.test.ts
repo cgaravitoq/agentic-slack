@@ -4,7 +4,10 @@ import {
   defineAgentConfig,
   setSuggestedPrompts,
 } from "@agentic-slack/core";
-import type { SlackCoreBindings } from "@agentic-slack/core";
+import type {
+  SlackBlockActionsPayload,
+  SlackCoreBindings,
+} from "@agentic-slack/core";
 import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
 import * as v from "valibot";
 import { createApp } from "../src/app.ts";
@@ -119,11 +122,29 @@ const assistantEnvelope = v.object({
 });
 type AssistantEnvelope = v.InferOutput<typeof assistantEnvelope>;
 
-const signedRequest = async (
-  payload: AssistantEnvelope | EventEnvelope,
-  url = "https://example.com/events",
+const blockActions: SlackBlockActionsPayload = {
+  actions: [
+    {
+      action_id: "approval_approve",
+      block_id: "approval",
+      type: "button",
+      value: "req-1",
+    },
+  ],
+  api_app_id: "A123",
+  channel: { id: "D1" },
+  container: { thread_ts: "171.1", type: "message" },
+  message: { thread_ts: "171.1", ts: "171.2" },
+  team: { id: "T123" },
+  type: "block_actions",
+  user: { id: "U1" },
+};
+
+const signedBody = async (
+  body: string,
+  contentType: string,
+  url: string,
 ): Promise<Request> => {
-  const body = JSON.stringify(payload);
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const key = await crypto.subtle.importKey(
     "raw",
@@ -143,13 +164,30 @@ const signedRequest = async (
   return new Request(url, {
     body,
     headers: {
-      "content-type": "application/json",
+      "content-type": contentType,
       "x-slack-request-timestamp": timestamp,
       "x-slack-signature": signature,
     },
     method: "POST",
   });
 };
+
+const signedRequest = (
+  payload: AssistantEnvelope | EventEnvelope,
+  url = "https://example.com/events",
+): Promise<Request> =>
+  signedBody(JSON.stringify(payload), "application/json", url);
+
+// Slack posts interactivity as a form field holding the JSON payload.
+const signedInteraction = (
+  payload: typeof blockActions,
+  url = "https://example.com/interactions",
+): Promise<Request> =>
+  signedBody(
+    new URLSearchParams({ payload: JSON.stringify(payload) }).toString(),
+    "application/x-www-form-urlencoded",
+    url,
+  );
 
 const event = (overrides: EventOverrides = {}) => ({
   api_app_id: "A123",
@@ -311,6 +349,89 @@ describe("ingress acknowledgement", () => {
 
     expect(retried.status).toBe(200);
     expect(attempts).toBe(2);
+  });
+});
+
+describe("approval interactions", () => {
+  const decisions: SlackBlockActionsPayload[] = [];
+  const handler = (payload: SlackBlockActionsPayload) => {
+    decisions.push(payload);
+    return Promise.resolve();
+  };
+  const decide = async (
+    payload: typeof blockActions,
+    overrides: { apiAppId?: string; teamId?: string } = {},
+  ) => {
+    const channel = createSlackIngress(
+      trusted,
+      () => Promise.resolve(),
+      undefined,
+      handler,
+    );
+    return await channel.route().request(
+      await signedInteraction({
+        ...payload,
+        api_app_id: overrides.apiAppId ?? payload.api_app_id,
+        team: { id: overrides.teamId ?? "T123" },
+      }),
+      undefined,
+      testBindings(new FakeD1()),
+    );
+  };
+
+  test("routes a signed decision from the configured workspace to the handler", async () => {
+    decisions.length = 0;
+    const response = await decide(blockActions);
+    expect(response.status).toBe(200);
+    expect(decisions).toEqual([blockActions]);
+  });
+
+  test("rejects an unsigned decision", async () => {
+    decisions.length = 0;
+    const channel = createSlackIngress(
+      trusted,
+      () => Promise.resolve(),
+      undefined,
+      handler,
+    );
+    const response = await channel
+      .route()
+      .request("https://example.com/interactions", {
+        body: new URLSearchParams({
+          payload: JSON.stringify(blockActions),
+        }).toString(),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        method: "POST",
+      });
+    expect(response.status).toBe(401);
+    expect(decisions).toEqual([]);
+  });
+
+  test("ignores a decision from another workspace or app", async () => {
+    decisions.length = 0;
+    for (const overrides of [{ teamId: "T999" }, { apiAppId: "A999" }]) {
+      // oxlint-disable-next-line no-await-in-loop
+      const response = await decide(blockActions, overrides);
+      expect(response.status).toBe(200);
+    }
+    expect(decisions).toEqual([]);
+  });
+
+  test("answers non-2xx when the decision handler fails, so Slack retries", async () => {
+    const channel = createSlackIngress(
+      trusted,
+      () => Promise.resolve(),
+      undefined,
+      () => Promise.reject(new Error("decision failed")),
+    );
+    const response = await channel
+      .route()
+      .request(
+        await signedInteraction(blockActions),
+        undefined,
+        testBindings(new FakeD1()),
+      );
+    expect(response.status).toBe(500);
   });
 });
 

@@ -49,6 +49,7 @@ const operatorConfig = defineAgentConfig({
     {
       authSecret: "CRM_MCP_TOKEN",
       name: "crm",
+      requireApproval: ["create_organization"],
       tools: ["create_organization"],
       url: "https://mcp.example.test/mcp",
     },
@@ -242,6 +243,14 @@ test("mounts each configured MCP server with its bearer read from the Worker sec
     optional: true,
     url: "https://docs.example.test/mcp",
   });
+});
+
+test("gates only the server whose tools require approval", () => {
+  mcpConnections.length = 0;
+  SlackAgent({ id: "test" });
+  const [crm, docs] = mcpConnections;
+  expect(v.is(v.function(), crm?.fetch)).toBe(true);
+  expect(Object.hasOwn(docs ?? {}, "fetch")).toBe(false);
 });
 
 test("mounts each configured skill with its name and instructions", () => {

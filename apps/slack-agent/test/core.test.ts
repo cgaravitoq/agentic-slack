@@ -4,6 +4,7 @@ import { defineSkill } from "@flue/runtime";
 import * as v from "valibot";
 
 import {
+  canonicalJson,
   CLOUDFLARE_TRACING_CONTENT,
   composeInstructions,
   defineAgentConfig,
@@ -622,6 +623,139 @@ describe("MCP servers", () => {
         }),
       ).toThrow("Agent MCP server crm requires an authSecret");
     }
+  });
+});
+
+describe("MCP tools that require approval", () => {
+  const required = {
+    description: "Gates operator tools.",
+    name: "Gated Agent",
+    ownerInstructions: "Use the connected tools.",
+  };
+  const gated = defineAgentConfig({
+    ...required,
+    mcpServers: [
+      {
+        name: "crm",
+        requireApproval: [" create_organization "],
+        tools: ["create_organization", "find_organization"],
+        url: "https://mcp.example.test/mcp",
+      },
+    ],
+  });
+
+  test("keeps no gated tools unless the operator configures them", () => {
+    expect(config.mcpServers).toEqual([]);
+  });
+
+  test("trims the gated names and freezes them", () => {
+    const [server] = gated.mcpServers;
+    expect(server?.requireApproval).toEqual(["create_organization"]);
+    expect(Object.isFrozen(server?.requireApproval)).toBe(true);
+  });
+
+  test("rejects gated names that are blank, repeated, or outside the allowlist", () => {
+    const server = { name: "crm", url: "https://mcp.example.test/mcp" };
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        mcpServers: [{ ...server, requireApproval: ["  "] }],
+      }),
+    ).toThrow("Agent MCP server crm requires a tool name in requireApproval");
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        mcpServers: [{ ...server, requireApproval: ["create", "create"] }],
+      }),
+    ).toThrow("Agent MCP server crm requires approval for create twice");
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        mcpServers: [
+          {
+            ...server,
+            requireApproval: ["create_organization"],
+            tools: ["find_organization"],
+          },
+        ],
+      }),
+    ).toThrow(
+      "Agent MCP server crm requires approval for create_organization, which its tools allowlist does not name",
+    );
+  });
+
+  test("gates a tool the server allowlist names", () => {
+    const configured = defineAgentConfig({
+      ...required,
+      mcpServers: [
+        {
+          name: "crm",
+          requireApproval: ["create_organization"],
+          tools: ["create_organization"],
+          url: "https://mcp.example.test/mcp",
+        },
+      ],
+    });
+    expect(configured.mcpServers[0]?.requireApproval).toEqual([
+      "create_organization",
+    ]);
+  });
+
+  test("tells the model which mounted tools need approval", () => {
+    expect(composeInstructions(gated)).toEqual([
+      ...pinnedCoreInstructions,
+      "Use the connected tools.",
+      "Calling mcp__crm__create_organization requires human approval: the call executes nothing until a person approves it in Slack, and an approved call runs only when you repeat it with exactly the same arguments.",
+    ]);
+  });
+
+  test("leaves instructions untouched when nothing is gated", () => {
+    expect(composeInstructions(config)).toEqual([
+      ...pinnedCoreInstructions,
+      "Prefer short answers.",
+    ]);
+  });
+
+  test("enables Slack interactivity in the manifest only for a gated config", () => {
+    const gatedManifest = v.parse(
+      v.object({
+        settings: v.object({
+          interactivity: v.strictObject({
+            is_enabled: v.boolean(),
+            request_url: v.string(),
+          }),
+        }),
+      }),
+      JSON.parse(
+        generateSlackManifest(gated, "https://agent.example.com/path"),
+      ),
+    );
+    expect(gatedManifest.settings.interactivity).toEqual({
+      is_enabled: true,
+      request_url: "https://agent.example.com/channels/slack/interactions",
+    });
+    const neutralManifest = v.parse(
+      v.object({
+        settings: v.object({
+          interactivity: v.strictObject({ is_enabled: v.boolean() }),
+        }),
+      }),
+      JSON.parse(generateSlackManifest(config, "https://agent.example.com")),
+    );
+    expect(neutralManifest.settings.interactivity).toEqual({
+      is_enabled: false,
+    });
+  });
+});
+
+describe("MCP call arguments", () => {
+  test("pins the canonical form that identifies one call", () => {
+    expect(canonicalJson({ a: [{ c: 3, d: 2 }], b: 1 })).toBe(
+      '{"a":[{"c":3,"d":2}],"b":1}',
+    );
+    expect(canonicalJson({ a: 1 })).not.toBe(canonicalJson({ a: 2 }));
+    expect(canonicalJson([1, 2])).not.toBe(canonicalJson([2, 1]));
+    expect(canonicalJson(null)).toBe("null");
   });
 });
 

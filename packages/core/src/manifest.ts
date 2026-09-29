@@ -5,6 +5,9 @@ export const generateSlackManifest = (
   deployedUrl: string,
 ): string => {
   const { origin } = new URL(deployedUrl);
+  const requiresApproval = config.mcpServers.some(
+    (server) => (server.requireApproval?.length ?? 0) > 0,
+  );
   return JSON.stringify(
     {
       display_information: {
@@ -35,7 +38,12 @@ export const generateSlackManifest = (
           bot_events: ["app_mention", "assistant_thread_started", "message.im"],
           request_url: `${origin}/channels/slack/events`,
         },
-        interactivity: { is_enabled: false },
+        interactivity: requiresApproval
+          ? {
+              is_enabled: true,
+              request_url: `${origin}/channels/slack/interactions`,
+            }
+          : { is_enabled: false },
         org_deploy_enabled: false,
         socket_mode_enabled: false,
         token_rotation_enabled: false,

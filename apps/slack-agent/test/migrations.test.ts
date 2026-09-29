@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { readdir } from "node:fs/promises";
+import { APPROVAL_TTL_SECONDS, createApprovalStore } from "@agentic-slack/core";
+import type { ApprovalRequest } from "@agentic-slack/core";
 import {
   claimAndRun,
   claimEvent,
@@ -141,6 +143,7 @@ describe("D1 migration schema", () => {
     expect(migrationFiles).toEqual([
       "0001_seen_events.sql",
       "0002_seen_events_created_at.sql",
+      "0003_approval_requests.sql",
     ]);
     expect(
       applyOrder([
@@ -157,6 +160,10 @@ describe("D1 migration schema", () => {
     expect(batches).toHaveLength(migrationFiles.length);
     expect(batches[0]).not.toContain("CREATE INDEX");
     expect(batches[1]).toContain("CREATE INDEX");
+    expect(batches[2]).toContain(
+      "CREATE TABLE IF NOT EXISTS approval_requests",
+    );
+    expect(batches[2]).toContain("CREATE INDEX");
   });
 
   test("indexes created_at and plans the sweep through that index", async () => {
@@ -366,5 +373,217 @@ describe("D1 migration schema", () => {
     );
     expect(failure).toBe("claim failed");
     expect(runs).toBe(0);
+  });
+});
+
+const NOW = 1_700_000_000;
+
+const pendingApproval = (
+  overrides: Partial<ApprovalRequest> = {},
+): ApprovalRequest => ({
+  appId: "A1",
+  args: '{"domain":"acme.test"}',
+  channelId: "D1",
+  conversationId: "slack:v1:T1:D1:D1",
+  createdAt: NOW,
+  expiresAt: NOW + APPROVAL_TTL_SECONDS,
+  messageTs: "171.2",
+  requestId: "req-1",
+  requesterId: "U1",
+  state: "pending",
+  surface: "private",
+  teamId: "T1",
+  threadTs: "171.1",
+  tool: "create_organization",
+  ...overrides,
+});
+
+const approvalRows = async (db: D1Database): Promise<unknown[]> => {
+  const { results } = await db
+    .prepare(
+      "SELECT request_id, state, decided_by, message_ts FROM approval_requests ORDER BY request_id",
+    )
+    .all();
+  return results;
+};
+
+describe("approval request storage", () => {
+  test("decides a pending request once and refuses every later decision", async () => {
+    const { db } = migrated();
+    const store = createApprovalStore(db);
+    await store.create(pendingApproval());
+
+    expect(await store.decide("req-1", "approved", "U1", NOW)).toBe(true);
+    expect(await store.decide("req-1", "rejected", "U2", NOW)).toBe(false);
+    expect(await store.decide("req-1", "approved", "U1", NOW)).toBe(false);
+
+    expect(await approvalRows(db)).toEqual([
+      {
+        decided_by: "U1",
+        message_ts: "171.2",
+        request_id: "req-1",
+        state: "approved",
+      },
+    ]);
+  });
+
+  test("executes an approved request exactly once and never a pending or rejected one", async () => {
+    const { db } = migrated();
+    const store = createApprovalStore(db);
+    await store.create(pendingApproval({ requestId: "req-pending" }));
+    await store.create(pendingApproval({ requestId: "req-rejected" }));
+    await store.create(pendingApproval({ requestId: "req-approved" }));
+
+    expect(await store.claim("req-pending")).toBe(false);
+    expect(await store.decide("req-rejected", "rejected", "U1", NOW)).toBe(
+      true,
+    );
+    expect(await store.claim("req-rejected")).toBe(false);
+    expect(await store.decide("req-approved", "approved", "U1", NOW)).toBe(
+      true,
+    );
+    expect(await store.claim("req-approved")).toBe(true);
+    expect(await store.claim("req-approved")).toBe(false);
+
+    expect(await approvalRows(db)).toEqual([
+      {
+        decided_by: "U1",
+        message_ts: "171.2",
+        request_id: "req-approved",
+        state: "executed",
+      },
+      {
+        decided_by: null,
+        message_ts: "171.2",
+        request_id: "req-pending",
+        state: "pending",
+      },
+      {
+        decided_by: "U1",
+        message_ts: "171.2",
+        request_id: "req-rejected",
+        state: "rejected",
+      },
+    ]);
+  });
+
+  test("finds only the newest request for one exact call in one conversation", async () => {
+    const { db } = migrated();
+    const store = createApprovalStore(db);
+    await store.create(
+      pendingApproval({ createdAt: NOW - 60, requestId: "req-old" }),
+    );
+    await store.create(pendingApproval({ requestId: "req-new" }));
+    await store.create(
+      pendingApproval({
+        args: '{"domain":"other.test"}',
+        requestId: "req-other-args",
+      }),
+    );
+    await store.create(
+      pendingApproval({
+        conversationId: "slack:v1:T1:D2:D2",
+        requestId: "req-other-conversation",
+      }),
+    );
+
+    const newest = await store.latest(
+      "slack:v1:T1:D1:D1",
+      "create_organization",
+      '{"domain":"acme.test"}',
+    );
+    expect(newest?.requestId).toBe("req-new");
+    expect(
+      await store.latest(
+        "slack:v1:T1:D1:D1",
+        "create_organization",
+        '{"domain":"absent.test"}',
+      ),
+    ).toBeUndefined();
+    expect(
+      await store.latest(
+        "slack:v1:T1:D1:D1",
+        "delete_organization",
+        '{"domain":"acme.test"}',
+      ),
+    ).toBeUndefined();
+  });
+
+  test("plans the exact-call lookup through the approval index", async () => {
+    const { db, prepared } = migrated();
+    const store = createApprovalStore(db);
+    await store.create(pendingApproval());
+    await store.latest(
+      "slack:v1:T1:D1:D1",
+      "create_organization",
+      '{"domain":"acme.test"}',
+    );
+
+    const lookup = prepared.find((sql) =>
+      sql.includes("FROM approval_requests WHERE conversation_id"),
+    );
+    expect(lookup).toBeDefined();
+
+    const { results } = await db
+      .prepare(`EXPLAIN QUERY PLAN ${lookup ?? ""}`)
+      .bind(
+        "slack:v1:T1:D1:D1",
+        "create_organization",
+        '{"domain":"acme.test"}',
+      )
+      .all();
+    const details = results.map((step) => step.detail);
+    expect(details).toContain(
+      "SEARCH approval_requests USING INDEX idx_approval_requests_lookup (conversation_id=? AND tool=?)",
+    );
+    expect(details).not.toContain("SCAN approval_requests");
+  });
+
+  test("keeps the card timestamp and reads one request by id", async () => {
+    const { db } = migrated();
+    const store = createApprovalStore(db);
+    await store.create(pendingApproval({ messageTs: "" }));
+    await store.attachMessage("req-1", "171.4");
+
+    const attached = await store.read("req-1");
+    expect(attached?.messageTs).toBe("171.4");
+    expect(await store.read("req-absent")).toBeUndefined();
+  });
+
+  test("sweeps only the requests that left the retention window", async () => {
+    const { db } = migrated();
+    const store = createApprovalStore(db);
+    const retention = 7 * 24 * 60 * 60;
+    const longAgo = NOW - 2 * retention;
+    await store.create(
+      pendingApproval({
+        createdAt: longAgo,
+        expiresAt: NOW - retention - 1,
+        requestId: "req-expired",
+      }),
+    );
+    await store.create(
+      pendingApproval({
+        createdAt: longAgo,
+        expiresAt: NOW - retention,
+        requestId: "req-boundary",
+      }),
+    );
+    await store.create(pendingApproval({ requestId: "req-live" }));
+
+    expect(await approvalRows(db)).toEqual([
+      {
+        decided_by: null,
+        message_ts: "171.2",
+        request_id: "req-boundary",
+        state: "pending",
+      },
+      {
+        decided_by: null,
+        message_ts: "171.2",
+        request_id: "req-live",
+        state: "pending",
+      },
+    ]);
   });
 });
