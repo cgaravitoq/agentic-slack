@@ -25,9 +25,14 @@ import {
   useAgentStart,
   useInitialData,
   useInstruction,
+  useMcpConnection,
   useModel,
 } from "@flue/runtime";
-import type { AgentProps, FlueObservation } from "@flue/runtime";
+import type {
+  AgentProps,
+  FlueObservation,
+  McpConnectionDefinition,
+} from "@flue/runtime";
 import { extend, getCloudflareContext } from "@flue/runtime/cloudflare";
 import * as v from "valibot";
 import config from "../agent.config.ts";
@@ -43,6 +48,9 @@ const deliveryStore = (): SlackDeliveryStore => {
 };
 
 const botToken = (): string => env.SLACK_BOT_TOKEN;
+
+const workerSecret = (name: string): string =>
+  v.parse(v.object({ [name]: v.pipe(v.string(), v.nonEmpty()) }), env)[name];
 
 export const startSlackTurnDelivery = (
   instanceId: string,
@@ -73,6 +81,13 @@ export const SlackAgent = (props: AgentProps) => {
   useModel(config.model);
   for (const instruction of composeInstructions(config)) {
     useInstruction(instruction);
+  }
+  for (const { authSecret, ...server } of config.mcpServers) {
+    const connection: McpConnectionDefinition = { ...server };
+    if (authSecret !== undefined) {
+      connection.auth = () => workerSecret(authSecret);
+    }
+    useMcpConnection(connection);
   }
   const bound = useInitialData<SlackDeliveryBinding | undefined>();
   useAgentStart(() => {

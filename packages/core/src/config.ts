@@ -9,6 +9,14 @@ export interface SuggestedPrompt {
   message: string;
 }
 
+interface McpServerConfig {
+  name: string;
+  url: string;
+  authSecret?: string;
+  tools?: string[];
+  optional?: boolean;
+}
+
 export interface AgentConfig {
   name: string;
   description: string;
@@ -19,6 +27,7 @@ export interface AgentConfig {
     channelDays?: number;
   };
   model?: string;
+  mcpServers?: readonly McpServerConfig[];
 }
 
 export interface ResolvedAgentConfig {
@@ -31,6 +40,7 @@ export interface ResolvedAgentConfig {
     channelDays: number;
   };
   model: string;
+  mcpServers: readonly McpServerConfig[];
 }
 
 const resolveSuggestedPrompt = (prompt: SuggestedPrompt): SuggestedPrompt => {
@@ -40,6 +50,39 @@ const resolveSuggestedPrompt = (prompt: SuggestedPrompt): SuggestedPrompt => {
     throw new Error("Agent suggested prompt requires title and message");
   }
   return Object.freeze({ message, title });
+};
+
+const isHttpsUrl = (value: string): boolean =>
+  URL.canParse(value) && new URL(value).protocol === "https:";
+
+const resolveMcpServer = (server: McpServerConfig): McpServerConfig => {
+  const name = server.name.trim();
+  if (!name) {
+    throw new Error("Agent MCP server requires name");
+  }
+  const url = server.url.trim();
+  if (!isHttpsUrl(url)) {
+    throw new Error(`Agent MCP server ${name} requires an HTTPS url`);
+  }
+  const resolved: McpServerConfig = { ...server, name, url };
+  if (server.authSecret !== undefined) {
+    resolved.authSecret = server.authSecret.trim();
+  }
+  return Object.freeze(resolved);
+};
+
+const resolveMcpServers = (
+  servers: readonly McpServerConfig[],
+): readonly McpServerConfig[] => {
+  const resolved = servers.map(resolveMcpServer);
+  const names = new Set<string>();
+  for (const { name } of resolved) {
+    if (names.has(name)) {
+      throw new Error(`Agent MCP server ${name} is configured twice`);
+    }
+    names.add(name);
+  }
+  return Object.freeze(resolved);
 };
 
 const resolveRetentionDays = (
@@ -76,6 +119,7 @@ export const defineAgentConfig = (config: AgentConfig): ResolvedAgentConfig => {
   }
   return Object.freeze({
     description: config.description.trim(),
+    mcpServers: resolveMcpServers(config.mcpServers ?? []),
     model,
     name: config.name.trim(),
     ownerInstructions: config.ownerInstructions.trim(),

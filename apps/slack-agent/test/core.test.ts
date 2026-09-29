@@ -543,3 +543,70 @@ describe("assistant suggested prompts", () => {
     );
   });
 });
+
+describe("MCP servers", () => {
+  const required = {
+    description: "Connects operator tools.",
+    name: "Connected Agent",
+    ownerInstructions: "Use the connected tools.",
+  };
+
+  test("mounts no servers unless the operator configures them", () => {
+    expect(config.mcpServers).toEqual([]);
+    expect(Object.isFrozen(config.mcpServers)).toBe(true);
+  });
+
+  test("trims configured servers and keeps their options", () => {
+    const configured = defineAgentConfig({
+      ...required,
+      mcpServers: [
+        {
+          authSecret: " CRM_MCP_TOKEN ",
+          name: " crm ",
+          tools: ["create_organization"],
+          url: " https://mcp.example.test/mcp ",
+        },
+        { name: "docs", optional: true, url: "https://docs.example.test/mcp" },
+      ],
+    });
+    expect(configured.mcpServers).toEqual([
+      {
+        authSecret: "CRM_MCP_TOKEN",
+        name: "crm",
+        tools: ["create_organization"],
+        url: "https://mcp.example.test/mcp",
+      },
+      { name: "docs", optional: true, url: "https://docs.example.test/mcp" },
+    ]);
+  });
+
+  test("rejects servers that are unnamed, duplicated, or not HTTPS", () => {
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        mcpServers: [{ name: " ", url: "https://mcp.example.test/mcp" }],
+      }),
+    ).toThrow("Agent MCP server requires name");
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        mcpServers: [{ name: "crm", url: "http://mcp.example.test/mcp" }],
+      }),
+    ).toThrow("Agent MCP server crm requires an HTTPS url");
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        mcpServers: [{ name: "crm", url: "not a url" }],
+      }),
+    ).toThrow("Agent MCP server crm requires an HTTPS url");
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        mcpServers: [
+          { name: "crm", url: "https://a.example.test/mcp" },
+          { name: "crm", url: "https://b.example.test/mcp" },
+        ],
+      }),
+    ).toThrow("Agent MCP server crm is configured twice");
+  });
+});

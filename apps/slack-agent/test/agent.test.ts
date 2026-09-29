@@ -1,4 +1,6 @@
 import { expect, mock, test } from "bun:test";
+import type { McpConnectionDefinition } from "@flue/runtime";
+import * as v from "valibot";
 import { composeInstructions, defineAgentConfig } from "@agentic-slack/core";
 import type { ExpiryPayload, ExpirySchedule } from "@agentic-slack/core";
 
@@ -29,6 +31,15 @@ const shippedPrompts = config.suggestedPrompts.map((prompt) => ({
 // operator config and falls back to either cannot satisfy the runtime tests.
 const operatorConfig = defineAgentConfig({
   description: "Exercises operator configuration.",
+  mcpServers: [
+    {
+      authSecret: "CRM_MCP_TOKEN",
+      name: "crm",
+      tools: ["create_organization"],
+      url: "https://mcp.example.test/mcp",
+    },
+    { name: "docs", optional: true, url: "https://docs.example.test/mcp" },
+  ],
   model: "cloudflare/@cf/test-operator-model",
   name: "Configured Agent",
   ownerInstructions: "Keep answers short.",
@@ -86,9 +97,11 @@ interface WiredRetentionAgent extends RecordingAgent {
 }
 
 const instructions: string[] = [];
+const mcpConnections: McpConnectionDefinition[] = [];
 let resolvedModel = "";
 
 await mockCloudflareWorkers({
+  CRM_MCP_TOKEN: "crm-test-token",
   SLACK_BOT_TOKEN: "xoxb-test-token",
 });
 const runtime = await import("@flue/runtime");
@@ -99,6 +112,8 @@ await mock.module("@flue/runtime", () => ({
   useAgentStart: () => {},
   useInitialData: () => {},
   useInstruction: (instruction: string) => instructions.push(instruction),
+  useMcpConnection: (definition: McpConnectionDefinition) =>
+    mcpConnections.push(definition),
   useModel: (model: string) => {
     resolvedModel = model;
   },
@@ -165,6 +180,25 @@ test("uses the model and owner instructions from the operator config", () => {
   );
   expect(resolvedModel).toBe("cloudflare/@cf/test-operator-model");
   expect(instructions).toEqual([...composeInstructions(operatorConfig)]);
+});
+
+test("mounts each configured MCP server with its bearer read from the Worker secret", async () => {
+  mcpConnections.length = 0;
+  SlackAgent({ id: "test" });
+  const [crm, docs] = mcpConnections;
+  expect(mcpConnections).toHaveLength(2);
+  expect(crm).toMatchObject({
+    name: "crm",
+    tools: ["create_organization"],
+    url: "https://mcp.example.test/mcp",
+  });
+  const auth = v.parse(v.function(), crm?.auth);
+  expect(await auth()).toBe("crm-test-token");
+  expect(docs).toEqual({
+    name: "docs",
+    optional: true,
+    url: "https://docs.example.test/mcp",
+  });
 });
 
 test("schedules three-day private and nine-day channel expiry on the extended Durable Object", async () => {
