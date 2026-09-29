@@ -139,7 +139,7 @@ const ack = (status: number): Response => new Response(null, { status });
 const claimThenAcknowledge = async (
   db: D1Database,
   eventId: string,
-  run: () => Promise<void>,
+  run: () => Promise<void> | void,
 ): Promise<Response> => {
   try {
     await claimAndRun(db, eventId, run);
@@ -189,7 +189,7 @@ export const createSlackIngress = (
   handleLifecycle?: (
     lifecycle: RoutedSlackLifecycle,
     env: SlackCoreBindings,
-  ) => Promise<void>,
+  ) => Promise<void> | void,
   handleInteraction?: (
     payload: SlackBlockActionsPayload,
     env: SlackCoreBindings,

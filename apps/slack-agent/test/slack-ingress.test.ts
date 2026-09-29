@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import {
   createSlackIngress,
   defineAgentConfig,
@@ -11,7 +11,7 @@ import type {
 import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
 import * as v from "valibot";
 import { createApp } from "../src/app.ts";
-import { createLifecycleHandler } from "../src/lifecycle.ts";
+import { mockCloudflareWorkers, workerWaitUntil } from "./module-mocks.ts";
 
 const trusted = {
   appId: "A123",
@@ -19,6 +19,15 @@ const trusted = {
   signingSecret: "signing-secret-for-tests-1234567890",
   teamId: "T123",
 };
+
+// The lifecycle handler defers its Slack call to the worker's `waitUntil`, so
+// the runtime module has to stand in for `cloudflare:workers` before it loads.
+await mockCloudflareWorkers({ SLACK_BOT_TOKEN: trusted.botToken });
+const { createLifecycleHandler } = await import("../src/lifecycle.ts");
+
+beforeEach(() => {
+  workerWaitUntil.length = 0;
+});
 
 class FakeD1 {
   readonly seen = new Set<string>();
@@ -499,6 +508,7 @@ describe("assistant thread lifecycle", () => {
     };
     await deliver();
     await deliver();
+    await Promise.all(workerWaitUntil);
 
     expect(turns).toEqual([]);
     expect(requests).toEqual([
@@ -518,7 +528,7 @@ describe("assistant thread lifecycle", () => {
   // A permanent Slack refusal is not a transient failure: retrying it three
   // times only burns Slack's redeliveries, so the ack must not turn it into a
   // 500. The claim stays, which also dedupes the redelivery.
-  test("answers 200 when Slack refuses the assistant prompts for good", async () => {
+  test("answers 200 and reports when Slack refuses the assistant prompts for good", async () => {
     const db = new FakeD1();
     let attempts = 0;
     const reported: unknown[][] = [];
@@ -558,6 +568,7 @@ describe("assistant thread lifecycle", () => {
 
       const first = await deliver();
       const redelivered = await deliver();
+      await Promise.all(workerWaitUntil);
       expect(first.status).toBe(200);
       expect(redelivered.status).toBe(200);
     } finally {
@@ -566,6 +577,43 @@ describe("assistant thread lifecycle", () => {
 
     expect(attempts).toBe(1);
     expect(reported).toHaveLength(1);
+  });
+
+  // Slack budgets three seconds for the Events API ack, and the prompt call is
+  // the only Slack round-trip on this path. A Slack that never answers must not
+  // hold the ack open; the side effect is best-effort and the claim is durable.
+  test("acknowledges an assistant-thread start without waiting on the prompt call", async () => {
+    const db = new FakeD1();
+    let calls = 0;
+    const channel = createSlackIngress(
+      trusted,
+      () => Promise.resolve(),
+      createLifecycleHandler(
+        defineAgentConfig({
+          description: "Answers Slack conversations.",
+          name: "Operator Agent",
+          ownerInstructions: "Prefer short answers.",
+          suggestedPrompts: [{ message: "What changed?", title: "Recap" }],
+        }),
+        trusted.botToken,
+        () => {
+          calls += 1;
+          return Promise.withResolvers<Response>().promise;
+        },
+      ),
+    );
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(assistantThreadStarted),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(200);
+    expect(calls).toBe(1);
+    expect(workerWaitUntil).toHaveLength(1);
   });
 
   test("rejects lifecycle events from a foreign workspace or app", async () => {
@@ -653,6 +701,7 @@ describe("assistant thread lifecycle", () => {
       testBindings(db),
     );
     expect(response.status).toBe(200);
+    await Promise.all(workerWaitUntil);
 
     expect(turns).toEqual([]);
     expect(requests).toEqual([
@@ -723,6 +772,7 @@ describe("assistant thread lifecycle", () => {
       testBindings(db),
     );
     expect(response.status).toBe(200);
+    await Promise.all(workerWaitUntil);
 
     expect(turns).toEqual([]);
     expect(requests).toEqual([

@@ -24,7 +24,7 @@ export const createApp = (
   handleLifecycle?: (
     lifecycle: RoutedSlackLifecycle,
     bindings: SlackCoreBindings,
-  ) => Promise<void>,
+  ) => Promise<void> | void,
   handleInteraction?: (
     payload: SlackBlockActionsPayload,
     bindings: SlackCoreBindings,
