@@ -110,7 +110,7 @@ await mock.module("@flue/runtime", () => ({
   observe: () => () => {},
   useAgentFinish: () => {},
   useAgentStart: () => {},
-  useInitialData: () => {},
+  useDelivery: () => ({ body: "", kind: "user" }),
   useInstruction: (instruction: string) => instructions.push(instruction),
   useMcpConnection: (definition: McpConnectionDefinition) =>
     mcpConnections.push(definition),

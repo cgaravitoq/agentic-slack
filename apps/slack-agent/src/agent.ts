@@ -23,7 +23,7 @@ import {
   observe,
   useAgentFinish,
   useAgentStart,
-  useInitialData,
+  useDelivery,
   useInstruction,
   useMcpConnection,
   useModel,
@@ -94,14 +94,14 @@ export const SlackAgent = (props: AgentProps) => {
     }
     useMcpConnection(connection);
   }
-  const bound = useInitialData<SlackDeliveryBinding | undefined>();
+  const delivery = useDelivery();
   useAgentStart(() => {
-    if (bound === undefined) {
+    if (delivery.kind !== "signal") {
       return;
     }
     startSlackTurnDelivery(
       props.id,
-      v.parse(slackDeliveryBindingSchema, bound),
+      v.parse(slackDeliveryBindingSchema, delivery.attributes),
     );
   });
   useAgentFinish(async () => {
@@ -109,7 +109,6 @@ export const SlackAgent = (props: AgentProps) => {
   });
   return `${config.name}: ${config.description}`;
 };
-SlackAgent.initialData = slackDeliveryBindingSchema;
 
 interface RetentionAgent {
   listSchedules: () => Promise<readonly ExpirySchedule[]>;

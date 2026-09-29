@@ -56,9 +56,9 @@ export default createApp(
     const handle = init(SlackAgent, { id: instanceId });
     await handle.dispatch({
       idempotencyKey: turn.eventId,
-      initialData: slackDeliveryBinding(streamTargetFor(turn)),
       message: {
         attributes: {
+          ...slackDeliveryBinding(streamTargetFor(turn)),
           event_id: turn.eventId,
           message_ts: turn.messageTs,
           user: turn.userId,

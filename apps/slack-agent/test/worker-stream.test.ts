@@ -472,7 +472,7 @@ const deliverFromAlarm = async (evictLive = false): Promise<void> => {
   const instanceId = last?.instanceId ?? "";
   const binding = v.parse(
     slackDeliveryBindingSchema,
-    last?.request.initialData,
+    last?.request.message.attributes,
   );
   startSlackTurnDelivery(instanceId, binding);
   if (evictLive) {
@@ -604,7 +604,10 @@ test("streams the turn into the routed thread, never a model-chosen one", async 
   expect(dispatched[0]?.instanceId).toBe("slack:v1:T123:C777:171.0");
   expect(dispatched[0]?.request.message.body).toBe("hello");
   expect(
-    v.parse(slackDeliveryBindingSchema, dispatched[0]?.request.initialData),
+    v.parse(
+      slackDeliveryBindingSchema,
+      dispatched[0]?.request.message.attributes,
+    ),
   ).toEqual({
     channelId: "C777",
     recipientTeamId: "T123",
@@ -612,9 +615,7 @@ test("streams the turn into the routed thread, never a model-chosen one", async 
     surface: "channel",
     threadTs: "171.0",
   });
-  expect(JSON.stringify(dispatched[0]?.request.initialData)).not.toContain(
-    "xoxb",
-  );
+  expect(JSON.stringify(dispatched[0]?.request)).not.toContain("xoxb");
   expect([...firstObjectSql.rows.values()].join("")).not.toContain(BOT_TOKEN);
   expect(slackCalls.at(0)?.method).toBe("reactions.add");
   expect(bodiesFor("chat.startStream")).toEqual([
@@ -1091,6 +1092,17 @@ test("routes successive top-level DMs to one instance and keeps channel threads 
     "slack:v1:T123:C777:191.0",
     "slack:v1:T123:C777:192.0",
   ]);
+  // Flue records initialData once per instance and ignores it afterwards, so a
+  // destination sent there would pin every later DM reply to the first thread.
+  expect(dispatched.map((entry) => entry.request.initialData)).toEqual([
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+  ]);
+  expect(
+    dispatched.map((entry) => entry.request.message.attributes?.threadTs),
+  ).toEqual(["181.1", "182.2", "191.0", "192.0"]);
 });
 
 test("a failed eyes reaction still dispatches the turn", async () => {

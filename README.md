@@ -40,7 +40,7 @@ The operator surface is `apps/slack-agent/agent.config.ts`: name, description, o
 The Worker acknowledges an accepted event and hands the turn to `executionCtx.waitUntil`, so the response never waits for the deferred work that `waitUntil` keeps alive.
 The deferred work refreshes retention, fires a best-effort `:eyes:` reaction on channel mentions, and dispatches the turn to the Durable Object.
 The model turn and Slack delivery run later on the Durable Object from durable state, including on its alarm path when the live stream handle is gone.
-The stream destination is passed as `initialData` that the model cannot influence.
+The stream destination rides in each dispatched message's attributes, set by the Worker and read back with `useDelivery()`, so the model cannot influence it and every DM reply reaches its own thread.
 
 ## Delivery
 
