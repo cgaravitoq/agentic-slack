@@ -1,8 +1,9 @@
 import { expect, mock, test } from "bun:test";
-import type { McpConnectionDefinition } from "@flue/runtime";
+import type { DeliveredMessage, McpConnectionDefinition } from "@flue/runtime";
 import * as v from "valibot";
 import { composeInstructions, defineAgentConfig } from "@agentic-slack/core";
 import type { ExpiryPayload, ExpirySchedule } from "@agentic-slack/core";
+import { evictLiveSlackDelivery } from "../../../packages/core/src/delivery.ts";
 
 import config from "../agent.config.ts";
 import type { CapturedCloudflareExtension } from "./module-mocks.ts";
@@ -99,6 +100,22 @@ interface WiredRetentionAgent extends RecordingAgent {
 const instructions: string[] = [];
 const mcpConnections: McpConnectionDefinition[] = [];
 let resolvedModel = "";
+const userMessage: DeliveredMessage = { body: "", kind: "user" };
+let delivery: DeliveredMessage = userMessage;
+const agentStarts: (() => void)[] = [];
+const deliveryRows = new Map<string, string>();
+const deliverySql = {
+  exec(query: string, ...bindings: unknown[]) {
+    if (query.trimStart().startsWith("SELECT")) {
+      const payload = deliveryRows.get(String(bindings[0]));
+      return { toArray: () => (payload === undefined ? [] : [{ payload }]) };
+    }
+    if (query.trimStart().startsWith("INSERT")) {
+      deliveryRows.set(String(bindings[0]), String(bindings[1]));
+    }
+    return { toArray: () => [] };
+  },
+};
 
 const workerEnv = {
   CRM_MCP_TOKEN: "crm-test-token",
@@ -110,8 +127,8 @@ await mock.module("@flue/runtime", () => ({
   ...runtime,
   observe: () => () => {},
   useAgentFinish: () => {},
-  useAgentStart: () => {},
-  useDelivery: () => ({ body: "", kind: "user" }),
+  useAgentStart: (start: () => void) => agentStarts.push(start),
+  useDelivery: () => delivery,
   useInstruction: (instruction: string) => instructions.push(instruction),
   useMcpConnection: (definition: McpConnectionDefinition) =>
     mcpConnections.push(definition),
@@ -129,6 +146,7 @@ await mock.module("@flue/runtime/cloudflare", () => ({
     retentionExtendCapture.extension = extension;
     return extension;
   },
+  getCloudflareContext: () => ({ storage: { sql: deliverySql } }),
 }));
 await mock.module("../agent.config.ts", () => ({ default: operatorConfig }));
 const { SlackAgent } = await import("../src/agent.ts");
@@ -203,6 +221,57 @@ test("mounts each configured MCP server with its bearer read from the Worker sec
     optional: true,
     url: "https://docs.example.test/mcp",
   });
+});
+
+const directMessage = (threadTs: string): DeliveredMessage => ({
+  attributes: {
+    channelId: "D777",
+    event_id: `Ev-${threadTs}`,
+    message_ts: threadTs,
+    recipientTeamId: "T123",
+    recipientUserId: "U777",
+    surface: "private",
+    threadTs,
+    user: "U777",
+  },
+  body: threadTs,
+  kind: "signal",
+  type: "slack.message.im",
+});
+
+test("streams each dispatched message's reply to the thread named in its attributes", () => {
+  const instanceId = "slack:v1:T123:D777:D777";
+  const startWith = (message: DeliveredMessage) => {
+    delivery = message;
+    agentStarts.length = 0;
+    SlackAgent({ id: instanceId });
+    for (const start of agentStarts) {
+      start();
+    }
+  };
+  const recordThreads = () => {
+    const payload = deliveryRows.get(instanceId);
+    const record = v.parse(
+      v.object({
+        binding: v.object({ threadTs: v.string() }),
+        joinedBindings: v.array(v.object({ threadTs: v.string() })),
+      }),
+      JSON.parse(payload ?? "null"),
+    );
+    return [record.binding, ...record.joinedBindings].map(
+      (binding) => binding.threadTs,
+    );
+  };
+
+  startWith(userMessage);
+  expect(deliveryRows.has(instanceId)).toBe(false);
+
+  startWith(directMessage("181.1"));
+  startWith(directMessage("182.2"));
+  expect(recordThreads()).toEqual(["181.1", "182.2"]);
+
+  evictLiveSlackDelivery(instanceId);
+  delivery = userMessage;
 });
 
 test("schedules three-day private and nine-day channel expiry on the extended Durable Object", async () => {
