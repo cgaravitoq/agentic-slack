@@ -8,8 +8,11 @@ import type { ConversationLifecycleAgent } from "../../../packages/core/src/rete
 import type {
   Agent,
   ConversationStreamChunk,
+  DeliveredMessage,
   DispatchReceipt,
+  FlueEventContext,
   FlueObservation,
+  FlueObservationSubscriber,
 } from "@flue/runtime";
 import * as v from "valibot";
 import { mockCloudflareWorkers, mockWorkersAi } from "./module-mocks.ts";
@@ -115,6 +118,19 @@ await mockCloudflareWorkers({
   SLACK_TEAM_ID: "T123",
 });
 const runtime = await import("@flue/runtime");
+// The alarm path is the agent's own wiring, so these tests drive it through
+// SlackAgent and the hooks it registers rather than reimplementing the seam.
+const agentStarts: (() => void | Promise<void>)[] = [];
+const agentFinishes: (() => void | Promise<void>)[] = [];
+const eventContext: FlueEventContext = {
+  agentName: undefined,
+  env: {},
+  id: "test",
+  log: { error: () => {}, info: () => {}, warn: () => {} },
+  req: undefined,
+};
+let delivered: DeliveredMessage = { body: "", kind: "user" };
+let observed: FlueObservationSubscriber | undefined;
 await mock.module("@flue/runtime", () => ({
   ...runtime,
   init: (_agent: Agent, options: { id: string }) => ({
@@ -140,7 +156,22 @@ await mock.module("@flue/runtime", () => ({
     },
   }),
   instrument: () => {},
+  observe: (subscriber: FlueObservationSubscriber) => {
+    observed = subscriber;
+    return () => {};
+  },
   setProvider: () => {},
+  useAgentFinish: (run: () => void | Promise<void>) => {
+    agentFinishes.push(run);
+  },
+  useAgentStart: (run: () => void | Promise<void>) => {
+    agentStarts.push(run);
+  },
+  useDelivery: () => delivered,
+  useInstruction: () => {},
+  useMcpConnection: () => {},
+  useModel: () => {},
+  useSkill: () => {},
 }));
 const createFakeSql = () => {
   const rows = new Map<string, string>();
@@ -240,11 +271,7 @@ globalThis.fetch = capturingFetch;
 
 const workerModule = await import("../src/index.ts");
 const app = workerModule.default;
-const {
-  finishSlackTurnDelivery,
-  observeSlackTurnDelivery,
-  startSlackTurnDelivery,
-} = await import("../src/agent.ts");
+const { SlackAgent } = await import("../src/agent.ts");
 
 class FakeD1 {
   private readonly seen = new Set<string>();
@@ -470,11 +497,24 @@ const observationFromChunk = (
 const deliverFromAlarm = async (evictLive = false): Promise<void> => {
   const last = dispatched.at(-1);
   const instanceId = last?.instanceId ?? "";
-  const binding = v.parse(
-    slackDeliveryBindingSchema,
-    last?.request.message.attributes,
-  );
-  await startSlackTurnDelivery(instanceId, binding);
+  const message = last?.request.message;
+  delivered = {
+    attributes: message?.attributes,
+    body: message?.body ?? "",
+    kind: "signal",
+    type: message?.type ?? "",
+  };
+  agentStarts.length = 0;
+  agentFinishes.length = 0;
+  SlackAgent({ id: instanceId });
+  const observer = observed;
+  if (observer === undefined) {
+    throw new Error("SlackAgent registered no event observer");
+  }
+  for (const start of agentStarts) {
+    // oxlint-disable-next-line no-await-in-loop
+    await start();
+  }
   if (evictLive) {
     evictLiveSlackDelivery(instanceId);
   }
@@ -488,19 +528,27 @@ const deliverFromAlarm = async (evictLive = false): Promise<void> => {
   for (const chunk of chunks) {
     const observation = observationFromChunk(chunk, instanceId);
     if (observation !== undefined) {
-      void observeSlackTurnDelivery(observation);
+      // Events reach the observer in the order the run produced them.
+      // oxlint-disable-next-line no-await-in-loop
+      await observer(observation, eventContext);
     }
   }
   if (runFailure !== undefined) {
-    await observeSlackTurnDelivery({
-      ...observationEnvelope(instanceId),
-      outcome: "failed",
-      submissionId: "sub-1",
-      type: "submission_settled",
-    });
+    await observer(
+      {
+        ...observationEnvelope(instanceId),
+        outcome: "failed",
+        submissionId: "sub-1",
+        type: "submission_settled",
+      },
+      eventContext,
+    );
     return;
   }
-  await finishSlackTurnDelivery(instanceId);
+  for (const finish of agentFinishes) {
+    // oxlint-disable-next-line no-await-in-loop
+    await finish();
+  }
 };
 
 const runTurn = async (eventId: string, text?: string): Promise<number> => {
@@ -1066,7 +1114,12 @@ test("a retried finish does not post a second Slack stream", async () => {
 
   expect(await runTurn("Ev-once")).toBe(200);
   const calls = slackCalls.length;
-  await finishSlackTurnDelivery(dispatched.at(-1)?.instanceId ?? "");
+  agentFinishes.length = 0;
+  SlackAgent({ id: dispatched.at(-1)?.instanceId ?? "" });
+  for (const finish of agentFinishes) {
+    // oxlint-disable-next-line no-await-in-loop
+    await finish();
+  }
 
   expect(slackCalls).toHaveLength(calls);
   expect(bodiesFor("chat.startStream")).toHaveLength(1);
