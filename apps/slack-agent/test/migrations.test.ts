@@ -184,13 +184,15 @@ describe("D1 migration schema", () => {
       .all();
     expect(columns).toEqual([{ cid: 1, name: "created_at", seqno: 0 }]);
 
-    expect(await claimEvent(db, "Ev-plan")).toBe(true);
+    const claimNow = 1_700_000_000;
+    expect(await claimEvent(db, "Ev-plan", claimNow)).toBe(true);
     const sweeps = prepared.filter((sql) => sql.startsWith("DELETE"));
     expect(sweeps).toHaveLength(1);
 
     const { results: plan } = await db
       .prepare(`EXPLAIN QUERY PLAN ${sweeps[0]}`)
-      .bind(retentionSeconds, sweepBatchLimit)
+      // The sweep binds a cutoff timestamp, not the retention window itself.
+      .bind(claimNow - retentionSeconds, sweepBatchLimit)
       .all();
     const details = plan.map((step) => step.detail);
     expect(details).toContain(
@@ -248,6 +250,16 @@ describe("D1 migration schema", () => {
     await seed("Ev-recent", now - retentionSeconds + 1);
 
     expect(await claimEvent(db, "Ev-claimed", now)).toBe(true);
+
+    // The claim stamps the injected clock as created_at, not the wall clock: a
+    // row written with unixepoch() would outlive the sweep and quietly move the
+    // boundary this test pins.
+    const { results: claimed } = await db
+      .prepare(
+        "SELECT created_at FROM seen_events WHERE event_id = 'Ev-claimed'",
+      )
+      .all();
+    expect(claimed).toEqual([{ created_at: now }]);
 
     const { results } = await db
       .prepare("SELECT event_id FROM seen_events ORDER BY event_id")
