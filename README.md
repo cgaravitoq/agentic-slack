@@ -38,8 +38,9 @@ The application selects Workers AI and connects the Flue agent lifecycle to dura
 
 The operator surface is `apps/slack-agent/agent.config.ts`: name, description, owner instructions, suggested prompts, retention, model, MCP servers, and skills.
 
-The Worker acknowledges an accepted event and hands the turn to `executionCtx.waitUntil`, so the response never waits for the deferred work that `waitUntil` keeps alive.
-The deferred work refreshes retention, fires a best-effort `:eyes:` reaction on channel mentions, and dispatches the turn to the Durable Object.
+The Worker claims the event in D1 and dispatches the turn to the Durable Object before it acknowledges, so an event Slack is told to stop retrying is already admitted durably.
+The claimed turn refreshes retention and fires a best-effort `:eyes:` reaction on channel mentions before the dispatch.
+A failed claim or dispatch answers Slack with a non-2xx response so it retries the delivery; a duplicate delivery of an already-claimed event is answered `200` and ignored.
 The model turn and Slack delivery run later on the Durable Object from durable state, including on its alarm path when the live stream handle is gone.
 The stream destination rides in each dispatched message's attributes, set by the Worker and read back with `useDelivery()`, so the model cannot influence it and every DM reply reaches its own thread.
 Flue answers a message that arrives while the conversation is busy inside the running response, so one response can carry several requesting threads.
