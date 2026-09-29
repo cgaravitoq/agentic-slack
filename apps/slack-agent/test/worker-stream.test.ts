@@ -523,17 +523,23 @@ const streamAuthorizations = () => [
   ),
 ];
 
+const streamChunk = v.object({
+  text: v.optional(v.string()),
+  type: v.string(),
+});
+
+const streamChunks = () =>
+  bodiesFor("chat.appendStream").flatMap((body) =>
+    v.is(v.array(streamChunk), body.chunks) ? body.chunks : [],
+  );
+
 const streamedMarkdown = () =>
-  bodiesFor("chat.appendStream")
-    .map((body) =>
-      v.is(v.string(), body.markdown_text) ? body.markdown_text : "",
-    )
+  streamChunks()
+    .map((chunk) => (chunk.type === "markdown_text" ? (chunk.text ?? "") : ""))
     .join("");
 
-const taskChunks = () =>
-  bodiesFor("chat.appendStream").flatMap((body) =>
-    v.is(v.array(v.unknown()), body.chunks) ? body.chunks : [],
-  );
+const taskChunks = (): unknown[] =>
+  streamChunks().filter((chunk) => chunk.type === "task_update");
 
 beforeEach(() => {
   slackCalls.length = 0;
@@ -654,12 +660,12 @@ test("keeps the wire destination on the routed channel, not one named in the tur
   expect(bodiesFor("chat.appendStream")).toEqual([
     {
       channel: "C777",
-      markdown_text: payload.slice(0, 1024),
+      chunks: [{ text: payload.slice(0, 1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
     {
       channel: "C777",
-      markdown_text: payload.slice(1024),
+      chunks: [{ text: payload.slice(1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
   ]);
@@ -720,12 +726,12 @@ test("streams a tool call as a named, sanitized task update", async () => {
     },
     {
       channel: "C777",
-      markdown_text: payload.slice(0, 1024),
+      chunks: [{ text: payload.slice(0, 1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
     {
       channel: "C777",
-      markdown_text: payload.slice(1024),
+      chunks: [{ text: payload.slice(1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
   ]);
@@ -808,7 +814,11 @@ test("omits the output of a void tool result", async () => {
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
 });
 
@@ -885,7 +895,11 @@ test("redacts credentials carried in a tool result before the wire", async () =>
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
 });
 
@@ -958,7 +972,11 @@ test("redacts credentials escaped by JSON.stringify before the wire", async () =
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
 });
 
@@ -1030,7 +1048,11 @@ test("delivers the durable reply after the isolate drops its live stream handle"
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Hello there, done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Hello there, done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
   expect(streamedMarkdown()).toBe("Hello there, done.");
   expect(bodiesFor("chat.stopStream")).toEqual([

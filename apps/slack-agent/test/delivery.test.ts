@@ -78,13 +78,34 @@ const markdownAppendBody = v.strictObject({
   markdown_text: v.pipe(v.string(), v.minLength(1), v.maxLength(12_000)),
   ts: v.string(),
 });
+const markdownChunk = v.strictObject({
+  text: v.pipe(v.string(), v.minLength(1), v.maxLength(12_000)),
+  type: v.literal("markdown_text"),
+});
 const taskAppendBody = v.strictObject({
   channel: v.string(),
-  chunks: v.pipe(v.array(taskChunk), v.minLength(1)),
+  chunks: v.pipe(v.array(v.union([taskChunk, markdownChunk])), v.minLength(1)),
   ts: v.string(),
 });
 const appendStreamBody = v.union([markdownAppendBody, taskAppendBody]);
 const stopStreamBody = v.strictObject({ channel: v.string(), ts: v.string() });
+
+const parseSlackCall = (method: string, json: string): SlackCall => {
+  const raw: unknown = JSON.parse(json);
+  if (method === "chat.startStream") {
+    const surfaced = v.is(v.object({ recipient_user_id: v.string() }), raw)
+      ? channelStartStreamBody
+      : startStreamBody;
+    return { body: v.parse(surfaced, raw), method };
+  }
+  if (method === "chat.appendStream") {
+    return { body: v.parse(appendStreamBody, raw), method };
+  }
+  if (method === "chat.stopStream") {
+    return { body: v.parse(stopStreamBody, raw), method };
+  }
+  throw new Error(`Unexpected Slack method ${method}`);
+};
 
 interface SlackCall {
   method: string;
@@ -156,12 +177,29 @@ const createFakeSlack = (
   const settle = createLifoSettler<Response>();
   const clock = (): number => now?.() ?? performance.now();
   const windowEnd = windowMs === undefined ? undefined : clock() + windowMs;
+  // Slack fixes a stream's mode on its first append: top-level markdown_text
+  // and chunks cannot be mixed, and the other form fails with
+  // streaming_mode_mismatch (observed against chat.appendStream).
+  const streamModes = new Map<string, "chunks" | "markdown">();
+  const switchesStreamMode = (
+    body: v.InferOutput<typeof appendStreamBody>,
+  ): boolean => {
+    const mode = v.is(markdownAppendBody, body) ? "markdown" : "chunks";
+    const fixed = streamModes.get(body.ts) ?? mode;
+    streamModes.set(body.ts, fixed);
+    return fixed !== mode;
+  };
   const chunksOf = (recorded: SlackCall[]) =>
     recorded
       .filter((call) => call.method === "chat.appendStream")
       .map((call) => v.parse(appendStreamBody, call.body))
-      .filter((body) => v.is(markdownAppendBody, body))
-      .map((body) => body.markdown_text);
+      .flatMap((body) =>
+        v.is(markdownAppendBody, body)
+          ? [body.markdown_text]
+          : body.chunks.flatMap((chunk) =>
+              chunk.type === "markdown_text" ? [chunk.text] : [],
+            ),
+      );
   const markdownChunks = () => chunksOf(calls);
   return {
     accepted,
@@ -188,19 +226,17 @@ const createFakeSlack = (
       if (!v.is(v.string(), init.body)) {
         throw new TypeError(`Expected a JSON body for ${method}`);
       }
-      const raw: unknown = JSON.parse(init.body);
-      let call: SlackCall;
-      if (method === "chat.startStream") {
-        const surfaced = v.is(v.object({ recipient_user_id: v.string() }), raw)
-          ? channelStartStreamBody
-          : startStreamBody;
-        call = { body: v.parse(surfaced, raw), method };
-      } else if (method === "chat.appendStream") {
-        call = { body: v.parse(appendStreamBody, raw), method };
-      } else if (method === "chat.stopStream") {
-        call = { body: v.parse(stopStreamBody, raw), method };
-      } else {
-        throw new Error(`Unexpected Slack method ${method}`);
+      const call = parseSlackCall(method, init.body);
+      if (
+        call.method === "chat.appendStream" &&
+        switchesStreamMode(v.parse(appendStreamBody, call.body))
+      ) {
+        return settle(
+          Response.json({ error: "streaming_mode_mismatch", ok: false }),
+        ).then((response) => {
+          calls.push(call);
+          return response;
+        });
       }
       const error = failures[method];
       const occurrence = (seen.get(method) ?? 0) + 1;
@@ -247,7 +283,9 @@ const createFakeSlack = (
         .filter((call) => call.method === "chat.appendStream")
         .map((call) => v.parse(appendStreamBody, call.body))
         .filter((body) => v.is(taskAppendBody, body))
-        .flatMap((body) => body.chunks),
+        .flatMap((body) =>
+          body.chunks.filter((chunk) => chunk.type === "task_update"),
+        ),
   };
 };
 
@@ -1185,7 +1223,9 @@ describe("Slack task updates", () => {
       }),
       JSON.stringify({
         channel: "C123",
-        markdown_text: "Looking it up. Found three.",
+        chunks: [
+          { text: "Looking it up. Found three.", type: "markdown_text" },
+        ],
         ts: STREAM_TS,
       }),
     ]);

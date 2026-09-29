@@ -270,7 +270,15 @@ export const createSqlSlackDeliveryStore = (
   };
 };
 
-type SlackRequestBody = Record<string, string | SlackTaskChunk[]>;
+interface SlackMarkdownChunk {
+  text: string;
+  type: "markdown_text";
+}
+
+type SlackRequestBody = Record<
+  string,
+  string | (SlackMarkdownChunk | SlackTaskChunk)[]
+>;
 
 export const COALESCE_CHARS = 1024;
 export const COALESCE_MS = 300;
@@ -492,10 +500,14 @@ export const createSlackStream = (
         "chat.appendStream",
         {
           channel: channelId,
-          markdown_text: markdown.slice(
-            offset,
-            offset + MAX_SLACK_APPEND_LENGTH,
-          ),
+          // Slack fixes a stream to chunks or to markdown_text on the first
+          // append, and task updates need chunks, so text goes as chunks too.
+          chunks: [
+            {
+              text: markdown.slice(offset, offset + MAX_SLACK_APPEND_LENGTH),
+              type: "markdown_text",
+            },
+          ],
           ts,
         },
         budget,
