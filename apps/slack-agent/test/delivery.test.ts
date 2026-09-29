@@ -1732,8 +1732,8 @@ describe("durable Slack delivery", () => {
     const slack = createFakeSlack();
     const store = memoryStore();
     const { first, second } = privateBindings();
-    await openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
-    await openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
     applySlackDeliveryEvent(store, "dm", { text: "xray1xray2", type: "text" });
     await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
 
@@ -1748,9 +1748,9 @@ describe("durable Slack delivery", () => {
     const slack = createFakeSlack();
     const store = memoryStore();
     const { first, second } = privateBindings();
-    await openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
-    await openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
-    await openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
     applySlackDeliveryEvent(store, "dm", { text: "xray1xray2", type: "text" });
     await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
 
@@ -1759,16 +1759,17 @@ describe("durable Slack delivery", () => {
 
   // A record left open by an interrupted turn belongs to the thread that
   // opened it; the next turn's thread must not inherit it. The threads that
-  // record still owes an outcome are told before their record is replaced.
-  test("tells the interrupted turn's threads before a later turn replaces their record", async () => {
+  // record still owes an outcome are told when the turn that replaced it
+  // finishes, not while its model is still waiting to start.
+  test("tells the interrupted turn's threads when the turn that replaced them finishes", async () => {
     const slack = createFakeSlack();
     const store = memoryStore();
     const { first, second } = privateBindings();
     const third = { ...first, threadTs: "183.3" };
-    await openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
-    await openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
     evictLiveSlackDelivery("dm");
-    await openSlackDelivery(store, "dm", third, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", third, BOT_TOKEN, slack.fetcher);
     applySlackDeliveryEvent(store, "dm", { text: "third only", type: "text" });
     await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
 
@@ -1785,20 +1786,19 @@ describe("durable Slack delivery", () => {
 
   // The runtime starts a response's `useAgentStart()` hooks together, so two
   // deliveries can open the same instance before either has settled the
-  // interrupted record. The fresh record must take the instance's slot first,
-  // or the second open replaces it and its thread is the one left out.
+  // interrupted record. Opening is synchronous, so the fresh record takes the
+  // instance's slot before the second open can see it; the second joins rather
+  // than replacing it, and its thread is not the one left out.
   test("settles an interrupted record once when two turns open together", async () => {
     const slack = createFakeSlack();
     const store = memoryStore();
     const first = slackDeliveryBinding(privateTarget);
     const third = { ...first, threadTs: "183.3" };
     const fourth = { ...first, threadTs: "184.4" };
-    await openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
     evictLiveSlackDelivery("dm");
-    await Promise.all([
-      openSlackDelivery(store, "dm", third, BOT_TOKEN, slack.fetcher),
-      openSlackDelivery(store, "dm", fourth, BOT_TOKEN, slack.fetcher),
-    ]);
+    openSlackDelivery(store, "dm", third, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", fourth, BOT_TOKEN, slack.fetcher);
     applySlackDeliveryEvent(store, "dm", { text: "reply", type: "text" });
     await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
 
@@ -1815,11 +1815,53 @@ describe("durable Slack delivery", () => {
     ]).toEqual(["183.3", "184.4"]);
   });
 
+  // The turn that abandons a record must reach its model without waiting on a
+  // Slack round-trip, retries included: opening the fresh record touches Slack
+  // not at all, and the interrupted threads are settled when this turn ends.
+  test("opens the fresh record without settling the interrupted one", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const { first } = privateBindings();
+    const third = { ...first, threadTs: "183.3" };
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    evictLiveSlackDelivery("dm");
+
+    openSlackDelivery(store, "dm", third, BOT_TOKEN, slack.fetcher);
+
+    expect(slack.calls).toEqual([]);
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
+    expect(startStreamThreads(slack).toSorted()).toEqual(["171.2", "183.3"]);
+  });
+
+  // The record that replaced an interrupted one carries that record durably, so
+  // a notice Slack refuses to accept is retried by a later finish instead of
+  // being lost with the isolate that attempted it.
+  test("retries an interrupted thread's notice from the durable record", async () => {
+    const failing = createFakeSlack({
+      "chat.startStream": "channel_not_found",
+    });
+    const store = serializingStore();
+    const { first } = privateBindings();
+    const third = { ...first, threadTs: "183.3" };
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, failing.fetcher);
+    evictLiveSlackDelivery("dm");
+    openSlackDelivery(store, "dm", third, BOT_TOKEN, failing.fetcher);
+    applySlackDeliveryEvent(store, "dm", { text: "reply", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, failing.fetcher);
+    expect(store.load("dm")?.abandoned).toHaveLength(1);
+
+    const healthy = createFakeSlack();
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, healthy.fetcher);
+
+    expect(startStreamThreads(healthy)).toEqual(["171.2"]);
+    expect(healthy.markdown()).toBe(SLACK_STREAM_FAILURE_NOTICE);
+  });
+
   test("replays durable tool events in record order and the reply text exactly once", async () => {
     const slack = createFakeSlack();
     const store = memoryStore();
     const preamble = "n".repeat(600);
-    await openSlackDelivery(
+    openSlackDelivery(
       store,
       "i1",
       slackDeliveryBinding(channelTarget),
@@ -1873,7 +1915,7 @@ describe("durable Slack delivery", () => {
       { limit: 1 },
     );
     const store = memoryStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       store,
       "i1",
       slackDeliveryBinding(channelTarget),
@@ -1906,7 +1948,7 @@ describe("durable Slack delivery", () => {
   test("appends the failure notice from the durable record once the live stream is evicted", async () => {
     const slack = createFakeSlack();
     const store = memoryStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       store,
       "i1",
       slackDeliveryBinding(channelTarget),
@@ -1939,7 +1981,7 @@ describe("durable Slack delivery", () => {
   test("does not grow the durable record when an event arrives after finish", async () => {
     const slack = createFakeSlack();
     const store = memoryStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       store,
       "i1",
       slackDeliveryBinding(channelTarget),
@@ -1965,7 +2007,7 @@ describe("durable Slack delivery", () => {
   test("keeps the durable record bounded and merged while a long reply streams", async () => {
     const slack = createFakeSlack();
     const store = memoryStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       store,
       "i1",
       slackDeliveryBinding(channelTarget),
@@ -1995,7 +2037,7 @@ describe("durable Slack delivery", () => {
     );
     const liveSlack = createFakeSlack();
     const liveStore = serializingStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       liveStore,
       "live",
       slackDeliveryBinding(channelTarget),
@@ -2009,7 +2051,7 @@ describe("durable Slack delivery", () => {
 
     const replaySlack = createFakeSlack();
     const replayStore = serializingStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       replayStore,
       "replay",
       slackDeliveryBinding(channelTarget),
@@ -2041,7 +2083,7 @@ describe("durable Slack delivery", () => {
     const head = "a".repeat(cap - 1);
     const slack = createFakeSlack();
     const store = serializingStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       store,
       "surrogate",
       slackDeliveryBinding(channelTarget),
@@ -2070,7 +2112,7 @@ describe("durable Slack delivery", () => {
     const answer = "a".repeat(50);
     const slack = createFakeSlack();
     const store = serializingStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       store,
       "evicted",
       slackDeliveryBinding(channelTarget),
@@ -2091,7 +2133,7 @@ describe("durable Slack delivery", () => {
       { status: 429, windowMs: 1500 },
     );
     const store = serializingStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       store,
       "blocked-replay",
       slackDeliveryBinding(channelTarget),
@@ -2122,7 +2164,7 @@ describe("durable Slack delivery", () => {
     const answer = "b".repeat(50);
     const slack = createFakeSlack();
     const store = serializingStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       store,
       "timer",
       slackDeliveryBinding(channelTarget),
@@ -2145,7 +2187,7 @@ describe("durable Slack delivery", () => {
   test("anchors the flush timer to the first pending delta, not the last", async () => {
     const slack = createFakeSlack();
     const store = serializingStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       store,
       "anchor",
       slackDeliveryBinding(channelTarget),
@@ -2173,7 +2215,7 @@ describe("durable Slack delivery", () => {
     ];
     const finishSlack = createFakeSlack();
     const finishStore = serializingStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       finishStore,
       "finished",
       slackDeliveryBinding(channelTarget),
@@ -2183,7 +2225,7 @@ describe("durable Slack delivery", () => {
     evictLiveSlackDelivery("finished");
     const failSlack = createFakeSlack();
     const failStore = serializingStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       failStore,
       "failed",
       slackDeliveryBinding(channelTarget),
@@ -2226,7 +2268,7 @@ describe("durable Slack delivery", () => {
     const expected = `${answer.slice(0, MAX_SLACK_MESSAGE_LENGTH - 20)}\n\n(truncated)`;
     const finishSlack = createFakeSlack();
     const finishStore = serializingStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       finishStore,
       "finished",
       slackDeliveryBinding(channelTarget),
@@ -2236,7 +2278,7 @@ describe("durable Slack delivery", () => {
     evictLiveSlackDelivery("finished");
     const failSlack = createFakeSlack();
     const failStore = serializingStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       failStore,
       "failed",
       slackDeliveryBinding(channelTarget),
@@ -2273,7 +2315,7 @@ describe("durable Slack delivery", () => {
   test("does not throw or double-post when finish hits a Slack error and is retried", async () => {
     const slack = createFakeSlack({ "chat.stopStream": "channel_not_found" });
     const store = memoryStore();
-    await openSlackDelivery(
+    openSlackDelivery(
       store,
       "i1",
       slackDeliveryBinding(channelTarget),

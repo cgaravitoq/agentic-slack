@@ -186,7 +186,8 @@ export interface SlackStream {
   append: (delta: string) => void;
   task: (update: SlackTaskUpdate) => void;
   finish: (fallback: string) => Promise<void>;
-  fail: (notice: string) => Promise<void>;
+  // True when the closing notice reached the thread.
+  fail: (notice: string) => Promise<boolean>;
 }
 
 export type SlackDeliveryEvent =
@@ -194,13 +195,20 @@ export type SlackDeliveryEvent =
   | { type: "tool-start"; id: string; name: string }
   | { type: "tool-result"; id: string; output: string; error: boolean };
 
-interface SlackDeliveryRecord {
+interface AbandonedDelivery {
   binding: SlackDeliveryBinding;
   events: SlackDeliveryEvent[];
   joinedBindings: SlackDeliveryBinding[];
   replyText: string;
   failed: boolean;
   closed: boolean;
+}
+
+interface SlackDeliveryRecord extends AbandonedDelivery {
+  // Records a later turn abandoned, each still owed a failure notice. They ride
+  // the record that replaced them so a crash before the notice leaves a durable
+  // copy behind for the next finish to retry.
+  abandoned: AbandonedDelivery[];
 }
 
 export interface SlackDeliveryStore {
@@ -214,30 +222,37 @@ interface SqlExec {
 
 const deliveryRow = v.object({ payload: v.string() });
 
-const slackDeliveryRecordSchema = v.object({
+const deliveryEventSchema = v.union([
+  v.object({ text: v.string(), type: v.literal("text") }),
+  v.object({
+    id: v.string(),
+    name: v.string(),
+    type: v.literal("tool-start"),
+  }),
+  v.object({
+    error: v.boolean(),
+    id: v.string(),
+    output: v.string(),
+    type: v.literal("tool-result"),
+  }),
+]);
+
+const deliveryRecordFields = {
   binding: slackDeliveryBindingSchema,
   closed: v.boolean(),
-  events: v.array(
-    v.union([
-      v.object({ text: v.string(), type: v.literal("text") }),
-      v.object({
-        id: v.string(),
-        name: v.string(),
-        type: v.literal("tool-start"),
-      }),
-      v.object({
-        error: v.boolean(),
-        id: v.string(),
-        output: v.string(),
-        type: v.literal("tool-result"),
-      }),
-    ]),
-  ),
+  events: v.array(deliveryEventSchema),
   failed: v.boolean(),
   // Absent on a record written before a response could carry more than one
   // requesting thread, and those records are still readable.
   joinedBindings: v.optional(v.array(slackDeliveryBindingSchema), []),
   replyText: v.string(),
+};
+
+const abandonedDeliverySchema = v.object(deliveryRecordFields);
+
+const slackDeliveryRecordSchema = v.object({
+  ...deliveryRecordFields,
+  abandoned: v.optional(v.array(abandonedDeliverySchema), []),
 });
 
 export const createSqlSlackDeliveryStore = (
@@ -553,14 +568,16 @@ export const createSlackStream = (
     );
   };
 
-  const attempt = async (work: () => Promise<void>): Promise<void> => {
+  const attempt = async (work: () => Promise<void>): Promise<boolean> => {
     try {
       await work();
+      return true;
     } catch (error: unknown) {
       failure ??=
         error instanceof Error
           ? error
           : new Error("Slack streaming delivery failed", { cause: error });
+      return false;
     }
   };
 
@@ -606,14 +623,17 @@ export const createSlackStream = (
     }, COALESCE_MS);
   };
 
-  const close = async (trailer: string, always: boolean): Promise<void> => {
+  // Reports whether the closing notice reached the thread, so a caller holding
+  // a durable record knows the outcome is delivered rather than merely sent.
+  const close = async (trailer: string, always: boolean): Promise<boolean> => {
     if (closed) {
-      return;
+      return failure === undefined;
     }
     closed = true;
     flushPending();
     enqueue(() => send(sanitizer.flush(), contentBudget));
     await queue;
+    let delivered = true;
     // A recorded failure must reach the user on whichever path closes the
     // stream: otherwise they keep the partial content with nothing telling them
     // the turn broke. `closed` keeps it to one notice per stream.
@@ -623,15 +643,18 @@ export const createSlackStream = (
       // `post`, not `send`: the closing word is not stream content, and a reply
       // that already hit the content cap would otherwise clip it away and leave
       // the user with a truncated answer and no sign the turn broke.
-      await attempt(() => post(sanitizeReply(notice), closingBudget));
+      delivered = await attempt(() =>
+        post(sanitizeReply(notice), closingBudget),
+      );
     }
     const ts = streamTs;
     if (ts === undefined) {
-      return;
+      return delivered;
     }
     await attempt(async () => {
       await call("chat.stopStream", { channel: channelId, ts }, closingBudget);
     });
+    return delivered;
   };
 
   return {
@@ -641,8 +664,8 @@ export const createSlackStream = (
       }
       bufferAppend(sanitizer.push(delta));
     },
-    async fail(notice) {
-      await close(notice, true);
+    fail(notice) {
+      return close(notice, true);
     },
     async finish(fallback) {
       await close(fallback, false);
@@ -854,6 +877,7 @@ const runSlackAlarmDelivery = async (
 };
 
 const emptyRecord = (binding: SlackDeliveryBinding): SlackDeliveryRecord => ({
+  abandoned: [],
   binding,
   closed: false,
   events: [],
@@ -894,12 +918,17 @@ const adoptDestination = (
 // Every requesting thread is owed its own reply, so one destination failing
 // must not deny the others: the failing stream has already told its own
 // thread, and rethrowing would fail a completed turn, which the runtime would
-// then retry and post twice.
-const settleDestination = async (work: () => Promise<void>): Promise<void> => {
+// then retry and post twice. The result is reported so a durable notice is
+// only retired once its thread actually heard it.
+const settleDestination = async (
+  work: () => Promise<void>,
+): Promise<boolean> => {
   try {
     await work();
+    return true;
   } catch {
     // Deliberate: that thread already carries its own outcome.
+    return false;
   }
 };
 
@@ -915,32 +944,45 @@ const replaySlackFailure = async (
     fetcher,
   );
   feedSlackStream(stream, events);
-  await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+  if (!(await stream.fail(SLACK_STREAM_FAILURE_NOTICE))) {
+    throw new Error("Slack failure notice was not delivered");
+  }
 };
 
-// The record a fresh turn abandons is about to be replaced in the store, so
-// this is the last chance its threads have to hear an outcome.
-const failAbandonedRecord = async (
-  record: SlackDeliveryRecord,
+// The record a fresh turn abandons is about to be replaced in the store, so its
+// threads are settled from the copy the fresh record carries, not from the slot
+// the fresh record now owns.
+const settleAbandonedRecord = async (
+  record: AbandonedDelivery,
   token: string,
   fetcher: Fetcher,
-): Promise<void> => {
-  await Promise.all(
+): Promise<boolean> => {
+  const results = await Promise.all(
     [record.binding, ...record.joinedBindings].map((binding) =>
       settleDestination(() =>
         replaySlackFailure(binding, token, record.events, fetcher),
       ),
     ),
   );
+  return results.every(Boolean);
 };
 
-export const openSlackDelivery = async (
+const abandonRecord = (record: SlackDeliveryRecord): AbandonedDelivery => ({
+  binding: record.binding,
+  closed: record.closed,
+  events: record.events,
+  failed: record.failed,
+  joinedBindings: record.joinedBindings,
+  replyText: record.replyText,
+});
+
+export const openSlackDelivery = (
   store: SlackDeliveryStore,
   instanceId: string,
   binding: SlackDeliveryBinding,
   token: string,
   fetcher: Fetcher = fetch,
-): Promise<void> => {
+): void => {
   const live = liveDeliveries.get(instanceId);
   if (live !== undefined) {
     if (adoptDestination(live.record, binding)) {
@@ -953,14 +995,17 @@ export const openSlackDelivery = async (
   // opened it. Only that thread, or one that already joined its response,
   // resumes it; a later turn starts its own record so its reply cannot land in
   // the interrupted turn's thread. The new record takes the instance's slot
-  // before the interrupted record is settled, so a concurrent turn joins this
-  // record instead of replacing it.
+  // before anything is sent to the interrupted threads, so a concurrent turn
+  // joins this record instead of replacing it.
   const abandoned =
     existing !== undefined &&
     !existing.closed &&
     !ownsDestination(existing, binding);
   const resumable = existing !== undefined && !existing.closed && !abandoned;
   const record = resumable ? existing : emptyRecord(binding);
+  if (abandoned) {
+    record.abandoned = [...existing.abandoned, abandonRecord(existing)];
+  }
   adoptDestination(record, binding);
   store.save(instanceId, record);
   liveDeliveries.set(instanceId, {
@@ -975,9 +1020,6 @@ export const openSlackDelivery = async (
     ),
     toolNames: new Map(),
   });
-  if (abandoned) {
-    await failAbandonedRecord(existing, token, fetcher);
-  }
 };
 
 export const applySlackDeliveryEvent = (
@@ -1009,6 +1051,31 @@ export const applySlackDeliveryEvent = (
   store.save(instanceId, record);
 };
 
+// The record a fresh turn carries holds the threads of every record it
+// abandoned; settle them here, before this turn's own delivery, so their
+// notices keep the order they had when those turns were interrupted. A notice
+// Slack still refuses stays on the record for the next finish to retry.
+const settleAbandonedRecords = async (
+  store: SlackDeliveryStore,
+  instanceId: string,
+  record: SlackDeliveryRecord,
+  token: string,
+  fetcher: Fetcher,
+): Promise<void> => {
+  if (record.abandoned.length === 0) {
+    return;
+  }
+  const remaining: AbandonedDelivery[] = [];
+  for (const entry of record.abandoned) {
+    // oxlint-disable-next-line no-await-in-loop
+    if (!(await settleAbandonedRecord(entry, token, fetcher))) {
+      remaining.push(entry);
+    }
+  }
+  record.abandoned = remaining;
+  store.save(instanceId, record);
+};
+
 export const failSlackDelivery = async (
   store: SlackDeliveryStore,
   instanceId: string,
@@ -1017,16 +1084,22 @@ export const failSlackDelivery = async (
 ): Promise<void> => {
   const live = liveDeliveries.get(instanceId);
   const record = live?.record ?? store.load(instanceId);
-  if (record === undefined || record.closed) {
+  if (record === undefined) {
+    return;
+  }
+  await settleAbandonedRecords(store, instanceId, record, token, fetcher);
+  if (record.closed) {
     return;
   }
   record.failed = true;
   const primary =
     live === undefined
       ? () => replaySlackFailure(record.binding, token, record.events, fetcher)
-      : () => live.stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+      : async () => {
+          await live.stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+        };
   try {
-    await primary();
+    await settleDestination(primary);
   } finally {
     await Promise.all(
       record.joinedBindings.map((binding) =>
@@ -1047,11 +1120,15 @@ export const finishSlackDelivery = async (
 ): Promise<void> => {
   const live = liveDeliveries.get(instanceId);
   const record = live?.record ?? store.load(instanceId);
-  if (record === undefined || record.closed) {
+  if (record === undefined) {
     return;
   }
   if (record.failed) {
     await failSlackDelivery(store, instanceId, token, fetcher);
+    return;
+  }
+  await settleAbandonedRecords(store, instanceId, record, token, fetcher);
+  if (record.closed) {
     return;
   }
   const trailer = replyTrailer(record.replyText);
