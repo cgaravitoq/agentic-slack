@@ -7,8 +7,9 @@ Channel threads have separate durable conversations; messages in the same DM cha
 Replies always go to the requesting thread.
 
 The agent has no built-in business integrations or external tools.
+Business tools live in an MCP server you operate, and procedures ship as Agent Skills; both are declared in `apps/slack-agent/agent.config.ts`.
 It receives admitted mentions and DMs, not the complete history of a Slack channel.
-Configure its name, instructions, suggested prompts, retention, and model in `apps/slack-agent/agent.config.ts`.
+Configure its name, instructions, suggested prompts, retention, model, MCP servers, and skills in `apps/slack-agent/agent.config.ts`.
 
 This Bun monorepo separates reusable Slack admission and delivery code from the deployed application.
 The current runtime uses Flue, Cloudflare Workers, Durable Objects, D1, and Workers AI.
@@ -35,7 +36,7 @@ flowchart LR
 The core owns Slack admission and delivery, deduplication, retention helpers, and instruction composition.
 The application selects Workers AI and connects the Flue agent lifecycle to durable delivery and retention.
 
-The operator surface is `apps/slack-agent/agent.config.ts`: name, description, owner instructions, suggested prompts, retention, and model.
+The operator surface is `apps/slack-agent/agent.config.ts`: name, description, owner instructions, suggested prompts, retention, model, MCP servers, and skills.
 
 The Worker acknowledges an accepted event and hands the turn to `executionCtx.waitUntil`, so the response never waits for the deferred work that `waitUntil` keeps alive.
 The deferred work refreshes retention, fires a best-effort `:eyes:` reaction on channel mentions, and dispatches the turn to the Durable Object.
@@ -63,6 +64,81 @@ That destroy is the product's only conversation deletion mechanism.
 An active conversation can therefore remain stored longer than 7 or 15 calendar days.
 Delivery events and reply text are persisted before output sanitization; closing a delivery does not erase that record.
 Expiry deletes the application's Durable Object state, not messages already sent to Slack or data subject to external service retention policies.
+
+## Business tools and skills
+
+This repository stays business-neutral: your tools live in an MCP server you operate, and your procedures ship as Agent Skills.
+Both are declared in `apps/slack-agent/agent.config.ts`, so extending the agent never means editing agent code.
+
+### Connect your MCP server
+
+```ts
+export default defineAgentConfig({
+  // ...the rest of your configuration
+  mcpServers: [
+    {
+      authSecret: "CRM_MCP_TOKEN",
+      name: "crm",
+      tools: ["create_organization", "find_organization"],
+      url: "https://mcp.internal.example.com/mcp",
+    },
+  ],
+});
+```
+
+Each entry takes these fields:
+
+- `name` (required): the identifier every tool of that server carries.
+- `url` (required): the server endpoint, which must be HTTPS.
+- `authSecret` (optional): the name of a Worker secret holding the bearer token, read on each request so a rotated token needs no redeploy.
+- `tools` (optional): an allowlist of tool names to mount; the connection fails if the server does not expose one of them.
+- `optional` (optional): when `true`, an unreachable server leaves the turn running without its tools instead of failing it.
+
+The model sees a mounted tool as `mcp__<name>__<tool>`, so the `crm` entry above exposes `mcp__crm__create_organization`.
+Store the token as a Worker secret rather than in the config file:
+
+```sh
+bunx wrangler secret put CRM_MCP_TOKEN --config apps/slack-agent/wrangler.deploy.json --env staging
+```
+
+Enter the token at Wrangler's prompt.
+An MCP server you connect influences your agent: its tool descriptions enter the prompt and its tool results enter the conversation.
+Treat a server you do not control like any other third-party dependency, and use `tools` to bound what it exposes.
+
+### Add a skill
+
+A skill is a directory containing a `SKILL.md` file: frontmatter names it, and the body carries the procedure.
+Create the directory next to the config, then import it and mount it.
+
+```text
+apps/slack-agent/skills/refunds/
+└─ SKILL.md
+```
+
+```markdown
+---
+name: refunds
+description: Process a customer refund request end to end. Use when a customer asks for a refund or disputes a charge.
+---
+
+1. Confirm the order ID and the reason for the refund.
+2. Issue the refund with the `mcp__crm__create_refund` tool.
+```
+
+```ts
+import refunds from "./skills/refunds/SKILL.md";
+
+export default defineAgentConfig({
+  // ...the rest of your configuration
+  skills: [refunds],
+});
+```
+
+The `name` must match the directory name.
+Only the description is always in context, so it carries the routing decision: state what the skill does and when to use it.
+The instructions load when the model activates the skill, and any other file in the directory, such as a `POLICY.md`, is packaged and read only on demand.
+The build packages the whole directory into the Worker, so a skill directory must contain no secrets or private keys.
+Two skills that share a name are rejected when the config is defined.
 
 ## Self-hosting
 
