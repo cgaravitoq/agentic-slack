@@ -2253,6 +2253,47 @@ describe("durable Slack delivery", () => {
     ]);
   });
 
+  // The durable record keeps the reply text twice: merged for the finish path
+  // and as text events for the fail path. Both must be the same capped text,
+  // or the two paths only agree while the stream clips them the same.
+  test("caps the events' text to the merged reply text past the durable cap", () => {
+    const answer = markedAnswer(6007);
+    const slack = createFakeSlack();
+    const store = serializingStore();
+    openSlackDelivery(
+      store,
+      "cap",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("cap");
+    applySlackDeliveryEvent(store, "cap", {
+      text: answer.slice(0, 4000),
+      type: "text",
+    });
+    applySlackDeliveryEvent(store, "cap", {
+      id: "call-1",
+      name: "search_docs",
+      type: "tool-start",
+    });
+    applySlackDeliveryEvent(store, "cap", {
+      text: answer.slice(4000),
+      type: "text",
+    });
+
+    const record = store.load("cap");
+    const eventsText = (record?.events ?? [])
+      .filter((event) => event.type === "text")
+      .map((event) => event.text)
+      .join("");
+    const replyText = record?.replyText ?? "";
+    expect(replyText).toHaveLength(
+      MAX_SLACK_MESSAGE_LENGTH + STREAM_TAIL_LENGTH,
+    );
+    expect(eventsText).toBe(replyText);
+  });
+
   // The fail path replays the record's text events in record order and the
   // finish path posts the merged reply text, so the two sources stop agreeing
   // past the durable cap: the concatenated events keep growing while the

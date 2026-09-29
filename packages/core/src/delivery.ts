@@ -186,8 +186,9 @@ export interface SlackStream {
   append: (delta: string) => void;
   task: (update: SlackTaskUpdate) => void;
   finish: (fallback: string) => Promise<void>;
-  // True when the closing notice reached the thread.
-  fail: (notice: string) => Promise<boolean>;
+  // True when the closing notice reached the thread. `replyText` posts a reply
+  // the stream never saw, the way `finish` posts its fallback.
+  fail: (notice: string, replyText?: string) => Promise<boolean>;
 }
 
 export type SlackDeliveryEvent =
@@ -625,7 +626,11 @@ export const createSlackStream = (
 
   // Reports whether the closing notice reached the thread, so a caller holding
   // a durable record knows the outcome is delivered rather than merely sent.
-  const close = async (trailer: string, always: boolean): Promise<boolean> => {
+  const close = async (
+    trailer: string,
+    always: boolean,
+    replyText?: string,
+  ): Promise<boolean> => {
     if (closed) {
       return failure === undefined;
     }
@@ -633,6 +638,12 @@ export const createSlackStream = (
     flushPending();
     enqueue(() => send(sanitizer.flush(), contentBudget));
     await queue;
+    if (replyText !== undefined && replyText !== "") {
+      // A durable replay posts its reply the way a durable finish posts its
+      // fallback, so the two paths sanitize and clip the text identically
+      // instead of only agreeing while the stream clips them the same.
+      await attempt(() => post(sanitizeReply(replyText), contentBudget));
+    }
     let delivered = true;
     // A recorded failure must reach the user on whichever path closes the
     // stream: otherwise they keep the partial content with nothing telling them
@@ -664,8 +675,8 @@ export const createSlackStream = (
       }
       bufferAppend(sanitizer.push(delta));
     },
-    fail(notice) {
-      return close(notice, true);
+    fail(notice, replyText) {
+      return close(notice, true, replyText);
     },
     async finish(fallback) {
       await close(fallback, false);
@@ -778,7 +789,10 @@ const appendDurableText = (current: string, delta: string): string =>
     : clipDurableText(current + delta);
 
 // One merged text event per run of deltas: a replay only ever needs the text,
-// and an event per 4-character delta is what made every save quadratic.
+// and an event per 4-character delta is what made every save quadratic. The
+// events carry exactly the merged reply text, split at the non-text events, so
+// a durable fail replay and a durable finish replay read one source rather than
+// two that only agree while the stream clips them.
 const applyRecordEvent = (
   record: SlackDeliveryRecord,
   event: SlackDeliveryEvent,
@@ -787,13 +801,18 @@ const applyRecordEvent = (
     record.events.push(event);
     return;
   }
-  record.replyText = appendDurableText(record.replyText, event.text);
-  const last = record.events.at(-1);
-  if (last?.type === "text") {
-    last.text = appendDurableText(last.text, event.text);
+  const previous = record.replyText;
+  record.replyText = appendDurableText(previous, event.text);
+  const added = record.replyText.slice(previous.length);
+  if (added === "") {
     return;
   }
-  record.events.push({ text: clipDurableText(event.text), type: "text" });
+  const last = record.events.at(-1);
+  if (last?.type === "text") {
+    last.text += added;
+    return;
+  }
+  record.events.push({ text: added, type: "text" });
 };
 
 interface LiveSlackDelivery {
@@ -856,13 +875,15 @@ export const evictLiveSlackDelivery = (instanceId?: string): void => {
   }
 };
 
+interface SlackDeliveryReplay {
+  events: readonly SlackDeliveryEvent[];
+  replyText: string;
+}
+
 const runSlackAlarmDelivery = async (
   binding: SlackDeliveryBinding,
   token: string,
-  work: {
-    events: readonly SlackDeliveryEvent[];
-    replyText: string;
-  },
+  work: SlackDeliveryReplay,
   fetcher: Fetcher = fetch,
 ): Promise<void> => {
   const stream = createSlackStream(
@@ -932,10 +953,17 @@ const settleDestination = async (
   }
 };
 
+// A replay carries the record's non-text events and its merged reply text, the
+// one text source both the durable finish and the durable fail read.
+const deliveryReplay = (record: AbandonedDelivery): SlackDeliveryReplay => ({
+  events: record.events.filter((event) => event.type !== "text"),
+  replyText: record.replyText,
+});
+
 const replaySlackFailure = async (
   binding: SlackDeliveryBinding,
   token: string,
-  events: readonly SlackDeliveryEvent[],
+  replay: SlackDeliveryReplay,
   fetcher: Fetcher = fetch,
 ): Promise<void> => {
   const stream = createSlackStream(
@@ -943,8 +971,8 @@ const replaySlackFailure = async (
     token,
     fetcher,
   );
-  feedSlackStream(stream, events);
-  if (!(await stream.fail(SLACK_STREAM_FAILURE_NOTICE))) {
+  feedSlackStream(stream, replay.events);
+  if (!(await stream.fail(SLACK_STREAM_FAILURE_NOTICE, replay.replyText))) {
     throw new Error("Slack failure notice was not delivered");
   }
 };
@@ -957,10 +985,11 @@ const settleAbandonedRecord = async (
   token: string,
   fetcher: Fetcher,
 ): Promise<boolean> => {
+  const replay = deliveryReplay(record);
   const results = await Promise.all(
     [record.binding, ...record.joinedBindings].map((binding) =>
       settleDestination(() =>
-        replaySlackFailure(binding, token, record.events, fetcher),
+        replaySlackFailure(binding, token, replay, fetcher),
       ),
     ),
   );
@@ -1092,9 +1121,10 @@ export const failSlackDelivery = async (
     return;
   }
   record.failed = true;
+  const replay = deliveryReplay(record);
   const primary =
     live === undefined
-      ? () => replaySlackFailure(record.binding, token, record.events, fetcher)
+      ? () => replaySlackFailure(record.binding, token, replay, fetcher)
       : async () => {
           await live.stream.fail(SLACK_STREAM_FAILURE_NOTICE);
         };
@@ -1104,7 +1134,7 @@ export const failSlackDelivery = async (
     await Promise.all(
       record.joinedBindings.map((binding) =>
         settleDestination(() =>
-          replaySlackFailure(binding, token, record.events, fetcher),
+          replaySlackFailure(binding, token, replay, fetcher),
         ),
       ),
     );
@@ -1131,15 +1161,11 @@ export const finishSlackDelivery = async (
   if (record.closed) {
     return;
   }
-  const trailer = replyTrailer(record.replyText);
-  const replay = {
-    events: record.events.filter((event) => event.type !== "text"),
-    replyText: trailer,
-  };
+  const replay = deliveryReplay(record);
   const primary =
     live === undefined
       ? () => runSlackAlarmDelivery(record.binding, token, replay, fetcher)
-      : () => live.stream.finish(trailer);
+      : () => live.stream.finish(replyTrailer(record.replyText));
   try {
     await settleDestination(primary);
     await Promise.all(
