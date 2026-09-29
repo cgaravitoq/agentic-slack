@@ -281,7 +281,7 @@ describe("D1 migration schema", () => {
     expect(await staleCount(db)).toEqual([{ stale: 0 }]);
   });
 
-  test("runs the claimed handler when the retention sweep fails", async () => {
+  test("runs the claimed handler and reports the sweep failure by name", async () => {
     const { db } = migrated();
     await db
       .prepare(
@@ -295,13 +295,25 @@ describe("D1 migration schema", () => {
       )
       .run();
 
+    const reported: unknown[][] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      reported.push(args);
+    };
     let runs = 0;
-    await claimAndRun(db, "Ev-sweep", () => {
-      runs += 1;
-      return Promise.resolve();
-    });
+    try {
+      await claimAndRun(db, "Ev-sweep", () => {
+        runs += 1;
+        return Promise.resolve();
+      });
+    } finally {
+      console.error = originalError;
+    }
 
     expect(runs).toBe(1);
+    expect(reported).toHaveLength(1);
+    expect(reported[0][0]).toBe("seen_events retention sweep failed");
+    expect(reported[0][1]).toBeInstanceOf(Error);
     expect(await claimEvent(db, "Ev-sweep")).toBe(false);
     const { results } = await db
       .prepare("SELECT event_id FROM seen_events ORDER BY event_id")

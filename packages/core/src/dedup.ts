@@ -24,8 +24,9 @@ export const claimEvent = async (
       )
       .bind(now - SEEN_EVENT_RETENTION_SECONDS, SWEEP_BATCH_LIMIT)
       .run();
-  } catch {
+  } catch (error) {
     // The claim already committed; propagating would fail the claim, so Slack's retry would deduplicate to changes === 0 and drop the event.
+    console.error("seen_events retention sweep failed", error);
   }
   return true;
 };
