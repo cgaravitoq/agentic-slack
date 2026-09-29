@@ -133,6 +133,22 @@ const routeSlackEvent = (
   };
 };
 
+const ack = (status: number): Response => new Response(null, { status });
+
+const claimThenAcknowledge = async (
+  db: D1Database,
+  eventId: string,
+  run: () => Promise<void>,
+): Promise<Response> => {
+  try {
+    await claimAndRun(db, eventId, run);
+    return ack(200);
+  } catch (error: unknown) {
+    console.error("Slack event handling failed", error);
+    return ack(500);
+  }
+};
+
 export const missingReadiness = (
   trusted: TrustedSlackConfig,
   bindings: Partial<SlackCoreBindings>,
@@ -181,9 +197,9 @@ export const createSlackIngress = (
       trusted.appId,
   );
   const channel = createSlackChannel<SlackCoreEnv>({
-    events({ c, payload }) {
+    async events({ c, payload }): Promise<Response> {
       if (!identityComplete) {
-        return;
+        return ack(200);
       }
       const routed = routeSlackEvent(payload);
       if (
@@ -191,7 +207,7 @@ export const createSlackIngress = (
         routed.teamId !== trusted.teamId ||
         routed.appId !== trusted.appId
       ) {
-        return;
+        return ack(200);
       }
       const run =
         routed.kind === "turn"
@@ -203,17 +219,9 @@ export const createSlackIngress = (
               )
           : handleLifecycle && (() => handleLifecycle(routed, c.env));
       if (!run) {
-        return;
+        return ack(200);
       }
-      c.executionCtx.waitUntil(
-        (async () => {
-          try {
-            await claimAndRun(c.env.DB, routed.eventId, run);
-          } catch (error: unknown) {
-            console.error("Slack event handling failed", error);
-          }
-        })(),
-      );
+      return await claimThenAcknowledge(c.env.DB, routed.eventId, run);
     },
     signingSecret: identityComplete
       ? trusted.signingSecret
