@@ -1,4 +1,4 @@
-import { expect, mock, test } from "bun:test";
+import { expect, mock, spyOn, test } from "bun:test";
 import { defineSkill } from "@flue/runtime";
 import type {
   DeliveredMessage,
@@ -11,7 +11,10 @@ import type { ExpiryPayload, ExpirySchedule } from "@agentic-slack/core";
 import { evictLiveSlackDelivery } from "../../../packages/core/src/delivery.ts";
 
 import config from "../agent.config.ts";
-import type { CapturedCloudflareExtension } from "./module-mocks.ts";
+import type {
+  CapturedCloudflareExtension,
+  MockedWorkerEnv,
+} from "./module-mocks.ts";
 import {
   mockCloudflareWorkers,
   retentionExtendCapture,
@@ -133,8 +136,9 @@ const deliverySql = {
   },
 };
 
-const workerEnv = {
+const workerEnv: MockedWorkerEnv = {
   CRM_MCP_TOKEN: "crm-test-token",
+  SLACK_APP_ID: "A123",
   SLACK_BOT_TOKEN: "xoxb-test-token",
 };
 await mockCloudflareWorkers(workerEnv);
@@ -273,6 +277,82 @@ const directMessage = (threadTs: string): DeliveredMessage => ({
   body: threadTs,
   kind: "signal",
   type: "slack.message.im",
+});
+
+test("holds a gated call for the requester of the conversation's thread", async () => {
+  const instanceId = "slack:v1:T123:D777:D777";
+  const inserted: unknown[][] = [];
+  workerEnv.DB = {
+    prepare: (query: string) => ({
+      bind: (...bindings: unknown[]) => ({
+        all: () => Promise.resolve({ results: [] }),
+        run: () => {
+          if (query.includes("INSERT INTO approval_requests")) {
+            inserted.push(bindings);
+          }
+          return Promise.resolve({ meta: { changes: 1 } });
+        },
+      }),
+    }),
+  };
+  const requested: string[] = [];
+  const network = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(
+      (input: RequestInfo | URL) => {
+        requested.push(v.parse(v.string(), input));
+        return Promise.resolve(Response.json({ ok: true, ts: "181.2" }));
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  );
+  delivery = directMessage("181.1");
+  agentStarts.length = 0;
+  mcpConnections.length = 0;
+  SlackAgent({ id: instanceId });
+  for (const start of agentStarts) {
+    start();
+  }
+  const gate = v.parse(v.function(), mcpConnections[0]?.fetch);
+  const send = (body: string) =>
+    gate("https://mcp.example.test/mcp", {
+      body,
+      method: "POST",
+    });
+
+  await send(
+    JSON.stringify({
+      id: 1,
+      jsonrpc: "2.0",
+      method: "tools/call",
+      params: {
+        arguments: { domain: "acme.test" },
+        name: "create_organization",
+      },
+    }),
+  );
+  expect(requested).toEqual(["https://slack.com/api/chat.postMessage"]);
+  expect(inserted.map((row) => row.slice(1, 11))).toEqual([
+    [
+      instanceId,
+      "T123",
+      "A123",
+      "D777",
+      "181.1",
+      "private",
+      "U777",
+      "create_organization",
+      '{"domain":"acme.test"}',
+      "pending",
+    ],
+  ]);
+
+  await send(JSON.stringify({ id: 2, jsonrpc: "2.0", method: "tools/list" }));
+  expect(requested.at(-1)).toBe("https://mcp.example.test/mcp");
+
+  network.mockRestore();
+  evictLiveSlackDelivery(instanceId);
+  deliveryRows.delete(instanceId);
+  delivery = userMessage;
 });
 
 test("streams each dispatched message's reply to the thread named in its attributes", () => {

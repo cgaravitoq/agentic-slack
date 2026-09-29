@@ -43,6 +43,7 @@ export const retentionExtendCapture: RetentionExtendCapture = {};
 export interface MockedWorkerEnv {
   AI?: unknown;
   CRM_MCP_TOKEN?: string;
+  DB?: unknown;
   EXTENSION_SECRET?: string;
   SLACK_APP_ID?: string;
   SLACK_BOT_TOKEN: string;
