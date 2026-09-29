@@ -610,6 +610,19 @@ describe("MCP servers", () => {
       }),
     ).toThrow("Agent MCP server crm is configured twice");
   });
+
+  test("rejects a server whose authSecret is empty after trimming", () => {
+    for (const authSecret of ["", " "]) {
+      expect(() =>
+        defineAgentConfig({
+          ...required,
+          mcpServers: [
+            { authSecret, name: "crm", url: "https://mcp.example.test/mcp" },
+          ],
+        }),
+      ).toThrow("Agent MCP server crm requires an authSecret");
+    }
+  });
 });
 
 describe("Agent Skills", () => {
