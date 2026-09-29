@@ -226,27 +226,27 @@ describe("D1 migration schema", () => {
     expect(completed).toBe(1);
   });
 
-  test("sweeps only rows older than the retention window", async () => {
+  test("sweeps only rows older than the retention window, pinning the boundary second", async () => {
     const { db } = migrated();
-    await db
-      .prepare(
-        "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
-      )
-      .bind("Ev-expired", retentionSeconds + 1)
-      .run();
-    await db
-      .prepare(
-        "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
-      )
-      .bind("Ev-recent", retentionSeconds - 1)
-      .run();
+    const now = 1_700_000_000;
+    const seed = (eventId: string, createdAt: number) =>
+      db
+        .prepare(
+          "INSERT INTO seen_events (event_id, created_at) VALUES (?1, ?2)",
+        )
+        .bind(eventId, createdAt)
+        .run();
+    await seed("Ev-expired", now - retentionSeconds - 1);
+    await seed("Ev-boundary", now - retentionSeconds);
+    await seed("Ev-recent", now - retentionSeconds + 1);
 
-    expect(await claimEvent(db, "Ev-claimed")).toBe(true);
+    expect(await claimEvent(db, "Ev-claimed", now)).toBe(true);
 
     const { results } = await db
       .prepare("SELECT event_id FROM seen_events ORDER BY event_id")
       .all();
     expect(results).toEqual([
+      { event_id: "Ev-boundary" },
       { event_id: "Ev-claimed" },
       { event_id: "Ev-recent" },
     ]);
@@ -254,15 +254,16 @@ describe("D1 migration schema", () => {
 
   test("sweeps one batch at a time and leaves the remainder behind", async () => {
     const { db } = migrated();
+    const now = 1_700_000_000;
     const stale = sweepBatchLimit + 2;
     await db
       .prepare(
-        "INSERT INTO seen_events (event_id, created_at) WITH RECURSIVE counter(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM counter WHERE i < ?2) SELECT 'Ev-stale-' || i, unixepoch() - ?1 FROM counter",
+        "INSERT INTO seen_events (event_id, created_at) WITH RECURSIVE counter(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM counter WHERE i < ?2) SELECT 'Ev-stale-' || i, ?1 FROM counter",
       )
-      .bind(retentionSeconds + 1, stale)
+      .bind(now - retentionSeconds - 1, stale)
       .run();
 
-    expect(await claimEvent(db, "Ev-batch")).toBe(true);
+    expect(await claimEvent(db, "Ev-batch", now)).toBe(true);
     expect(await staleCount(db)).toEqual([{ stale: stale - sweepBatchLimit }]);
 
     const { results: survivors } = await db
@@ -271,10 +272,12 @@ describe("D1 migration schema", () => {
       )
       .all();
     expect(survivors).toHaveLength(stale - sweepBatchLimit);
-    expect(await claimEvent(db, String(survivors[0].event_id))).toBe(false);
+    expect(await claimEvent(db, String(survivors[0].event_id), now)).toBe(
+      false,
+    );
     expect(await staleCount(db)).toEqual([{ stale: stale - sweepBatchLimit }]);
 
-    expect(await claimEvent(db, "Ev-batch-again")).toBe(true);
+    expect(await claimEvent(db, "Ev-batch-again", now)).toBe(true);
     expect(await staleCount(db)).toEqual([{ stale: 0 }]);
   });
 
