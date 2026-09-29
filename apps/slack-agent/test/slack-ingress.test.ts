@@ -19,6 +19,7 @@ const trusted = {
 
 class FakeD1 {
   readonly seen = new Set<string>();
+  rejectClaim = false;
   private values: unknown[] = [];
 
   prepare(sql: string) {
@@ -30,6 +31,9 @@ class FakeD1 {
       run: () => {
         const eventId = String(this.values[0]);
         if (sql.startsWith("INSERT")) {
+          if (this.rejectClaim) {
+            return Promise.reject(new Error("claim failed"));
+          }
           if (this.seen.has(eventId)) {
             return Promise.resolve({ meta: { changes: 0 } });
           }
@@ -163,50 +167,27 @@ const event = (overrides: EventOverrides = {}) => ({
 });
 
 describe("signed Slack ingress", () => {
-  test("acks before work and deduplicates all side effects by event_id", async () => {
+  test("claims and dispatches before acknowledging, and deduplicates all side effects by event_id", async () => {
     const db = new FakeD1();
     const turns: string[] = [];
-    const { promise: blocked, resolve: releaseWork } =
-      Promise.withResolvers<undefined>();
-    const channel = createSlackIngress(trusted, async (turn, instanceId) => {
+    const channel = createSlackIngress(trusted, (turn, instanceId) => {
       turns.push(`${turn.text}:${instanceId}`);
-      await blocked;
+      return Promise.resolve();
     });
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
     const bindings = testBindings(db);
 
     const threadedMention = event({ thread_ts: "170.root" });
     const first = await channel
       .route()
-      .request(
-        await signedRequest(threadedMention),
-        undefined,
-        bindings,
-        executionCtx,
-      );
+      .request(await signedRequest(threadedMention), undefined, bindings);
     expect(first.status).toBe(200);
-    expect(turns).toHaveLength(1);
-    expect(turns[0]).toBe("hello:slack:v1:T123:C123:170.root");
-    releaseWork();
-    await Promise.all(pending.splice(0));
+    expect(db.seen.has("Ev123")).toBe(true);
+    expect(turns).toEqual(["hello:slack:v1:T123:C123:170.root"]);
 
     const duplicate = await channel
       .route()
-      .request(
-        await signedRequest(threadedMention),
-        undefined,
-        bindings,
-        executionCtx,
-      );
+      .request(await signedRequest(threadedMention), undefined, bindings);
     expect(duplicate.status).toBe(200);
-    await Promise.all(pending.splice(0));
     expect(turns).toHaveLength(1);
 
     const directMessage = {
@@ -223,14 +204,8 @@ describe("signed Slack ingress", () => {
     };
     const directResponse = await channel
       .route()
-      .request(
-        await signedRequest(directMessage),
-        undefined,
-        bindings,
-        executionCtx,
-      );
+      .request(await signedRequest(directMessage), undefined, bindings);
     expect(directResponse.status).toBe(200);
-    await Promise.all(pending);
     expect(turns.at(-1)).toBe("private hello:slack:v1:T123:D123:D123");
   });
 
@@ -241,14 +216,6 @@ describe("signed Slack ingress", () => {
       admitted.push(turn.eventId);
       return Promise.resolve();
     });
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
     const bindings = testBindings(db);
 
     const invalid = await channel
@@ -295,17 +262,55 @@ describe("signed Slack ingress", () => {
       rejected.map(async (payload) => {
         const response = await channel
           .route()
-          .request(
-            await signedRequest(payload),
-            undefined,
-            bindings,
-            executionCtx,
-          );
+          .request(await signedRequest(payload), undefined, bindings);
         expect(response.status).toBe(200);
       }),
     );
-    await Promise.all(pending);
     expect(admitted).toEqual([]);
+  });
+});
+
+describe("ingress acknowledgement", () => {
+  test("answers non-2xx when the claim fails, so Slack retries the delivery", async () => {
+    const db = new FakeD1();
+    db.rejectClaim = true;
+    const turns: string[] = [];
+    const channel = createSlackIngress(trusted, (turn) => {
+      turns.push(turn.eventId);
+      return Promise.resolve();
+    });
+
+    const response = await channel
+      .route()
+      .request(await signedRequest(event()), undefined, testBindings(db));
+
+    expect(response.status).toBe(500);
+    expect(turns).toEqual([]);
+  });
+
+  test("answers non-2xx when the dispatch fails, so Slack retries the delivery", async () => {
+    const db = new FakeD1();
+    let attempts = 0;
+    const channel = createSlackIngress(trusted, () => {
+      attempts += 1;
+      return attempts === 1
+        ? Promise.reject(new Error("dispatch failed"))
+        : Promise.resolve();
+    });
+    const bindings = testBindings(db);
+
+    const failed = await channel
+      .route()
+      .request(await signedRequest(event()), undefined, bindings);
+
+    expect(failed.status).toBe(500);
+
+    const retried = await channel
+      .route()
+      .request(await signedRequest(event()), undefined, bindings);
+
+    expect(retried.status).toBe(200);
+    expect(attempts).toBe(2);
   });
 });
 
@@ -359,14 +364,6 @@ describe("assistant thread lifecycle", () => {
           },
         ),
     );
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
     const bindings = testBindings(db);
 
     const deliver = async () => {
@@ -376,10 +373,8 @@ describe("assistant thread lifecycle", () => {
           await signedRequest(assistantThreadStarted),
           undefined,
           bindings,
-          executionCtx,
         );
       expect(response.status).toBe(200);
-      await Promise.all(pending.splice(0));
     };
     await deliver();
     await deliver();
@@ -410,14 +405,6 @@ describe("assistant thread lifecycle", () => {
         return Promise.resolve();
       },
     );
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
     const bindings = testBindings(db);
 
     const rejected: AssistantEnvelope[] = [
@@ -436,16 +423,10 @@ describe("assistant thread lifecycle", () => {
       rejected.map(async (payload) => {
         const response = await channel
           .route()
-          .request(
-            await signedRequest(payload),
-            undefined,
-            bindings,
-            executionCtx,
-          );
+          .request(await signedRequest(payload), undefined, bindings);
         expect(response.status).toBe(200);
       }),
     );
-    await Promise.all(pending);
     expect(lifecycles).toEqual([]);
   });
 
@@ -488,14 +469,6 @@ describe("assistant thread lifecycle", () => {
         },
       ),
     );
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
 
     const response = await app.request(
       await signedRequest(
@@ -504,10 +477,8 @@ describe("assistant thread lifecycle", () => {
       ),
       undefined,
       testBindings(db),
-      executionCtx,
     );
     expect(response.status).toBe(200);
-    await Promise.all(pending);
 
     expect(turns).toEqual([]);
     expect(requests).toEqual([
@@ -568,14 +539,6 @@ describe("assistant thread lifecycle", () => {
         },
       ),
     );
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
 
     const response = await app.request(
       await signedRequest(
@@ -584,10 +547,8 @@ describe("assistant thread lifecycle", () => {
       ),
       undefined,
       testBindings(db),
-      executionCtx,
     );
     expect(response.status).toBe(200);
-    await Promise.all(pending);
 
     expect(turns).toEqual([]);
     expect(requests).toEqual([
