@@ -609,19 +609,20 @@ export const handleApprovalInteraction = async (
     await options.notifier.settle(request, EXPIRED_NOTE);
     return;
   }
-  await options.decide(request, decided.decision);
   const claimed = await options.store.decide(
     request.requestId,
     decided.decision === "approve" ? "approved" : "rejected",
     decided.userId,
     now,
   );
-  if (claimed) {
-    await options.notifier.settle(
-      request,
-      decided.decision === "approve" ? APPROVED_NOTE : REJECTED_NOTE,
-    );
+  if (!claimed) {
+    return;
   }
+  await options.decide(request, decided.decision);
+  await options.notifier.settle(
+    request,
+    decided.decision === "approve" ? APPROVED_NOTE : REJECTED_NOTE,
+  );
 };
 
 export const approvalInstructions = (

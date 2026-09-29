@@ -418,6 +418,7 @@ const pendingRequest = (): ApprovalRequest => ({
 
 const interactionFor = (request: ApprovalRequest = pendingRequest()) => {
   const decisions: { decision: ApprovalDecision; requestId: string }[] = [];
+  const statesAtDispatch: (string | undefined)[] = [];
   const { rows, store } = memoryStore();
   const { notifier, settled } = recordingNotifier();
   const seed = () => store.create(request);
@@ -431,6 +432,9 @@ const interactionFor = (request: ApprovalRequest = pendingRequest()) => {
       handleApprovalInteraction(payload, {
         decide: (entry, decision) => {
           decisions.push({ decision, requestId: entry.requestId });
+          statesAtDispatch.push(
+            rows.find((row) => row.requestId === entry.requestId)?.state,
+          );
           return Promise.resolve();
         },
         notifier,
@@ -440,11 +444,25 @@ const interactionFor = (request: ApprovalRequest = pendingRequest()) => {
     rows,
     seed,
     settled,
+    statesAtDispatch,
     store,
   };
 };
 
 describe("approval interactions", () => {
+  test("stores the decision before the model hears of it", async () => {
+    const approving = interactionFor();
+    await approving.seed();
+    await approving.handle(blockActions({}));
+
+    const rejecting = interactionFor();
+    await rejecting.seed();
+    await rejecting.handle(blockActions({ actionId: "approval_reject" }));
+
+    expect(approving.statesAtDispatch).toEqual(["approved"]);
+    expect(rejecting.statesAtDispatch).toEqual(["rejected"]);
+  });
+
   test("approves the requester's own pending call and reports it", async () => {
     const { decisions, handle, rows, seed, settled } = interactionFor();
     await seed();
