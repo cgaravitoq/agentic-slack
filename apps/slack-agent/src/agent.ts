@@ -61,9 +61,8 @@ const workerSecret = (name: string): string =>
 export const startSlackTurnDelivery = (
   instanceId: string,
   binding: SlackDeliveryBinding,
-): void => {
+): Promise<void> =>
   openSlackDelivery(deliveryStore(), instanceId, binding, botToken());
-};
 
 export const observeSlackTurnDelivery = (
   event: FlueObservation,
@@ -99,11 +98,11 @@ export const SlackAgent = (props: AgentProps) => {
     useMcpConnection(connection);
   }
   const delivery = useDelivery();
-  useAgentStart(() => {
+  useAgentStart(async () => {
     if (delivery.kind !== "signal") {
       return;
     }
-    startSlackTurnDelivery(
+    await startSlackTurnDelivery(
       props.id,
       v.parse(slackDeliveryBindingSchema, delivery.attributes),
     );

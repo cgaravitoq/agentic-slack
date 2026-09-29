@@ -474,7 +474,7 @@ const deliverFromAlarm = async (evictLive = false): Promise<void> => {
     slackDeliveryBindingSchema,
     last?.request.message.attributes,
   );
-  startSlackTurnDelivery(instanceId, binding);
+  await startSlackTurnDelivery(instanceId, binding);
   if (evictLive) {
     evictLiveSlackDelivery(instanceId);
   }

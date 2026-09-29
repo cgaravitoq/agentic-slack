@@ -903,13 +903,44 @@ const settleDestination = async (work: () => Promise<void>): Promise<void> => {
   }
 };
 
-export const openSlackDelivery = (
+const replaySlackFailure = async (
+  binding: SlackDeliveryBinding,
+  token: string,
+  events: readonly SlackDeliveryEvent[],
+  fetcher: Fetcher = fetch,
+): Promise<void> => {
+  const stream = createSlackStream(
+    streamTargetFromBinding(binding),
+    token,
+    fetcher,
+  );
+  feedSlackStream(stream, events);
+  await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+};
+
+// The record a fresh turn abandons is about to be replaced in the store, so
+// this is the last chance its threads have to hear an outcome.
+const failAbandonedRecord = async (
+  record: SlackDeliveryRecord,
+  token: string,
+  fetcher: Fetcher,
+): Promise<void> => {
+  await Promise.all(
+    [record.binding, ...record.joinedBindings].map((binding) =>
+      settleDestination(() =>
+        replaySlackFailure(binding, token, record.events, fetcher),
+      ),
+    ),
+  );
+};
+
+export const openSlackDelivery = async (
   store: SlackDeliveryStore,
   instanceId: string,
   binding: SlackDeliveryBinding,
   token: string,
   fetcher: Fetcher = fetch,
-): void => {
+): Promise<void> => {
   const live = liveDeliveries.get(instanceId);
   if (live !== undefined) {
     if (adoptDestination(live.record, binding)) {
@@ -921,13 +952,15 @@ export const openSlackDelivery = (
   // A record left open by an interrupted turn belongs to the thread that
   // opened it. Only that thread, or one that already joined its response,
   // resumes it; a later turn starts its own record so its reply cannot land in
-  // the interrupted turn's thread.
-  const record =
+  // the interrupted turn's thread. The new record takes the instance's slot
+  // before the interrupted record is settled, so a concurrent turn joins this
+  // record instead of replacing it.
+  const abandoned =
     existing !== undefined &&
     !existing.closed &&
-    ownsDestination(existing, binding)
-      ? existing
-      : emptyRecord(binding);
+    !ownsDestination(existing, binding);
+  const resumable = existing !== undefined && !existing.closed && !abandoned;
+  const record = resumable ? existing : emptyRecord(binding);
   adoptDestination(record, binding);
   store.save(instanceId, record);
   liveDeliveries.set(instanceId, {
@@ -942,6 +975,9 @@ export const openSlackDelivery = (
     ),
     toolNames: new Map(),
   });
+  if (abandoned) {
+    await failAbandonedRecord(existing, token, fetcher);
+  }
 };
 
 export const applySlackDeliveryEvent = (
@@ -971,21 +1007,6 @@ export const applySlackDeliveryEvent = (
   }
   applyRecordEvent(record, event);
   store.save(instanceId, record);
-};
-
-const replaySlackFailure = async (
-  binding: SlackDeliveryBinding,
-  token: string,
-  events: readonly SlackDeliveryEvent[],
-  fetcher: Fetcher = fetch,
-): Promise<void> => {
-  const stream = createSlackStream(
-    streamTargetFromBinding(binding),
-    token,
-    fetcher,
-  );
-  feedSlackStream(stream, events);
-  await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
 };
 
 export const failSlackDelivery = async (
