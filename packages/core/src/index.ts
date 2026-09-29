@@ -4,6 +4,7 @@ export {
   createApprovalFetch,
   createApprovalNotifier,
   createApprovalStore,
+  decisionMessage,
   handleApprovalInteraction,
 } from "./approval.ts";
 export type {

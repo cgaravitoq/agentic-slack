@@ -1,6 +1,7 @@
 import {
   createApprovalNotifier,
   createApprovalStore,
+  decisionMessage,
   handleApprovalInteraction,
   refreshRetention,
   slackDeliveryBindingSchema,
@@ -14,14 +15,6 @@ import type {
 import { init } from "@flue/runtime";
 import * as v from "valibot";
 import { SlackAgent } from "./agent.ts";
-
-const decisionBody = (
-  request: ApprovalRequest,
-  decision: ApprovalDecision,
-): string =>
-  decision === "approve"
-    ? `A person approved your call to ${request.tool} with exactly these arguments: ${request.args}. Call that tool again now with exactly those arguments; the approval covers that call alone.`
-    : `A person rejected your call to ${request.tool} with these arguments: ${request.args}. It was not executed: do not call it again, and tell the user it was rejected.`;
 
 const dispatchDecision = async (
   request: ApprovalRequest,
@@ -49,7 +42,7 @@ const dispatchDecision = async (
         message_ts: request.messageTs,
         user: request.requesterId,
       },
-      body: decisionBody(request, decision),
+      body: decisionMessage(request, decision),
       kind: "signal",
       type: "slack.approval",
     },

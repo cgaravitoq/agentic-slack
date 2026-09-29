@@ -4,6 +4,7 @@ import {
   canonicalJson,
   createApprovalFetch,
   createApprovalNotifier,
+  decisionMessage,
   handleApprovalInteraction,
 } from "@agentic-slack/core";
 import type {
@@ -32,7 +33,7 @@ const GATED = "create_organization";
 const PENDING_TEXT =
   "This call requires human approval: an Approve/Reject request for exactly this call is open in the Slack thread and nothing has been executed. Tell the user you are waiting for a person to approve it, and do not repeat this call while you wait. Once the approval arrives as a new message, call the tool again with exactly the same arguments.";
 const REJECTED_TEXT =
-  "The operator rejected exactly this call, so it was not executed. Tell the user it was rejected, and request it again only if they ask.";
+  "A person rejected exactly this call, so it was not executed. The same call stays refused until ten minutes after it was requested: tell the user it was rejected and do not repeat it.";
 const EXECUTED_TEXT =
   "Exactly this call was already approved and executed. Do not repeat it.";
 const NO_THREAD_TEXT =
@@ -450,6 +451,15 @@ const interactionFor = (request: ApprovalRequest = pendingRequest()) => {
 };
 
 describe("approval interactions", () => {
+  test("tells the model the same refusal the gate gives for a rejected call", () => {
+    expect(decisionMessage(pendingRequest(), "reject")).toBe(
+      `A person rejected your call to ${GATED} with these arguments: {"domain":"acme.test"}. ${REJECTED_TEXT}`,
+    );
+    expect(decisionMessage(pendingRequest(), "approve")).toBe(
+      `A person approved your call to ${GATED} with exactly these arguments: {"domain":"acme.test"}. Call that tool again now with exactly those arguments; the approval covers that call alone.`,
+    );
+  });
+
   test("stores the decision before the model hears of it", async () => {
     const approving = interactionFor();
     await approving.seed();

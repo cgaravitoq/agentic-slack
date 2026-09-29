@@ -352,11 +352,19 @@ export interface ApprovalGateContext {
 const REFUSAL_PENDING =
   "This call requires human approval: an Approve/Reject request for exactly this call is open in the Slack thread and nothing has been executed. Tell the user you are waiting for a person to approve it, and do not repeat this call while you wait. Once the approval arrives as a new message, call the tool again with exactly the same arguments.";
 const REFUSAL_REJECTED =
-  "The operator rejected exactly this call, so it was not executed. Tell the user it was rejected, and request it again only if they ask.";
+  "A person rejected exactly this call, so it was not executed. The same call stays refused until ten minutes after it was requested: tell the user it was rejected and do not repeat it.";
 const REFUSAL_EXECUTED =
   "Exactly this call was already approved and executed. Do not repeat it.";
 const REFUSAL_NO_THREAD =
   "This call requires human approval, but this conversation has no Slack thread to ask in, so it was not executed.";
+
+export const decisionMessage = (
+  request: ApprovalRequest,
+  decision: ApprovalDecision,
+): string =>
+  decision === "approve"
+    ? `A person approved your call to ${request.tool} with exactly these arguments: ${request.args}. Call that tool again now with exactly those arguments; the approval covers that call alone.`
+    : `A person rejected your call to ${request.tool} with these arguments: ${request.args}. ${REFUSAL_REJECTED}`;
 
 const refusalText = (state: ApprovalState): string => {
   if (state === "rejected") {

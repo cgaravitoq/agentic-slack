@@ -116,6 +116,7 @@ The bot posts an Approve/Reject card carrying that exact tool and its arguments 
 Only the person who asked can decide, only from that thread, and only within ten minutes.
 Approving runs the call once, when the model repeats it with the same arguments; a second click, an expired request, a rejection, and a call with different arguments never run it.
 Rejecting tells the model the call was rejected so it can tell the user.
+The same call stays refused until ten minutes after it was requested; repeating it after that posts a new card.
 Slack interactivity has to be enabled for the app: `bun run manifest` enables it at `/channels/slack/interactions` as soon as one server requires approval.
 
 ### Add a skill
