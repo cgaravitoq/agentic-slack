@@ -2,6 +2,7 @@ import { env, waitUntil } from "cloudflare:workers";
 import {
   CLOUDFLARE_TRACING_CONTENT,
   refreshRetention,
+  requiresApproval,
   slackDeliveryBinding,
   streamTargetFor,
 } from "@agentic-slack/core";
@@ -74,5 +75,7 @@ export default createApp(
     });
   },
   createLifecycleHandler(config, trusted.botToken),
-  createApprovalHandler(trusted.botToken),
+  requiresApproval(config)
+    ? createApprovalHandler(trusted.botToken)
+    : undefined,
 );

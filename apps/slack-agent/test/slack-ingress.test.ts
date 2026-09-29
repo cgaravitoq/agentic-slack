@@ -442,6 +442,22 @@ describe("approval interactions", () => {
       );
     expect(response.status).toBe(500);
   });
+
+  // The route is mounted only when a decision handler exists, so a deployment
+  // with no gated tool does not expose an endpoint that can only answer 200.
+  test("does not mount the interactions route without a decision handler", async () => {
+    const channel = createSlackIngress(trusted, () => Promise.resolve());
+
+    const response = await channel
+      .route()
+      .request(
+        await signedInteraction(blockActions),
+        undefined,
+        testBindings(new FakeD1()),
+      );
+
+    expect(response.status).toBe(404);
+  });
 });
 
 describe("assistant thread lifecycle", () => {

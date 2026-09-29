@@ -201,6 +201,10 @@ export const createSlackIngress = (
       trusted.teamId &&
       trusted.appId,
   );
+  const interactions = handleInteraction;
+  // `createSlackChannel` mounts `/interactions` only for a handler it is given,
+  // so a deployment with no decision handler exposes no endpoint whose only
+  // answer is 200.
   const channel = createSlackChannel<SlackCoreEnv>({
     async events({ c, payload }): Promise<Response> {
       if (!identityComplete) {
@@ -228,24 +232,26 @@ export const createSlackIngress = (
       }
       return await claimThenAcknowledge(c.env.DB, routed.eventId, run);
     },
-    async interactions({ c, payload }): Promise<Response> {
-      if (
-        !identityComplete ||
-        !handleInteraction ||
-        payload.type !== "block_actions" ||
-        payload.team?.id !== trusted.teamId ||
-        payload.api_app_id !== trusted.appId
-      ) {
-        return ack(200);
-      }
-      try {
-        await handleInteraction(payload, c.env);
-        return ack(200);
-      } catch (error: unknown) {
-        console.error("Slack interaction handling failed", error);
-        return ack(500);
-      }
-    },
+    interactions:
+      interactions === undefined
+        ? undefined
+        : async ({ c, payload }): Promise<Response> => {
+            if (
+              !identityComplete ||
+              payload.type !== "block_actions" ||
+              payload.team?.id !== trusted.teamId ||
+              payload.api_app_id !== trusted.appId
+            ) {
+              return ack(200);
+            }
+            try {
+              await interactions(payload, c.env);
+              return ack(200);
+            } catch (error: unknown) {
+              console.error("Slack interaction handling failed", error);
+              return ack(500);
+            }
+          },
     signingSecret: identityComplete
       ? trusted.signingSecret
       : DISABLED_SIGNING_SECRET,

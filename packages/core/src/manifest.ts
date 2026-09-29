@@ -1,13 +1,12 @@
 import type { ResolvedAgentConfig } from "./config.ts";
+import { requiresApproval } from "./config.ts";
 
 export const generateSlackManifest = (
   config: ResolvedAgentConfig,
   deployedUrl: string,
 ): string => {
   const { origin } = new URL(deployedUrl);
-  const requiresApproval = config.mcpServers.some(
-    (server) => (server.requireApproval?.length ?? 0) > 0,
-  );
+  const gatesACall = requiresApproval(config);
   return JSON.stringify(
     {
       display_information: {
@@ -38,7 +37,7 @@ export const generateSlackManifest = (
           bot_events: ["app_mention", "assistant_thread_started", "message.im"],
           request_url: `${origin}/channels/slack/events`,
         },
-        interactivity: requiresApproval
+        interactivity: gatesACall
           ? {
               is_enabled: true,
               request_url: `${origin}/channels/slack/interactions`,
