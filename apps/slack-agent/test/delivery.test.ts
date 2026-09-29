@@ -1783,6 +1783,38 @@ describe("durable Slack delivery", () => {
     expect(store.load("dm")?.binding.threadTs).toBe("183.3");
   });
 
+  // The runtime starts a response's `useAgentStart()` hooks together, so two
+  // deliveries can open the same instance before either has settled the
+  // interrupted record. The fresh record must take the instance's slot first,
+  // or the second open replaces it and its thread is the one left out.
+  test("settles an interrupted record once when two turns open together", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const first = slackDeliveryBinding(privateTarget);
+    const third = { ...first, threadTs: "183.3" };
+    const fourth = { ...first, threadTs: "184.4" };
+    await openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    evictLiveSlackDelivery("dm");
+    await Promise.all([
+      openSlackDelivery(store, "dm", third, BOT_TOKEN, slack.fetcher),
+      openSlackDelivery(store, "dm", fourth, BOT_TOKEN, slack.fetcher),
+    ]);
+    applySlackDeliveryEvent(store, "dm", { text: "reply", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
+
+    expect(startStreamThreads(slack).toSorted()).toEqual([
+      "171.2",
+      "183.3",
+      "184.4",
+    ]);
+    expect(slack.markdown()).toBe(`${SLACK_STREAM_FAILURE_NOTICE}replyreply`);
+    const record = store.load("dm");
+    expect([
+      record?.binding.threadTs,
+      ...(record?.joinedBindings ?? []).map((binding) => binding.threadTs),
+    ]).toEqual(["183.3", "184.4"]);
+  });
+
   test("replays durable tool events in record order and the reply text exactly once", async () => {
     const slack = createFakeSlack();
     const store = memoryStore();
