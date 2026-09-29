@@ -252,6 +252,29 @@ describe("D1 migration schema", () => {
     ]);
   });
 
+  test("sweeps against the wall clock in seconds when no clock is injected", async () => {
+    const { db } = migrated();
+    const seed = (eventId: string, age: number) =>
+      db
+        .prepare(
+          "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch() - ?2)",
+        )
+        .bind(eventId, age)
+        .run();
+    await seed("Ev-expired", retentionSeconds + 60);
+    await seed("Ev-recent", retentionSeconds - 60);
+
+    expect(await claimEvent(db, "Ev-claimed")).toBe(true);
+
+    const { results } = await db
+      .prepare("SELECT event_id FROM seen_events ORDER BY event_id")
+      .all();
+    expect(results).toEqual([
+      { event_id: "Ev-claimed" },
+      { event_id: "Ev-recent" },
+    ]);
+  });
+
   test("sweeps one batch at a time and leaves the remainder behind", async () => {
     const { db } = migrated();
     const now = 1_700_000_000;
