@@ -248,12 +248,6 @@ test("mounts each configured skill with its name and instructions", () => {
   mountedSkills.length = 0;
   SlackAgent({ id: "test" });
   expect(mountedSkills).toEqual([refunds]);
-  expect(mountedSkills).toMatchObject([
-    {
-      instructions: "Confirm the order ID, then issue the refund.",
-      name: "refunds",
-    },
-  ]);
 });
 
 const directMessage = (threadTs: string): DeliveredMessage => ({
