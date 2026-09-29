@@ -1,5 +1,10 @@
 import { expect, mock, test } from "bun:test";
-import type { DeliveredMessage, McpConnectionDefinition } from "@flue/runtime";
+import { defineSkill } from "@flue/runtime";
+import type {
+  DeliveredMessage,
+  McpConnectionDefinition,
+  Skill,
+} from "@flue/runtime";
 import * as v from "valibot";
 import { composeInstructions, defineAgentConfig } from "@agentic-slack/core";
 import type { ExpiryPayload, ExpirySchedule } from "@agentic-slack/core";
@@ -26,10 +31,18 @@ const shippedPrompts = config.suggestedPrompts.map((prompt) => ({
   message: prompt.message,
   title: prompt.title,
 }));
+const shippedMcpServers = [...config.mcpServers];
+const shippedSkills = [...config.skills];
 
 // Every field differs from both the shipped values in agent.config.ts and the
 // defaults in packages/core/src/config.ts, so a runtime that ignores the
 // operator config and falls back to either cannot satisfy the runtime tests.
+const refunds = defineSkill({
+  description:
+    "Process a customer refund request. Use when a customer disputes a charge.",
+  instructions: "Confirm the order ID, then issue the refund.",
+  name: "refunds",
+});
 const operatorConfig = defineAgentConfig({
   description: "Exercises operator configuration.",
   mcpServers: [
@@ -48,6 +61,7 @@ const operatorConfig = defineAgentConfig({
     channelDays: 9,
     privateDays: 3,
   },
+  skills: [refunds],
 });
 
 class RecordingAgent {
@@ -99,6 +113,7 @@ interface WiredRetentionAgent extends RecordingAgent {
 
 const instructions: string[] = [];
 const mcpConnections: McpConnectionDefinition[] = [];
+const mountedSkills: Skill[] = [];
 let resolvedModel = "";
 const userMessage: DeliveredMessage = { body: "", kind: "user" };
 let delivery: DeliveredMessage = userMessage;
@@ -135,6 +150,7 @@ await mock.module("@flue/runtime", () => ({
   useModel: (model: string) => {
     resolvedModel = model;
   },
+  useSkill: (skill: Skill) => mountedSkills.push(skill),
 }));
 // The spread keeps the mocked export list as wide as the real module: Bun
 // freezes it on first use, so a narrow mock breaks whichever test file loads
@@ -193,6 +209,11 @@ test("ships the pinned model, retention, and identity literals", () => {
   );
 });
 
+test("ships no MCP servers and no skills", () => {
+  expect(shippedMcpServers).toEqual([]);
+  expect(shippedSkills).toEqual([]);
+});
+
 test("uses the model and owner instructions from the operator config", () => {
   expect(SlackAgent({ id: "test" })).toBe(
     "Configured Agent: Exercises operator configuration.",
@@ -221,6 +242,18 @@ test("mounts each configured MCP server with its bearer read from the Worker sec
     optional: true,
     url: "https://docs.example.test/mcp",
   });
+});
+
+test("mounts each configured skill with its name and instructions", () => {
+  mountedSkills.length = 0;
+  SlackAgent({ id: "test" });
+  expect(mountedSkills).toEqual([refunds]);
+  expect(mountedSkills).toMatchObject([
+    {
+      instructions: "Confirm the order ID, then issue the refund.",
+      name: "refunds",
+    },
+  ]);
 });
 
 const directMessage = (threadTs: string): DeliveredMessage => ({

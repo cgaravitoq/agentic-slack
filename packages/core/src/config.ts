@@ -1,3 +1,5 @@
+import type { Skill } from "@flue/runtime";
+
 export const PRIVATE_RETENTION_DAYS = 7;
 export const CHANNEL_RETENTION_DAYS = 15;
 export const MODEL = "cloudflare/@cf/zai-org/glm-4.7-flash";
@@ -28,6 +30,7 @@ export interface AgentConfig {
   };
   model?: string;
   mcpServers?: readonly McpServerConfig[];
+  skills?: readonly Skill[];
 }
 
 export interface ResolvedAgentConfig {
@@ -41,6 +44,7 @@ export interface ResolvedAgentConfig {
   };
   model: string;
   mcpServers: readonly McpServerConfig[];
+  skills: readonly Skill[];
 }
 
 const resolveSuggestedPrompt = (prompt: SuggestedPrompt): SuggestedPrompt => {
@@ -83,6 +87,17 @@ const resolveMcpServers = (
     names.add(name);
   }
   return Object.freeze(resolved);
+};
+
+const resolveSkills = (skills: readonly Skill[]): readonly Skill[] => {
+  const names = new Set<string>();
+  for (const { name } of skills) {
+    if (names.has(name)) {
+      throw new Error(`Agent skill ${name} is configured twice`);
+    }
+    names.add(name);
+  }
+  return Object.freeze([...skills]);
 };
 
 const resolveRetentionDays = (
@@ -135,6 +150,7 @@ export const defineAgentConfig = (config: AgentConfig): ResolvedAgentConfig => {
         PRIVATE_RETENTION_DAYS,
       ),
     }),
+    skills: resolveSkills(config.skills ?? []),
     suggestedPrompts: Object.freeze(suggestedPrompts),
   });
 };
