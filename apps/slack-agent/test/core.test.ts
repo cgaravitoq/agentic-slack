@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
+import { defineSkill } from "@flue/runtime";
 import * as v from "valibot";
 
 import {
@@ -608,5 +609,46 @@ describe("MCP servers", () => {
         ],
       }),
     ).toThrow("Agent MCP server crm is configured twice");
+  });
+});
+
+describe("Agent Skills", () => {
+  const required = {
+    description: "Mounts operator skills.",
+    name: "Skilled Agent",
+    ownerInstructions: "Use the mounted skills.",
+  };
+  const refunds = defineSkill({
+    description:
+      "Process a customer refund request. Use when a customer disputes a charge.",
+    instructions: "Confirm the order ID, then issue the refund.",
+    name: "refunds",
+  });
+
+  test("mounts no skills unless the operator configures them", () => {
+    expect(config.skills).toEqual([]);
+    expect(Object.isFrozen(config.skills)).toBe(true);
+  });
+
+  test("keeps the configured skills in order", () => {
+    const configured = defineAgentConfig({ ...required, skills: [refunds] });
+    expect(configured.skills).toEqual([refunds]);
+    expect(Object.isFrozen(configured.skills)).toBe(true);
+  });
+
+  test("rejects the same skill name configured twice", () => {
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        skills: [
+          refunds,
+          defineSkill({
+            description: "Escalate an unresolved case to a specialist.",
+            instructions: "Summarize the case, then hand it off.",
+            name: "refunds",
+          }),
+        ],
+      }),
+    ).toThrow("Agent skill refunds is configured twice");
   });
 });

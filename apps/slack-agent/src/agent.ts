@@ -27,6 +27,7 @@ import {
   useInstruction,
   useMcpConnection,
   useModel,
+  useSkill,
 } from "@flue/runtime";
 import type {
   AgentProps,
@@ -86,6 +87,9 @@ export const SlackAgent = (props: AgentProps) => {
   useModel(config.model);
   for (const instruction of composeInstructions(config)) {
     useInstruction(instruction);
+  }
+  for (const skill of config.skills) {
+    useSkill(skill);
   }
   for (const { authSecret, ...server } of config.mcpServers) {
     const connection: McpConnectionDefinition = { ...server };
