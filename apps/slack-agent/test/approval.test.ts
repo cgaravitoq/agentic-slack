@@ -30,9 +30,9 @@ const CONVERSATION = "slack:v1:T1:D1:D1";
 const GATED = "create_organization";
 
 const PENDING_TEXT =
-  "This call requires human approval: an Approve/Reject request for exactly this call is open in the Slack thread and nothing has been executed. Tell the user you are waiting for a person to approve it, and do not call this tool again until the approval arrives.";
+  "This call requires human approval: an Approve/Reject request for exactly this call is open in the Slack thread and nothing has been executed. Tell the user you are waiting for a person to approve it, and do not repeat this call while you wait. Once the approval arrives as a new message, call the tool again with exactly the same arguments.";
 const REJECTED_TEXT =
-  "The operator rejected exactly this call, so it was not executed. Tell the user it was rejected and do not call it again.";
+  "The operator rejected exactly this call, so it was not executed. Tell the user it was rejected, and request it again only if they ask.";
 const EXECUTED_TEXT =
   "Exactly this call was already approved and executed. Do not repeat it.";
 const NO_THREAD_TEXT =
