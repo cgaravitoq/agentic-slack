@@ -37,6 +37,7 @@ The core owns Slack admission and delivery, deduplication, retention helpers, an
 The application selects Workers AI and connects the Flue agent lifecycle to durable delivery and retention.
 
 The operator surface is `apps/slack-agent/agent.config.ts`: name, description, owner instructions, suggested prompts, retention, model, MCP servers, and skills.
+An operator repository that pins this one can keep that file outside it; see [Consume a pinned copy](#consume-a-pinned-copy).
 
 The Worker claims the event in D1 and dispatches the turn to the Durable Object before it acknowledges, so an event Slack is told to stop retrying is already admitted durably.
 The claimed turn refreshes retention and fires a best-effort `:eyes:` reaction on channel mentions before the dispatch.
@@ -266,6 +267,43 @@ The Slack secrets stay on the Worker and are provisioned separately.
 Protect your integration branch with the `verify` status check and restrict the `staging` environment to deployments from `staging`.
 This repository currently develops on `staging`; there is no tagged stable release yet.
 Do not use `main` as a substitute for a tested release without comparing its revision.
+
+## Consume a pinned copy
+
+An operator repository can pin this repository, for example as a git submodule, and keep its own agent configuration, skills, and deployment configuration outside it.
+That way a deployment consumes a commit of this repository instead of forking it, and never edits a file inside it.
+
+```text
+operator-repo/
+├─ agentic-slack/          # this repository, pinned to a commit
+├─ skills/
+│  └─ refunds/SKILL.md
+├─ agent.config.ts
+└─ wrangler.deploy.json
+```
+
+Build with `AGENT_CONFIG` set to your configuration file, from the root of the pinned repository:
+
+```sh
+AGENT_CONFIG="$HOME/operator-repo/agent.config.ts" bun run deploy:dry
+```
+
+`AGENT_CONFIG` takes an absolute path or a path relative to the working directory, and it defaults to `apps/slack-agent/agent.config.ts`, so the in-repo configuration stays in effect when the variable is unset.
+The development server reads it the same way.
+Reach `defineAgentConfig` and your skills through the pinned tree, so your configuration typechecks against `AgentConfig` from `@agentic-slack/core` and the build packages each skill's `SKILL.md` and supporting files:
+
+```ts
+import { defineAgentConfig } from "./agentic-slack/packages/core/src/index.ts";
+import refunds from "./skills/refunds/SKILL.md";
+
+export default defineAgentConfig({
+  // ...the rest of your configuration
+  skills: [refunds],
+});
+```
+
+A dependency that resolves `@agentic-slack/core` through your own `node_modules` works too.
+`bun run manifest` and the `db:migrate:*` scripts still read the in-repo configuration and the in-repo Wrangler files.
 
 ## Security and support
 
