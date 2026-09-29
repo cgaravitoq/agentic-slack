@@ -45,6 +45,7 @@ The model turn and Slack delivery run later on the Durable Object from durable s
 The stream destination rides in each dispatched message's attributes, set by the Worker and read back with `useDelivery()`, so the model cannot influence it and every DM reply reaches its own thread.
 Flue answers a message that arrives while the conversation is busy inside the running response, so one response can carry several requesting threads.
 The delivery record keeps every one of those destinations and delivers the reply to each, which is what keeps a burst of DMs from leaving all but the first unanswered.
+A tool the operator gates with `requireApproval` is stopped inside its MCP connection: the Worker records the request in D1 and posts the Approve/Reject card, and only the approved call is forwarded to the server.
 
 ## Delivery
 
@@ -80,6 +81,7 @@ export default defineAgentConfig({
     {
       authSecret: "CRM_MCP_TOKEN",
       name: "crm",
+      requireApproval: ["create_organization"],
       tools: ["create_organization", "find_organization"],
       url: "https://mcp.internal.example.com/mcp",
     },
@@ -94,6 +96,7 @@ Each entry takes these fields:
 - `authSecret` (optional): the name of a Worker secret holding the bearer token, read on each request so a rotated token needs no redeploy.
 - `tools` (optional): an allowlist of tool names to mount; the connection fails if the server does not expose one of them.
 - `optional` (optional): when `true`, an unreachable server leaves the turn running without its tools instead of failing it.
+- `requireApproval` (optional): tool names whose calls wait for a person's Approve/Reject in the Slack thread; every name must appear in `tools` when that allowlist is set.
 
 The model sees a mounted tool as `mcp__<name>__<tool>`, so the `crm` entry above exposes `mcp__crm__create_organization`.
 Store the token as a Worker secret rather than in the config file:
@@ -105,6 +108,15 @@ bunx wrangler secret put CRM_MCP_TOKEN --config apps/slack-agent/wrangler.deploy
 Enter the token at Wrangler's prompt.
 An MCP server you connect influences your agent: its tool descriptions enter the prompt and its tool results enter the conversation.
 Treat a server you do not control like any other third-party dependency, and use `tools` to bound what it exposes.
+
+### Approve a call before it runs
+
+A tool named in `requireApproval` still mounts, so the model can call it, but the call is stopped on its way to the MCP server.
+The bot posts an Approve/Reject card carrying that exact tool and its arguments into the thread that asked, and answers the model that nothing has been executed.
+Only the person who asked can decide, only from that thread, and only within ten minutes.
+Approving runs the call once, when the model repeats it with the same arguments; a second click, an expired request, a rejection, and a call with different arguments never run it.
+Rejecting tells the model the call was rejected so it can tell the user.
+Slack interactivity has to be enabled for the app: `bun run manifest` enables it at `/channels/slack/interactions` as soon as one server requires approval.
 
 ### Add a skill
 
@@ -176,7 +188,7 @@ Keep the `flue-class-FlueSlackAgentAgent` SQLite migration: Flue injects the Dur
 bun run db:migrate:staging
 ```
 
-This applies the checked-in deduplication schema to the database in your local deployment configuration.
+This applies the checked-in deduplication and approval schemas to the database in your local deployment configuration.
 `bun run db:migrate:local` only migrates the local development store.
 
 ### 3. Create the Slack app
@@ -220,7 +232,8 @@ Replace the example URL with your deployed Worker URL in both commands.
 Paste the generated JSON into the existing Slack app's **App Manifest** and save it.
 If Slack requests reinstallation or URL verification, complete it after the Worker secrets and IDs are configured.
 The event endpoint is `/channels/slack/events`.
-The manifest enables the Messages tab, agent messaging, mentions, DMs, and assistant thread events; interactivity, org deploy, socket mode, and token rotation remain disabled.
+The manifest enables the Messages tab, agent messaging, mentions, DMs, and assistant thread events; it enables interactivity at `/channels/slack/interactions` as soon as one MCP server requires approval.
+Org deploy, socket mode, and token rotation remain disabled.
 A ready health response is `{"status":"ready"}`; HTTP 503 lists missing binding names without revealing values.
 
 ### 5. Check the first conversation
@@ -257,6 +270,7 @@ Do not use `main` as a substitute for a tested release without comparing its rev
 Slack requests pass signature verification and must match the configured workspace and app before a turn is admitted.
 Any eligible human in that workspace who can reach the installed app can interact with it; there is no per-user allowlist.
 Delivery destinations come from trusted event data, not model output.
+A tool the operator gates with `requireApproval` reaches its MCP server only after the person who asked approves that exact call in the thread it came from.
 Instructions and output filtering reduce accidental disclosure but do not make untrusted prompts safe to receive credentials.
 Conversation data is processed by Slack and Cloudflare, including Workers AI.
 Tracing is enabled with model content capture disabled in the application configuration.
