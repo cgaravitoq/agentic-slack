@@ -183,9 +183,9 @@ export const createApprovalStore = (db: D1Database): ApprovalStore => ({
   async decide(requestId, state, userId, now) {
     const result = await db
       .prepare(
-        "UPDATE approval_requests SET state = ?1, decided_at = ?2, decided_by = ?3 WHERE request_id = ?4 AND state = 'pending'",
+        "UPDATE approval_requests SET state = ?1, decided_at = ?2, decided_by = ?3, expires_at = CASE WHEN ?1 = 'approved' THEN ?2 + ?5 ELSE expires_at END WHERE request_id = ?4 AND state = 'pending'",
       )
-      .bind(state, now, userId, requestId)
+      .bind(state, now, userId, requestId, APPROVAL_TTL_SECONDS)
       .run();
     return changes(result) === 1;
   },

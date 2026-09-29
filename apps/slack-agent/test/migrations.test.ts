@@ -427,6 +427,22 @@ describe("approval request storage", () => {
     ]);
   });
 
+  test("gives an approval a full window from the click and keeps a rejection on the request window", async () => {
+    const { db } = migrated();
+    const store = createApprovalStore(db);
+    const lateClick = NOW + APPROVAL_TTL_SECONDS - 10;
+    await store.create(pendingApproval({ requestId: "req-approved" }));
+    await store.create(pendingApproval({ requestId: "req-rejected" }));
+
+    await store.decide("req-approved", "approved", "U1", lateClick);
+    await store.decide("req-rejected", "rejected", "U1", lateClick);
+
+    const approved = await store.read("req-approved");
+    const rejected = await store.read("req-rejected");
+    expect(approved?.expiresAt).toBe(lateClick + APPROVAL_TTL_SECONDS);
+    expect(rejected?.expiresAt).toBe(NOW + APPROVAL_TTL_SECONDS);
+  });
+
   test("executes an approved request exactly once and never a pending or rejected one", async () => {
     const { db } = migrated();
     const store = createApprovalStore(db);

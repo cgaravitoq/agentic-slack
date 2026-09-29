@@ -83,12 +83,15 @@ const memoryStore = () => {
       rows.push({ ...request });
       return Promise.resolve();
     },
-    decide(requestId, state) {
+    decide(requestId, state, _userId, now) {
       const row = find(requestId);
       if (row?.state !== "pending") {
         return Promise.resolve(false);
       }
       row.state = state;
+      if (state === "approved") {
+        row.expiresAt = now + APPROVAL_TTL_SECONDS;
+      }
       return Promise.resolve(true);
     },
     latest(conversationId, tool, args) {
