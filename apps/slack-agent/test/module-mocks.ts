@@ -50,10 +50,17 @@ export interface MockedWorkerEnv {
   SLACK_TEAM_ID?: string;
 }
 
+export const workerWaitUntil: Promise<unknown>[] = [];
+
 export const mockCloudflareWorkers = async (
   env: MockedWorkerEnv,
 ): Promise<void> => {
-  await mock.module("cloudflare:workers", () => ({ env }));
+  await mock.module("cloudflare:workers", () => ({
+    env,
+    waitUntil: (promise: Promise<unknown>) => {
+      workerWaitUntil.push(promise);
+    },
+  }));
 };
 
 export const mockWorkersAi = async (): Promise<void> => {

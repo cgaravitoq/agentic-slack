@@ -1,4 +1,4 @@
-import { env } from "cloudflare:workers";
+import { env, waitUntil } from "cloudflare:workers";
 import {
   CLOUDFLARE_TRACING_CONTENT,
   refreshRetention,
@@ -50,8 +50,10 @@ export default createApp(
         },
         method: "POST",
       });
+      // The ingress answers Slack as soon as the dispatch resolves, and the
+      // runtime cancels a subrequest still in flight after the response.
       // oxlint-disable-next-line promise/prefer-await-to-then
-      void reaction.catch(() => null);
+      waitUntil(reaction.catch(() => null));
     }
     const handle = init(SlackAgent, { id: instanceId });
     await handle.dispatch({
