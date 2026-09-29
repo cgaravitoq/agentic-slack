@@ -2179,6 +2179,65 @@ describe("durable Slack delivery", () => {
     ]);
   });
 
+  // The fail path replays the record's text events in record order and the
+  // finish path posts the merged reply text, so the two sources stop agreeing
+  // past the durable cap: the concatenated events keep growing while the
+  // merged text is clipped. What the user reads must not depend on which path
+  // closed the record.
+  test("replays the same reply text on both durable paths past the durable cap", async () => {
+    const answer = markedAnswer(6007);
+    const events: SlackDeliveryEvent[] = [
+      { text: answer.slice(0, 4000), type: "text" },
+      { id: "call-1", name: "search_docs", type: "tool-start" },
+      { text: answer.slice(4000), type: "text" },
+    ];
+    const expected = `${answer.slice(0, MAX_SLACK_MESSAGE_LENGTH - 20)}\n\n(truncated)`;
+    const finishSlack = createFakeSlack();
+    const finishStore = serializingStore();
+    await openSlackDelivery(
+      finishStore,
+      "finished",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      finishSlack.fetcher,
+    );
+    evictLiveSlackDelivery("finished");
+    const failSlack = createFakeSlack();
+    const failStore = serializingStore();
+    await openSlackDelivery(
+      failStore,
+      "failed",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      failSlack.fetcher,
+    );
+    evictLiveSlackDelivery("failed");
+    for (const event of events) {
+      applySlackDeliveryEvent(finishStore, "finished", event);
+      applySlackDeliveryEvent(failStore, "failed", event);
+    }
+    const finished = finishStore.load("finished");
+    const failed = failStore.load("failed");
+    expect(finished).toEqual(failed);
+    expect(finished?.replyText.length).toBe(
+      MAX_SLACK_MESSAGE_LENGTH + STREAM_TAIL_LENGTH,
+    );
+
+    await finishSlackDelivery(
+      finishStore,
+      "finished",
+      BOT_TOKEN,
+      finishSlack.fetcher,
+    );
+    await failSlackDelivery(failStore, "failed", BOT_TOKEN, failSlack.fetcher);
+
+    expect(finished?.replyText).not.toContain("<TAIL");
+    expect(finishSlack.markdown()).toBe(expected);
+    expect(failSlack.markdown()).toBe(
+      `${expected}${SLACK_STREAM_FAILURE_NOTICE}`,
+    );
+  });
+
   test("does not throw or double-post when finish hits a Slack error and is retried", async () => {
     const slack = createFakeSlack({ "chat.stopStream": "channel_not_found" });
     const store = memoryStore();
