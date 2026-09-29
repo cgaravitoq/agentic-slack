@@ -271,7 +271,14 @@ globalThis.fetch = capturingFetch;
 
 const workerModule = await import("../src/index.ts");
 const app = workerModule.default;
-const { SlackAgent } = await import("../src/agent.ts");
+// agent.ts registers its observer once, when first evaluated, and another test
+// file may have evaluated it under its own runtime mock; the query gives this
+// file an instance that registers against the mock above.
+const agentSpecifier = "../src/agent.ts?worker-stream";
+const { SlackAgent } = v.parse(
+  v.object({ SlackAgent: v.function() }),
+  await import(agentSpecifier),
+);
 
 class FakeD1 {
   private readonly seen = new Set<string>();
