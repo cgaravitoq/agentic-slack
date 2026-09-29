@@ -142,26 +142,30 @@ await mock.module("@flue/runtime", () => ({
   instrument: () => {},
   setProvider: () => {},
 }));
-const sqlRows = new Map<string, string>();
-let createTableCount = 0;
-let saveCount = 0;
-const fakeSql = {
-  exec(query: string, ...bindings: unknown[]) {
-    if (query.includes("CREATE TABLE")) {
-      createTableCount += 1;
+const createFakeSql = () => {
+  const rows = new Map<string, string>();
+  const counts = { createTable: 0, save: 0 };
+  const sql = {
+    exec(query: string, ...bindings: unknown[]) {
+      if (query.includes("CREATE TABLE")) {
+        counts.createTable += 1;
+        return { toArray: () => [] };
+      }
+      if (query.trimStart().startsWith("SELECT")) {
+        const payload = rows.get(String(bindings[0]));
+        return {
+          toArray: () => (payload === undefined ? [] : [{ payload }]),
+        };
+      }
+      counts.save += 1;
+      rows.set(String(bindings[0]), String(bindings[1]));
       return { toArray: () => [] };
-    }
-    if (query.trimStart().startsWith("SELECT")) {
-      const payload = sqlRows.get(String(bindings[0]));
-      return {
-        toArray: () => (payload === undefined ? [] : [{ payload }]),
-      };
-    }
-    saveCount += 1;
-    sqlRows.set(String(bindings[0]), String(bindings[1]));
-    return { toArray: () => [] };
-  },
+    },
+  };
+  return { counts, rows, sql };
 };
+const firstObjectSql = createFakeSql();
+let activeSql = firstObjectSql;
 const cloudflare = await import("@flue/runtime/cloudflare");
 await mock.module("@flue/runtime/cloudflare", () => ({
   ...cloudflare,
@@ -169,7 +173,7 @@ await mock.module("@flue/runtime/cloudflare", () => ({
   extend: () => ({ base: undefined }),
   getCloudflareContext: () => ({
     env: {},
-    storage: { sql: fakeSql },
+    storage: { sql: activeSql.sql },
   }),
 }));
 await mockWorkersAi();
@@ -468,7 +472,7 @@ const deliverFromAlarm = async (evictLive = false): Promise<void> => {
   const instanceId = last?.instanceId ?? "";
   const binding = v.parse(
     slackDeliveryBindingSchema,
-    last?.request.initialData,
+    last?.request.message.attributes,
   );
   startSlackTurnDelivery(instanceId, binding);
   if (evictLive) {
@@ -519,17 +523,23 @@ const streamAuthorizations = () => [
   ),
 ];
 
+const streamChunk = v.object({
+  text: v.optional(v.string()),
+  type: v.string(),
+});
+
+const streamChunks = () =>
+  bodiesFor("chat.appendStream").flatMap((body) =>
+    v.is(v.array(streamChunk), body.chunks) ? body.chunks : [],
+  );
+
 const streamedMarkdown = () =>
-  bodiesFor("chat.appendStream")
-    .map((body) =>
-      v.is(v.string(), body.markdown_text) ? body.markdown_text : "",
-    )
+  streamChunks()
+    .map((chunk) => (chunk.type === "markdown_text" ? (chunk.text ?? "") : ""))
     .join("");
 
-const taskChunks = () =>
-  bodiesFor("chat.appendStream").flatMap((body) =>
-    v.is(v.array(v.unknown()), body.chunks) ? body.chunks : [],
-  );
+const taskChunks = (): unknown[] =>
+  streamChunks().filter((chunk) => chunk.type === "task_update");
 
 beforeEach(() => {
   slackCalls.length = 0;
@@ -541,7 +551,7 @@ beforeEach(() => {
   toolChunks = [];
   replyText = "";
   runFailure = undefined;
-  sqlRows.clear();
+  firstObjectSql.rows.clear();
   evictLiveSlackDelivery();
 });
 
@@ -553,20 +563,41 @@ test("builds the durable delivery store once and flushes it on the coalesce boun
   deltas = ["warm"];
   replyText = "warm";
   expect(await runTurn("Ev-store-warm")).toBe(200);
-  expect(createTableCount).toBe(1);
+  expect(firstObjectSql.counts.createTable).toBe(1);
 
   deltas = Array.from({ length: 300 }, () => repeatingAlphabet(4));
   replyText = deltas.join("");
-  const saves = saveCount;
+  const saves = firstObjectSql.counts.save;
   slackCalls.length = 0;
   expect(await runTurn("Ev-store-batch")).toBe(200);
 
-  expect(createTableCount).toBe(1);
+  expect(firstObjectSql.counts.createTable).toBe(1);
   // Bounded from below too: a policy that stops flushing saves only the open
   // and the close, and an upper bound alone cannot see that.
-  expect(saveCount - saves).toBeGreaterThanOrEqual(3);
-  expect(saveCount - saves).toBeLessThanOrEqual(4);
+  expect(firstObjectSql.counts.save - saves).toBeGreaterThanOrEqual(3);
+  expect(firstObjectSql.counts.save - saves).toBeLessThanOrEqual(4);
   expect(streamedMarkdown()).toBe(replyText);
+});
+
+test("keeps each Durable Object's delivery store on its own storage", async () => {
+  deltas = ["first"];
+  replyText = "first";
+  expect(await runTurn("Ev-store-first-object")).toBe(200);
+  const firstSaves = firstObjectSql.counts.save;
+
+  const secondObjectSql = createFakeSql();
+  activeSql = secondObjectSql;
+  try {
+    deltas = ["second"];
+    replyText = "second";
+    expect(await runTurn("Ev-store-second-object")).toBe(200);
+  } finally {
+    activeSql = firstObjectSql;
+  }
+
+  expect(secondObjectSql.counts.createTable).toBe(1);
+  expect(secondObjectSql.counts.save).toBeGreaterThan(0);
+  expect(firstObjectSql.counts.save).toBe(firstSaves);
 });
 
 test("streams the turn into the routed thread, never a model-chosen one", async () => {
@@ -579,7 +610,10 @@ test("streams the turn into the routed thread, never a model-chosen one", async 
   expect(dispatched[0]?.instanceId).toBe("slack:v1:T123:C777:171.0");
   expect(dispatched[0]?.request.message.body).toBe("hello");
   expect(
-    v.parse(slackDeliveryBindingSchema, dispatched[0]?.request.initialData),
+    v.parse(
+      slackDeliveryBindingSchema,
+      dispatched[0]?.request.message.attributes,
+    ),
   ).toEqual({
     channelId: "C777",
     recipientTeamId: "T123",
@@ -587,10 +621,8 @@ test("streams the turn into the routed thread, never a model-chosen one", async 
     surface: "channel",
     threadTs: "171.0",
   });
-  expect(JSON.stringify(dispatched[0]?.request.initialData)).not.toContain(
-    "xoxb",
-  );
-  expect([...sqlRows.values()].join("")).not.toContain(BOT_TOKEN);
+  expect(JSON.stringify(dispatched[0]?.request)).not.toContain("xoxb");
+  expect([...firstObjectSql.rows.values()].join("")).not.toContain(BOT_TOKEN);
   expect(slackCalls.at(0)?.method).toBe("reactions.add");
   expect(bodiesFor("chat.startStream")).toEqual([
     {
@@ -628,12 +660,12 @@ test("keeps the wire destination on the routed channel, not one named in the tur
   expect(bodiesFor("chat.appendStream")).toEqual([
     {
       channel: "C777",
-      markdown_text: payload.slice(0, 1024),
+      chunks: [{ text: payload.slice(0, 1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
     {
       channel: "C777",
-      markdown_text: payload.slice(1024),
+      chunks: [{ text: payload.slice(1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
   ]);
@@ -694,12 +726,12 @@ test("streams a tool call as a named, sanitized task update", async () => {
     },
     {
       channel: "C777",
-      markdown_text: payload.slice(0, 1024),
+      chunks: [{ text: payload.slice(0, 1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
     {
       channel: "C777",
-      markdown_text: payload.slice(1024),
+      chunks: [{ text: payload.slice(1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
   ]);
@@ -782,7 +814,11 @@ test("omits the output of a void tool result", async () => {
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
 });
 
@@ -859,7 +895,11 @@ test("redacts credentials carried in a tool result before the wire", async () =>
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
 });
 
@@ -932,7 +972,11 @@ test("redacts credentials escaped by JSON.stringify before the wire", async () =
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
 });
 
@@ -1004,7 +1048,11 @@ test("delivers the durable reply after the isolate drops its live stream handle"
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Hello there, done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Hello there, done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
   expect(streamedMarkdown()).toBe("Hello there, done.");
   expect(bodiesFor("chat.stopStream")).toEqual([
@@ -1066,6 +1114,17 @@ test("routes successive top-level DMs to one instance and keeps channel threads 
     "slack:v1:T123:C777:191.0",
     "slack:v1:T123:C777:192.0",
   ]);
+  // Flue records initialData once per instance and ignores it afterwards, so a
+  // destination sent there would pin every later DM reply to the first thread.
+  expect(dispatched.map((entry) => entry.request.initialData)).toEqual([
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+  ]);
+  expect(
+    dispatched.map((entry) => entry.request.message.attributes?.threadTs),
+  ).toEqual(["181.1", "182.2", "191.0", "192.0"]);
 });
 
 test("a failed eyes reaction still dispatches the turn", async () => {

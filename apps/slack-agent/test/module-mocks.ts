@@ -42,6 +42,7 @@ export const retentionExtendCapture: RetentionExtendCapture = {};
 // export list and the bindings a test may stand in for are declared here.
 export interface MockedWorkerEnv {
   AI?: unknown;
+  CRM_MCP_TOKEN?: string;
   EXTENSION_SECRET?: string;
   SLACK_APP_ID?: string;
   SLACK_BOT_TOKEN: string;

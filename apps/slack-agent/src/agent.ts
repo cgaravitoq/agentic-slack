@@ -23,26 +23,39 @@ import {
   observe,
   useAgentFinish,
   useAgentStart,
-  useInitialData,
+  useDelivery,
   useInstruction,
+  useMcpConnection,
   useModel,
 } from "@flue/runtime";
-import type { AgentProps, FlueObservation } from "@flue/runtime";
+import type {
+  AgentProps,
+  FlueObservation,
+  McpConnectionDefinition,
+} from "@flue/runtime";
 import { extend, getCloudflareContext } from "@flue/runtime/cloudflare";
 import * as v from "valibot";
 import config from "../agent.config.ts";
 
-let cachedStore: SlackDeliveryStore | undefined;
+// Rebuilding the store re-runs its CREATE TABLE on every observation, and one
+// isolate can host several Durable Objects, so the cache is keyed by storage.
+const deliveryStores = new WeakMap<object, SlackDeliveryStore>();
 
-// Rebuilding the store re-runs its CREATE TABLE on every observation.
 const deliveryStore = (): SlackDeliveryStore => {
-  cachedStore ??= createSqlSlackDeliveryStore(
-    getCloudflareContext().storage.sql,
-  );
-  return cachedStore;
+  const { sql } = getCloudflareContext().storage;
+  const cached = deliveryStores.get(sql);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const store = createSqlSlackDeliveryStore(sql);
+  deliveryStores.set(sql, store);
+  return store;
 };
 
 const botToken = (): string => env.SLACK_BOT_TOKEN;
+
+const workerSecret = (name: string): string =>
+  v.parse(v.object({ [name]: v.pipe(v.string(), v.nonEmpty()) }), env)[name];
 
 export const startSlackTurnDelivery = (
   instanceId: string,
@@ -74,14 +87,21 @@ export const SlackAgent = (props: AgentProps) => {
   for (const instruction of composeInstructions(config)) {
     useInstruction(instruction);
   }
-  const bound = useInitialData<SlackDeliveryBinding | undefined>();
+  for (const { authSecret, ...server } of config.mcpServers) {
+    const connection: McpConnectionDefinition = { ...server };
+    if (authSecret !== undefined) {
+      connection.auth = () => workerSecret(authSecret);
+    }
+    useMcpConnection(connection);
+  }
+  const delivery = useDelivery();
   useAgentStart(() => {
-    if (bound === undefined) {
+    if (delivery.kind !== "signal") {
       return;
     }
     startSlackTurnDelivery(
       props.id,
-      v.parse(slackDeliveryBindingSchema, bound),
+      v.parse(slackDeliveryBindingSchema, delivery.attributes),
     );
   });
   useAgentFinish(async () => {
@@ -89,7 +109,6 @@ export const SlackAgent = (props: AgentProps) => {
   });
   return `${config.name}: ${config.description}`;
 };
-SlackAgent.initialData = slackDeliveryBindingSchema;
 
 interface RetentionAgent {
   listSchedules: () => Promise<readonly ExpirySchedule[]>;
