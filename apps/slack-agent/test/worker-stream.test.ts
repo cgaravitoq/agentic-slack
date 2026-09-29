@@ -142,26 +142,30 @@ await mock.module("@flue/runtime", () => ({
   instrument: () => {},
   setProvider: () => {},
 }));
-const sqlRows = new Map<string, string>();
-let createTableCount = 0;
-let saveCount = 0;
-const fakeSql = {
-  exec(query: string, ...bindings: unknown[]) {
-    if (query.includes("CREATE TABLE")) {
-      createTableCount += 1;
+const createFakeSql = () => {
+  const rows = new Map<string, string>();
+  const counts = { createTable: 0, save: 0 };
+  const sql = {
+    exec(query: string, ...bindings: unknown[]) {
+      if (query.includes("CREATE TABLE")) {
+        counts.createTable += 1;
+        return { toArray: () => [] };
+      }
+      if (query.trimStart().startsWith("SELECT")) {
+        const payload = rows.get(String(bindings[0]));
+        return {
+          toArray: () => (payload === undefined ? [] : [{ payload }]),
+        };
+      }
+      counts.save += 1;
+      rows.set(String(bindings[0]), String(bindings[1]));
       return { toArray: () => [] };
-    }
-    if (query.trimStart().startsWith("SELECT")) {
-      const payload = sqlRows.get(String(bindings[0]));
-      return {
-        toArray: () => (payload === undefined ? [] : [{ payload }]),
-      };
-    }
-    saveCount += 1;
-    sqlRows.set(String(bindings[0]), String(bindings[1]));
-    return { toArray: () => [] };
-  },
+    },
+  };
+  return { counts, rows, sql };
 };
+const firstObjectSql = createFakeSql();
+let activeSql = firstObjectSql;
 const cloudflare = await import("@flue/runtime/cloudflare");
 await mock.module("@flue/runtime/cloudflare", () => ({
   ...cloudflare,
@@ -169,7 +173,7 @@ await mock.module("@flue/runtime/cloudflare", () => ({
   extend: () => ({ base: undefined }),
   getCloudflareContext: () => ({
     env: {},
-    storage: { sql: fakeSql },
+    storage: { sql: activeSql.sql },
   }),
 }));
 await mockWorkersAi();
@@ -541,7 +545,7 @@ beforeEach(() => {
   toolChunks = [];
   replyText = "";
   runFailure = undefined;
-  sqlRows.clear();
+  firstObjectSql.rows.clear();
   evictLiveSlackDelivery();
 });
 
@@ -553,20 +557,41 @@ test("builds the durable delivery store once and flushes it on the coalesce boun
   deltas = ["warm"];
   replyText = "warm";
   expect(await runTurn("Ev-store-warm")).toBe(200);
-  expect(createTableCount).toBe(1);
+  expect(firstObjectSql.counts.createTable).toBe(1);
 
   deltas = Array.from({ length: 300 }, () => repeatingAlphabet(4));
   replyText = deltas.join("");
-  const saves = saveCount;
+  const saves = firstObjectSql.counts.save;
   slackCalls.length = 0;
   expect(await runTurn("Ev-store-batch")).toBe(200);
 
-  expect(createTableCount).toBe(1);
+  expect(firstObjectSql.counts.createTable).toBe(1);
   // Bounded from below too: a policy that stops flushing saves only the open
   // and the close, and an upper bound alone cannot see that.
-  expect(saveCount - saves).toBeGreaterThanOrEqual(3);
-  expect(saveCount - saves).toBeLessThanOrEqual(4);
+  expect(firstObjectSql.counts.save - saves).toBeGreaterThanOrEqual(3);
+  expect(firstObjectSql.counts.save - saves).toBeLessThanOrEqual(4);
   expect(streamedMarkdown()).toBe(replyText);
+});
+
+test("keeps each Durable Object's delivery store on its own storage", async () => {
+  deltas = ["first"];
+  replyText = "first";
+  expect(await runTurn("Ev-store-first-object")).toBe(200);
+  const firstSaves = firstObjectSql.counts.save;
+
+  const secondObjectSql = createFakeSql();
+  activeSql = secondObjectSql;
+  try {
+    deltas = ["second"];
+    replyText = "second";
+    expect(await runTurn("Ev-store-second-object")).toBe(200);
+  } finally {
+    activeSql = firstObjectSql;
+  }
+
+  expect(secondObjectSql.counts.createTable).toBe(1);
+  expect(secondObjectSql.counts.save).toBeGreaterThan(0);
+  expect(firstObjectSql.counts.save).toBe(firstSaves);
 });
 
 test("streams the turn into the routed thread, never a model-chosen one", async () => {
@@ -590,7 +615,7 @@ test("streams the turn into the routed thread, never a model-chosen one", async 
   expect(JSON.stringify(dispatched[0]?.request.initialData)).not.toContain(
     "xoxb",
   );
-  expect([...sqlRows.values()].join("")).not.toContain(BOT_TOKEN);
+  expect([...firstObjectSql.rows.values()].join("")).not.toContain(BOT_TOKEN);
   expect(slackCalls.at(0)?.method).toBe("reactions.add");
   expect(bodiesFor("chat.startStream")).toEqual([
     {

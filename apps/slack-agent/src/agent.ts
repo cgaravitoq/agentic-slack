@@ -37,14 +37,19 @@ import { extend, getCloudflareContext } from "@flue/runtime/cloudflare";
 import * as v from "valibot";
 import config from "../agent.config.ts";
 
-let cachedStore: SlackDeliveryStore | undefined;
+// Rebuilding the store re-runs its CREATE TABLE on every observation, and one
+// isolate can host several Durable Objects, so the cache is keyed by storage.
+const deliveryStores = new WeakMap<object, SlackDeliveryStore>();
 
-// Rebuilding the store re-runs its CREATE TABLE on every observation.
 const deliveryStore = (): SlackDeliveryStore => {
-  cachedStore ??= createSqlSlackDeliveryStore(
-    getCloudflareContext().storage.sql,
-  );
-  return cachedStore;
+  const { sql } = getCloudflareContext().storage;
+  const cached = deliveryStores.get(sql);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const store = createSqlSlackDeliveryStore(sql);
+  deliveryStores.set(sql, store);
+  return store;
 };
 
 const botToken = (): string => env.SLACK_BOT_TOKEN;
