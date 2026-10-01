@@ -1,5 +1,8 @@
 import { afterAll, beforeEach, expect, mock, test } from "bun:test";
-import { slackDeliveryBindingSchema } from "@agentic-slack/core";
+import {
+  defineAgentConfig,
+  slackDeliveryBindingSchema,
+} from "@agentic-slack/core";
 import {
   evictLiveSlackDelivery,
   SLACK_DELIVERY_FALLBACK,
@@ -1251,4 +1254,86 @@ test("keeps the eyes reaction alive past the ack", async () => {
   expect(status).toBe(200);
   expect(slackCalls[0]?.method).toBe("reactions.add");
   expect(workerWaitUntil).toHaveLength(1);
+});
+
+const signedInteraction = async (): Promise<Request> => {
+  const body = new URLSearchParams({
+    payload: JSON.stringify({
+      actions: [],
+      api_app_id: "A999",
+      team: { id: "T999" },
+      type: "block_actions",
+      user: { id: "U777" },
+    }),
+  }).toString();
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(SIGNING_SECRET),
+    { hash: "SHA-256", name: "HMAC" },
+    false,
+    ["sign"],
+  );
+  const bytes = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(`v0:${timestamp}:${body}`),
+  );
+  return new Request("https://example.com/channels/slack/interactions", {
+    body,
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-slack-request-timestamp": timestamp,
+      "x-slack-signature": `v0=${Array.from(new Uint8Array(bytes), (byte) =>
+        byte.toString(16).padStart(2, "0"),
+      ).join("")}`,
+    },
+    method: "POST",
+  });
+};
+
+// The worker reads its config once, when evaluated, so each config gets its own
+// instance of the entry module; the config module is restored afterwards for
+// whichever test file loads next.
+const interactionStatusFor = async (
+  requireApproval: string[],
+  specifier: string,
+): Promise<number> => {
+  const { default: shipped } = await import("../agent.config.ts");
+  await mock.module("../agent.config.ts", () => ({
+    default: defineAgentConfig({
+      description: "Answers Slack conversations.",
+      mcpServers: [
+        { name: "crm", requireApproval, url: "https://mcp.example.com/mcp" },
+      ],
+      name: "Operator Agent",
+      ownerInstructions: "Prefer short answers.",
+    }),
+  }));
+  let entry: unknown;
+  try {
+    entry = await import(specifier);
+  } finally {
+    await mock.module("../agent.config.ts", () => ({ default: shipped }));
+  }
+  const worker = v.parse(
+    v.object({ default: v.object({ request: v.function() }) }),
+    entry,
+  ).default;
+  const response: unknown = await worker.request(
+    await signedInteraction(),
+    undefined,
+    testBindings(),
+  );
+  return v.parse(v.instance(Response), response).status;
+};
+
+test("mounts the interactions route only when the config gates a call", async () => {
+  expect(
+    await interactionStatusFor(
+      ["create_organization"],
+      "../src/index.ts?gated",
+    ),
+  ).toBe(200);
+  expect(await interactionStatusFor([], "../src/index.ts?ungated")).toBe(404);
 });
