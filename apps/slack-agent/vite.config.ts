@@ -3,8 +3,11 @@ import { cloudflare } from "@cloudflare/vite-plugin";
 import { flue, flueWorkerConfig } from "@flue/vite";
 import { defineConfig, searchForWorkspaceRoot } from "vite";
 
+const agentConfigOverride = process.env.AGENT_CONFIG;
 const agentConfig = path.resolve(
-  process.env.AGENT_CONFIG ?? path.join(import.meta.dirname, "agent.config.ts"),
+  agentConfigOverride === undefined || agentConfigOverride === ""
+    ? path.join(import.meta.dirname, "agent.config.ts")
+    : agentConfigOverride,
 );
 
 export default defineConfig({

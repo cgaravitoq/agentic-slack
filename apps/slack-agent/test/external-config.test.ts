@@ -2,12 +2,14 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { resolveConfig } from "vite";
 
 const repoRoot = path.join(import.meta.dirname, "../../..");
 const bundle = path.join(
   repoRoot,
   "apps/slack-agent/dist/agentic_slack/index.js",
 );
+const viteConfig = path.join(repoRoot, "apps/slack-agent/vite.config.ts");
 const externalName = "External Receipt Agent";
 const externalSkillDescription = "External receipt skill description.";
 
@@ -33,10 +35,12 @@ export default {
 `;
 
 const build = async (agentConfig?: string): Promise<string> => {
-  const env =
-    agentConfig === undefined
-      ? process.env
-      : { ...process.env, AGENT_CONFIG: agentConfig };
+  const env = { ...process.env };
+  if (agentConfig === undefined) {
+    delete env.AGENT_CONFIG;
+  } else {
+    env.AGENT_CONFIG = agentConfig;
+  }
   const child = Bun.spawn([process.execPath, "run", "build"], {
     cwd: repoRoot,
     env,
@@ -79,4 +83,28 @@ test("defaults to the in-repo agent config when AGENT_CONFIG is unset", async ()
 
   expect(bundled).toContain("Slack Agent");
   expect(bundled).not.toContain(externalName);
+}, 30_000);
+
+test("defaults to the in-repo agent config when AGENT_CONFIG is empty", async () => {
+  const bundled = await build("");
+
+  expect(bundled).toContain("Slack Agent");
+  expect(bundled).not.toContain(externalName);
+}, 30_000);
+
+test("the dev server may read the directory of an external config", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "agentic-slack-serve-"));
+  const previous = process.env.AGENT_CONFIG;
+  process.env.AGENT_CONFIG = path.join(directory, "agent.config.ts");
+  try {
+    const resolved = await resolveConfig({ configFile: viteConfig }, "serve");
+    expect(resolved.server.fs.allow).toContain(directory);
+  } finally {
+    if (previous === undefined) {
+      delete process.env.AGENT_CONFIG;
+    } else {
+      process.env.AGENT_CONFIG = previous;
+    }
+    await rm(directory, { force: true, recursive: true });
+  }
 }, 30_000);
