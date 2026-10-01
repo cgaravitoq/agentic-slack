@@ -201,7 +201,6 @@ export const createSlackIngress = (
       trusted.teamId &&
       trusted.appId,
   );
-  const interactions = handleInteraction;
   // `createSlackChannel` mounts `/interactions` only for a handler it is given,
   // so a deployment with no decision handler exposes no endpoint whose only
   // answer is 200.
@@ -233,7 +232,7 @@ export const createSlackIngress = (
       return await claimThenAcknowledge(c.env.DB, routed.eventId, run);
     },
     interactions:
-      interactions === undefined
+      handleInteraction === undefined
         ? undefined
         : async ({ c, payload }): Promise<Response> => {
             if (
@@ -245,7 +244,7 @@ export const createSlackIngress = (
               return ack(200);
             }
             try {
-              await interactions(payload, c.env);
+              await handleInteraction(payload, c.env);
               return ack(200);
             } catch (error: unknown) {
               console.error("Slack interaction handling failed", error);
