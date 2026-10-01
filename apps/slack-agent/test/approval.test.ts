@@ -597,6 +597,7 @@ describe("approval interactions", () => {
 
     decisions.length = 0;
     await handle(blockActions({}));
+    await handle(blockActions({ actionId: "approval_reject" }));
 
     expect(decisions).toEqual([]);
   });
