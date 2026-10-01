@@ -33,10 +33,12 @@ export default {
 `;
 
 const build = async (agentConfig?: string): Promise<string> => {
-  const env =
-    agentConfig === undefined
-      ? process.env
-      : { ...process.env, AGENT_CONFIG: agentConfig };
+  const env = { ...process.env };
+  if (agentConfig === undefined) {
+    delete env.AGENT_CONFIG;
+  } else {
+    env.AGENT_CONFIG = agentConfig;
+  }
   const child = Bun.spawn([process.execPath, "run", "build"], {
     cwd: repoRoot,
     env,
