@@ -82,3 +82,10 @@ test("defaults to the in-repo agent config when AGENT_CONFIG is unset", async ()
   expect(bundled).toContain("Slack Agent");
   expect(bundled).not.toContain(externalName);
 }, 30_000);
+
+test("defaults to the in-repo agent config when AGENT_CONFIG is empty", async () => {
+  const bundled = await build("");
+
+  expect(bundled).toContain("Slack Agent");
+  expect(bundled).not.toContain(externalName);
+}, 30_000);
