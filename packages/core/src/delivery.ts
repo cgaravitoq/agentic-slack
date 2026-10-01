@@ -1032,8 +1032,12 @@ export const openSlackDelivery = (
     !ownsDestination(existing, binding);
   const resumable = existing !== undefined && !existing.closed && !abandoned;
   const record = resumable ? existing : emptyRecord(binding);
-  if (abandoned) {
-    record.abandoned = [...existing.abandoned, abandonRecord(existing)];
+  if (existing !== undefined && !resumable) {
+    // A notice Slack refused rides on until a finish delivers it, even when the
+    // record carrying it already closed.
+    record.abandoned = abandoned
+      ? [...existing.abandoned, abandonRecord(existing)]
+      : existing.abandoned;
   }
   adoptDestination(record, binding);
   store.save(instanceId, record);

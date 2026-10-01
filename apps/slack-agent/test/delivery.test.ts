@@ -1857,6 +1857,33 @@ describe("durable Slack delivery", () => {
     expect(healthy.markdown()).toBe(SLACK_STREAM_FAILURE_NOTICE);
   });
 
+  // A notice still refused when its carrier closes outlives that record: the
+  // next turn's fresh record inherits it, so its finish retries the notice
+  // instead of the slot's replacement discarding it.
+  test("keeps a refused interrupted-thread notice across the next turn's open", async () => {
+    const failing = createFakeSlack({
+      "chat.startStream": "channel_not_found",
+    });
+    const store = serializingStore();
+    const { first } = privateBindings();
+    const third = { ...first, threadTs: "183.3" };
+    const fourth = { ...first, threadTs: "184.4" };
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, failing.fetcher);
+    evictLiveSlackDelivery("dm");
+    openSlackDelivery(store, "dm", third, BOT_TOKEN, failing.fetcher);
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, failing.fetcher);
+    expect(store.load("dm")?.closed).toBe(true);
+
+    const healthy = createFakeSlack();
+    openSlackDelivery(store, "dm", fourth, BOT_TOKEN, healthy.fetcher);
+    applySlackDeliveryEvent(store, "dm", { text: "fourth", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, healthy.fetcher);
+
+    expect(startStreamThreads(healthy)).toEqual(["171.2", "184.4"]);
+    expect(healthy.markdown()).toBe(`${SLACK_STREAM_FAILURE_NOTICE}fourth`);
+    expect(store.load("dm")?.abandoned).toEqual([]);
+  });
+
   test("replays durable tool events in record order and the reply text exactly once", async () => {
     const slack = createFakeSlack();
     const store = memoryStore();
