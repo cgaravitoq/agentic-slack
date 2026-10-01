@@ -15,7 +15,11 @@ export type {
   ApprovalStore,
 } from "./approval.ts";
 export { setSuggestedPrompts } from "./assistant.ts";
-export { CLOUDFLARE_TRACING_CONTENT, defineAgentConfig } from "./config.ts";
+export {
+  CLOUDFLARE_TRACING_CONTENT,
+  defineAgentConfig,
+  requiresApproval,
+} from "./config.ts";
 export type { ResolvedAgentConfig } from "./config.ts";
 export {
   applySlackDeliveryEvent,

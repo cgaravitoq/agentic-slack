@@ -152,6 +152,12 @@ const resolveRetentionDays = (
   return days;
 };
 
+// The one predicate that decides whether the deployment can ask a person to
+// approve a call: the manifest enables interactivity on it, and the worker
+// mounts the interactions route on it.
+export const requiresApproval = (config: ResolvedAgentConfig): boolean =>
+  config.mcpServers.some((server) => (server.requireApproval?.length ?? 0) > 0);
+
 export const defineAgentConfig = (config: AgentConfig): ResolvedAgentConfig => {
   const model = (config.model ?? MODEL).trim();
   for (const [field, value] of Object.entries({

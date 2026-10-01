@@ -96,8 +96,9 @@ const approvalFetch = (
 const startSlackTurnDelivery = (
   instanceId: string,
   binding: SlackDeliveryBinding,
-): Promise<void> =>
+): void => {
   openSlackDelivery(deliveryStore(), instanceId, binding, botToken());
+};
 
 const observeSlackTurnDelivery = (
   event: FlueObservation,
@@ -142,11 +143,11 @@ export const SlackAgent = (props: AgentProps) => {
     useMcpConnection(connection);
   }
   const delivery = useDelivery();
-  useAgentStart(async () => {
+  useAgentStart(() => {
     if (delivery.kind !== "signal") {
       return;
     }
-    await startSlackTurnDelivery(
+    startSlackTurnDelivery(
       props.id,
       v.parse(slackDeliveryBindingSchema, delivery.attributes),
     );

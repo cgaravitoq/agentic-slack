@@ -186,7 +186,9 @@ export interface SlackStream {
   append: (delta: string) => void;
   task: (update: SlackTaskUpdate) => void;
   finish: (fallback: string) => Promise<void>;
-  fail: (notice: string) => Promise<void>;
+  // True when the closing notice reached the thread. `replyText` posts a reply
+  // the stream never saw, the way `finish` posts its fallback.
+  fail: (notice: string, replyText?: string) => Promise<boolean>;
 }
 
 export type SlackDeliveryEvent =
@@ -194,13 +196,20 @@ export type SlackDeliveryEvent =
   | { type: "tool-start"; id: string; name: string }
   | { type: "tool-result"; id: string; output: string; error: boolean };
 
-interface SlackDeliveryRecord {
+interface AbandonedDelivery {
   binding: SlackDeliveryBinding;
   events: SlackDeliveryEvent[];
   joinedBindings: SlackDeliveryBinding[];
   replyText: string;
   failed: boolean;
   closed: boolean;
+}
+
+interface SlackDeliveryRecord extends AbandonedDelivery {
+  // Records a later turn abandoned, each still owed a failure notice. They ride
+  // the record that replaced them so a crash before the notice leaves a durable
+  // copy behind for the next finish to retry.
+  abandoned: AbandonedDelivery[];
 }
 
 export interface SlackDeliveryStore {
@@ -214,30 +223,37 @@ interface SqlExec {
 
 const deliveryRow = v.object({ payload: v.string() });
 
-const slackDeliveryRecordSchema = v.object({
+const deliveryEventSchema = v.union([
+  v.object({ text: v.string(), type: v.literal("text") }),
+  v.object({
+    id: v.string(),
+    name: v.string(),
+    type: v.literal("tool-start"),
+  }),
+  v.object({
+    error: v.boolean(),
+    id: v.string(),
+    output: v.string(),
+    type: v.literal("tool-result"),
+  }),
+]);
+
+const deliveryRecordFields = {
   binding: slackDeliveryBindingSchema,
   closed: v.boolean(),
-  events: v.array(
-    v.union([
-      v.object({ text: v.string(), type: v.literal("text") }),
-      v.object({
-        id: v.string(),
-        name: v.string(),
-        type: v.literal("tool-start"),
-      }),
-      v.object({
-        error: v.boolean(),
-        id: v.string(),
-        output: v.string(),
-        type: v.literal("tool-result"),
-      }),
-    ]),
-  ),
+  events: v.array(deliveryEventSchema),
   failed: v.boolean(),
   // Absent on a record written before a response could carry more than one
   // requesting thread, and those records are still readable.
   joinedBindings: v.optional(v.array(slackDeliveryBindingSchema), []),
   replyText: v.string(),
+};
+
+const abandonedDeliverySchema = v.object(deliveryRecordFields);
+
+const slackDeliveryRecordSchema = v.object({
+  ...deliveryRecordFields,
+  abandoned: v.optional(v.array(abandonedDeliverySchema), []),
 });
 
 export const createSqlSlackDeliveryStore = (
@@ -553,14 +569,16 @@ export const createSlackStream = (
     );
   };
 
-  const attempt = async (work: () => Promise<void>): Promise<void> => {
+  const attempt = async (work: () => Promise<void>): Promise<boolean> => {
     try {
       await work();
+      return true;
     } catch (error: unknown) {
       failure ??=
         error instanceof Error
           ? error
           : new Error("Slack streaming delivery failed", { cause: error });
+      return false;
     }
   };
 
@@ -606,14 +624,27 @@ export const createSlackStream = (
     }, COALESCE_MS);
   };
 
-  const close = async (trailer: string, always: boolean): Promise<void> => {
+  // Reports whether the closing notice reached the thread, so a caller holding
+  // a durable record knows the outcome is delivered rather than merely sent.
+  const close = async (
+    trailer: string,
+    always: boolean,
+    replyText?: string,
+  ): Promise<boolean> => {
     if (closed) {
-      return;
+      return failure === undefined;
     }
     closed = true;
     flushPending();
     enqueue(() => send(sanitizer.flush(), contentBudget));
     await queue;
+    if (replyText !== undefined && replyText !== "") {
+      // A durable replay posts its reply the way a durable finish posts its
+      // fallback, so the two paths sanitize and clip the text identically
+      // instead of only agreeing while the stream clips them the same.
+      await attempt(() => post(sanitizeReply(replyText), contentBudget));
+    }
+    let delivered = true;
     // A recorded failure must reach the user on whichever path closes the
     // stream: otherwise they keep the partial content with nothing telling them
     // the turn broke. `closed` keeps it to one notice per stream.
@@ -623,15 +654,18 @@ export const createSlackStream = (
       // `post`, not `send`: the closing word is not stream content, and a reply
       // that already hit the content cap would otherwise clip it away and leave
       // the user with a truncated answer and no sign the turn broke.
-      await attempt(() => post(sanitizeReply(notice), closingBudget));
+      delivered = await attempt(() =>
+        post(sanitizeReply(notice), closingBudget),
+      );
     }
     const ts = streamTs;
     if (ts === undefined) {
-      return;
+      return delivered;
     }
     await attempt(async () => {
       await call("chat.stopStream", { channel: channelId, ts }, closingBudget);
     });
+    return delivered;
   };
 
   return {
@@ -641,8 +675,8 @@ export const createSlackStream = (
       }
       bufferAppend(sanitizer.push(delta));
     },
-    async fail(notice) {
-      await close(notice, true);
+    fail(notice, replyText) {
+      return close(notice, true, replyText);
     },
     async finish(fallback) {
       await close(fallback, false);
@@ -755,7 +789,10 @@ const appendDurableText = (current: string, delta: string): string =>
     : clipDurableText(current + delta);
 
 // One merged text event per run of deltas: a replay only ever needs the text,
-// and an event per 4-character delta is what made every save quadratic.
+// and an event per 4-character delta is what made every save quadratic. The
+// events carry exactly the merged reply text, split at the non-text events, so
+// a durable fail replay and a durable finish replay read one source rather than
+// two that only agree while the stream clips them.
 const applyRecordEvent = (
   record: SlackDeliveryRecord,
   event: SlackDeliveryEvent,
@@ -764,13 +801,18 @@ const applyRecordEvent = (
     record.events.push(event);
     return;
   }
-  record.replyText = appendDurableText(record.replyText, event.text);
-  const last = record.events.at(-1);
-  if (last?.type === "text") {
-    last.text = appendDurableText(last.text, event.text);
+  const previous = record.replyText;
+  record.replyText = appendDurableText(previous, event.text);
+  const added = record.replyText.slice(previous.length);
+  if (added === "") {
     return;
   }
-  record.events.push({ text: clipDurableText(event.text), type: "text" });
+  const last = record.events.at(-1);
+  if (last?.type === "text") {
+    last.text += added;
+    return;
+  }
+  record.events.push({ text: added, type: "text" });
 };
 
 interface LiveSlackDelivery {
@@ -833,13 +875,15 @@ export const evictLiveSlackDelivery = (instanceId?: string): void => {
   }
 };
 
+interface SlackDeliveryReplay {
+  events: readonly SlackDeliveryEvent[];
+  replyText: string;
+}
+
 const runSlackAlarmDelivery = async (
   binding: SlackDeliveryBinding,
   token: string,
-  work: {
-    events: readonly SlackDeliveryEvent[];
-    replyText: string;
-  },
+  work: SlackDeliveryReplay,
   fetcher: Fetcher = fetch,
 ): Promise<void> => {
   const stream = createSlackStream(
@@ -854,6 +898,7 @@ const runSlackAlarmDelivery = async (
 };
 
 const emptyRecord = (binding: SlackDeliveryBinding): SlackDeliveryRecord => ({
+  abandoned: [],
   binding,
   closed: false,
   events: [],
@@ -894,19 +939,31 @@ const adoptDestination = (
 // Every requesting thread is owed its own reply, so one destination failing
 // must not deny the others: the failing stream has already told its own
 // thread, and rethrowing would fail a completed turn, which the runtime would
-// then retry and post twice.
-const settleDestination = async (work: () => Promise<void>): Promise<void> => {
+// then retry and post twice. The result is reported so a durable notice is
+// only retired once its thread actually heard it.
+const settleDestination = async (
+  work: () => Promise<void>,
+): Promise<boolean> => {
   try {
     await work();
+    return true;
   } catch {
     // Deliberate: that thread already carries its own outcome.
+    return false;
   }
 };
+
+// A replay carries the record's non-text events and its merged reply text, the
+// one text source both the durable finish and the durable fail read.
+const deliveryReplay = (record: AbandonedDelivery): SlackDeliveryReplay => ({
+  events: record.events.filter((event) => event.type !== "text"),
+  replyText: record.replyText,
+});
 
 const replaySlackFailure = async (
   binding: SlackDeliveryBinding,
   token: string,
-  events: readonly SlackDeliveryEvent[],
+  replay: SlackDeliveryReplay,
   fetcher: Fetcher = fetch,
 ): Promise<void> => {
   const stream = createSlackStream(
@@ -914,33 +971,47 @@ const replaySlackFailure = async (
     token,
     fetcher,
   );
-  feedSlackStream(stream, events);
-  await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+  feedSlackStream(stream, replay.events);
+  if (!(await stream.fail(SLACK_STREAM_FAILURE_NOTICE, replay.replyText))) {
+    throw new Error("Slack failure notice was not delivered");
+  }
 };
 
-// The record a fresh turn abandons is about to be replaced in the store, so
-// this is the last chance its threads have to hear an outcome.
-const failAbandonedRecord = async (
-  record: SlackDeliveryRecord,
+// The record a fresh turn abandons is about to be replaced in the store, so its
+// threads are settled from the copy the fresh record carries, not from the slot
+// the fresh record now owns.
+const settleAbandonedRecord = async (
+  record: AbandonedDelivery,
   token: string,
   fetcher: Fetcher,
-): Promise<void> => {
-  await Promise.all(
+): Promise<boolean> => {
+  const replay = deliveryReplay(record);
+  const results = await Promise.all(
     [record.binding, ...record.joinedBindings].map((binding) =>
       settleDestination(() =>
-        replaySlackFailure(binding, token, record.events, fetcher),
+        replaySlackFailure(binding, token, replay, fetcher),
       ),
     ),
   );
+  return results.every(Boolean);
 };
 
-export const openSlackDelivery = async (
+const abandonRecord = (record: SlackDeliveryRecord): AbandonedDelivery => ({
+  binding: record.binding,
+  closed: record.closed,
+  events: record.events,
+  failed: record.failed,
+  joinedBindings: record.joinedBindings,
+  replyText: record.replyText,
+});
+
+export const openSlackDelivery = (
   store: SlackDeliveryStore,
   instanceId: string,
   binding: SlackDeliveryBinding,
   token: string,
   fetcher: Fetcher = fetch,
-): Promise<void> => {
+): void => {
   const live = liveDeliveries.get(instanceId);
   if (live !== undefined) {
     if (adoptDestination(live.record, binding)) {
@@ -953,14 +1024,21 @@ export const openSlackDelivery = async (
   // opened it. Only that thread, or one that already joined its response,
   // resumes it; a later turn starts its own record so its reply cannot land in
   // the interrupted turn's thread. The new record takes the instance's slot
-  // before the interrupted record is settled, so a concurrent turn joins this
-  // record instead of replacing it.
+  // before anything is sent to the interrupted threads, so a concurrent turn
+  // joins this record instead of replacing it.
   const abandoned =
     existing !== undefined &&
     !existing.closed &&
     !ownsDestination(existing, binding);
   const resumable = existing !== undefined && !existing.closed && !abandoned;
   const record = resumable ? existing : emptyRecord(binding);
+  if (existing !== undefined && !resumable) {
+    // A notice Slack refused rides on until a finish delivers it, even when the
+    // record carrying it already closed.
+    record.abandoned = abandoned
+      ? [...existing.abandoned, abandonRecord(existing)]
+      : existing.abandoned;
+  }
   adoptDestination(record, binding);
   store.save(instanceId, record);
   liveDeliveries.set(instanceId, {
@@ -975,9 +1053,6 @@ export const openSlackDelivery = async (
     ),
     toolNames: new Map(),
   });
-  if (abandoned) {
-    await failAbandonedRecord(existing, token, fetcher);
-  }
 };
 
 export const applySlackDeliveryEvent = (
@@ -1009,6 +1084,31 @@ export const applySlackDeliveryEvent = (
   store.save(instanceId, record);
 };
 
+// The record a fresh turn carries holds the threads of every record it
+// abandoned; settle them here, before this turn's own delivery, so their
+// notices keep the order they had when those turns were interrupted. A notice
+// Slack still refuses stays on the record for the next finish to retry.
+const settleAbandonedRecords = async (
+  store: SlackDeliveryStore,
+  instanceId: string,
+  record: SlackDeliveryRecord,
+  token: string,
+  fetcher: Fetcher,
+): Promise<void> => {
+  if (record.abandoned.length === 0) {
+    return;
+  }
+  const remaining: AbandonedDelivery[] = [];
+  for (const entry of record.abandoned) {
+    // oxlint-disable-next-line no-await-in-loop
+    if (!(await settleAbandonedRecord(entry, token, fetcher))) {
+      remaining.push(entry);
+    }
+  }
+  record.abandoned = remaining;
+  store.save(instanceId, record);
+};
+
 export const failSlackDelivery = async (
   store: SlackDeliveryStore,
   instanceId: string,
@@ -1017,21 +1117,28 @@ export const failSlackDelivery = async (
 ): Promise<void> => {
   const live = liveDeliveries.get(instanceId);
   const record = live?.record ?? store.load(instanceId);
-  if (record === undefined || record.closed) {
+  if (record === undefined) {
+    return;
+  }
+  await settleAbandonedRecords(store, instanceId, record, token, fetcher);
+  if (record.closed) {
     return;
   }
   record.failed = true;
+  const replay = deliveryReplay(record);
   const primary =
     live === undefined
-      ? () => replaySlackFailure(record.binding, token, record.events, fetcher)
-      : () => live.stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+      ? () => replaySlackFailure(record.binding, token, replay, fetcher)
+      : async () => {
+          await live.stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+        };
   try {
-    await primary();
+    await settleDestination(primary);
   } finally {
     await Promise.all(
       record.joinedBindings.map((binding) =>
         settleDestination(() =>
-          replaySlackFailure(binding, token, record.events, fetcher),
+          replaySlackFailure(binding, token, replay, fetcher),
         ),
       ),
     );
@@ -1047,22 +1154,22 @@ export const finishSlackDelivery = async (
 ): Promise<void> => {
   const live = liveDeliveries.get(instanceId);
   const record = live?.record ?? store.load(instanceId);
-  if (record === undefined || record.closed) {
+  if (record === undefined) {
     return;
   }
   if (record.failed) {
     await failSlackDelivery(store, instanceId, token, fetcher);
     return;
   }
-  const trailer = replyTrailer(record.replyText);
-  const replay = {
-    events: record.events.filter((event) => event.type !== "text"),
-    replyText: trailer,
-  };
+  await settleAbandonedRecords(store, instanceId, record, token, fetcher);
+  if (record.closed) {
+    return;
+  }
+  const replay = deliveryReplay(record);
   const primary =
     live === undefined
       ? () => runSlackAlarmDelivery(record.binding, token, replay, fetcher)
-      : () => live.stream.finish(trailer);
+      : () => live.stream.finish(replyTrailer(record.replyText));
   try {
     await settleDestination(primary);
     await Promise.all(

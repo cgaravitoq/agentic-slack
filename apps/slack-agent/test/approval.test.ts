@@ -543,6 +543,64 @@ describe("approval interactions", () => {
     expect(rows[0]?.state).toBe("pending");
     expect(settled).toEqual([{ note: EXPIRED_NOTE, requestId: "req-1" }]);
   });
+
+  // The decision is persisted before the model hears it, so a dispatch that
+  // fails answers Slack a 500. The redelivery must reach the model: the row is
+  // already decided, but the decision was never delivered.
+  test("tells the model the decision again when Slack redelivers the click", async () => {
+    const { rows, store } = memoryStore();
+    const { notifier, settled } = recordingNotifier();
+    await store.create(pendingRequest());
+    const decisions: ApprovalDecision[] = [];
+    let attempts = 0;
+    const decide = (
+      _request: ApprovalRequest,
+      decision: ApprovalDecision,
+    ): Promise<void> => {
+      attempts += 1;
+      if (attempts === 1) {
+        return Promise.reject(new Error("dispatch failed"));
+      }
+      decisions.push(decision);
+      return Promise.resolve();
+    };
+    const handle = (payload: SlackBlockActionsPayload) =>
+      handleApprovalInteraction(payload, {
+        decide,
+        notifier,
+        now: () => NOW,
+        store,
+      });
+
+    let failure: unknown;
+    try {
+      await handle(blockActions({}));
+    } catch (error: unknown) {
+      failure = error;
+    }
+    expect(failure).toEqual(new Error("dispatch failed"));
+    expect(rows[0]?.state).toBe("approved");
+    expect(settled).toEqual([]);
+
+    await handle(blockActions({}));
+
+    expect(decisions).toEqual(["approve"]);
+    expect(rows[0]?.state).toBe("approved");
+    expect(settled).toEqual([{ note: APPROVED_NOTE, requestId: "req-1" }]);
+  });
+
+  test("does not tell the model again once the approved call executed", async () => {
+    const { decisions, handle, seed, store } = interactionFor();
+    await seed();
+    await handle(blockActions({}));
+    expect(await store.claim("req-1")).toBe(true);
+
+    decisions.length = 0;
+    await handle(blockActions({}));
+    await handle(blockActions({ actionId: "approval_reject" }));
+
+    expect(decisions).toEqual([]);
+  });
 });
 
 const notifierRequests = () => {

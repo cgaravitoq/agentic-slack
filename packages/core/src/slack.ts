@@ -139,7 +139,7 @@ const ack = (status: number): Response => new Response(null, { status });
 const claimThenAcknowledge = async (
   db: D1Database,
   eventId: string,
-  run: () => Promise<void>,
+  run: () => Promise<void> | void,
 ): Promise<Response> => {
   try {
     await claimAndRun(db, eventId, run);
@@ -189,7 +189,7 @@ export const createSlackIngress = (
   handleLifecycle?: (
     lifecycle: RoutedSlackLifecycle,
     env: SlackCoreBindings,
-  ) => Promise<void>,
+  ) => Promise<void> | void,
   handleInteraction?: (
     payload: SlackBlockActionsPayload,
     env: SlackCoreBindings,
@@ -201,6 +201,9 @@ export const createSlackIngress = (
       trusted.teamId &&
       trusted.appId,
   );
+  // `createSlackChannel` mounts `/interactions` only for a handler it is given,
+  // so a deployment with no decision handler exposes no endpoint whose only
+  // answer is 200.
   const channel = createSlackChannel<SlackCoreEnv>({
     async events({ c, payload }): Promise<Response> {
       if (!identityComplete) {
@@ -228,24 +231,26 @@ export const createSlackIngress = (
       }
       return await claimThenAcknowledge(c.env.DB, routed.eventId, run);
     },
-    async interactions({ c, payload }): Promise<Response> {
-      if (
-        !identityComplete ||
-        !handleInteraction ||
-        payload.type !== "block_actions" ||
-        payload.team?.id !== trusted.teamId ||
-        payload.api_app_id !== trusted.appId
-      ) {
-        return ack(200);
-      }
-      try {
-        await handleInteraction(payload, c.env);
-        return ack(200);
-      } catch (error: unknown) {
-        console.error("Slack interaction handling failed", error);
-        return ack(500);
-      }
-    },
+    interactions:
+      handleInteraction === undefined
+        ? undefined
+        : async ({ c, payload }): Promise<Response> => {
+            if (
+              !identityComplete ||
+              payload.type !== "block_actions" ||
+              payload.team?.id !== trusted.teamId ||
+              payload.api_app_id !== trusted.appId
+            ) {
+              return ack(200);
+            }
+            try {
+              await handleInteraction(payload, c.env);
+              return ack(200);
+            } catch (error: unknown) {
+              console.error("Slack interaction handling failed", error);
+              return ack(500);
+            }
+          },
     signingSecret: identityComplete
       ? trusted.signingSecret
       : DISABLED_SIGNING_SECRET,

@@ -605,7 +605,6 @@ export const handleApprovalInteraction = async (
   const request = await options.store.read(decided.requestId);
   if (
     request === undefined ||
-    request.state !== "pending" ||
     request.channelId !== decided.channelId ||
     request.threadTs !== decided.threadTs ||
     request.requesterId !== decided.userId
@@ -613,17 +612,27 @@ export const handleApprovalInteraction = async (
     return;
   }
   const now = (options.now ?? (() => Math.floor(Date.now() / 1000)))();
-  if (request.expiresAt <= now) {
-    await options.notifier.settle(request, EXPIRED_NOTE);
-    return;
-  }
-  const claimed = await options.store.decide(
-    request.requestId,
-    decided.decision === "approve" ? "approved" : "rejected",
-    decided.userId,
-    now,
-  );
-  if (!claimed) {
+  if (request.state === "pending") {
+    if (request.expiresAt <= now) {
+      await options.notifier.settle(request, EXPIRED_NOTE);
+      return;
+    }
+    const claimed = await options.store.decide(
+      request.requestId,
+      decided.decision === "approve" ? "approved" : "rejected",
+      decided.userId,
+      now,
+    );
+    if (!claimed) {
+      return;
+    }
+  } else if (
+    request.state === "executed" ||
+    (request.state === "approved" ? "approve" : "reject") !== decided.decision
+  ) {
+    // A contradictory click, or one whose call already ran, is ignored. A
+    // decided request is not: Slack redelivers the interaction when the
+    // dispatch failed, and the model still has to hear the decision.
     return;
   }
   await options.decide(request, decided.decision);

@@ -44,7 +44,7 @@ export const releaseEvent = async (
 export const claimAndRun = async (
   db: D1Database,
   eventId: string,
-  run: () => Promise<void>,
+  run: () => Promise<void> | void,
 ): Promise<void> => {
   if (!(await claimEvent(db, eventId))) {
     return;
