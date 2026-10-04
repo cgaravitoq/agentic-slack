@@ -7,7 +7,9 @@ import {
   createApprovalFetch,
   createApprovalNotifier,
   createApprovalStore,
+  createSlackReadTools,
   createSqlSlackDeliveryStore,
+  createSqlSlackReadCursorStore,
   expireLatest,
   failSlackDelivery,
   finishSlackDelivery,
@@ -32,6 +34,7 @@ import {
   useMcpConnection,
   useModel,
   useSkill,
+  useTool,
 } from "@flue/runtime";
 import type {
   AgentProps,
@@ -143,6 +146,30 @@ export const SlackAgent = (props: AgentProps) => {
     useMcpConnection(connection);
   }
   const delivery = useDelivery();
+  if (config.read !== undefined && delivery.kind === "signal") {
+    const slack = v.safeParse(slackDeliveryBindingSchema, delivery.attributes);
+    if (slack.success) {
+      const cursorStore = createSqlSlackReadCursorStore(env.DB);
+      const tools = createSlackReadTools(
+        {
+          channelId: slack.output.channelId,
+          readsMemberChannels:
+            slack.output.surface === "private" &&
+            config.allowedUserIds.includes(slack.output.recipientUserId),
+          threadTs: slack.output.threadTs,
+        },
+        {
+          cursorStore,
+          lookbackSeconds: config.read.lookbackSeconds,
+          maxMessages: config.read.maxMessages,
+          token: botToken(),
+        },
+      );
+      for (const tool of tools) {
+        useTool(tool);
+      }
+    }
+  }
   useAgentStart(() => {
     if (delivery.kind !== "signal") {
       return;

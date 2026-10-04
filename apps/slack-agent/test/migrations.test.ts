@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { readdir } from "node:fs/promises";
-import { APPROVAL_TTL_SECONDS, createApprovalStore } from "@agentic-slack/core";
+import {
+  APPROVAL_TTL_SECONDS,
+  createApprovalStore,
+  createSqlSlackReadCursorStore,
+} from "@agentic-slack/core";
 import type { ApprovalRequest } from "@agentic-slack/core";
 import {
   claimAndRun,
@@ -144,6 +148,7 @@ describe("D1 migration schema", () => {
       "0001_seen_events.sql",
       "0002_seen_events_created_at.sql",
       "0003_approval_requests.sql",
+      "0004_slack_read_cursors.sql",
     ]);
     expect(
       applyOrder([
@@ -164,6 +169,9 @@ describe("D1 migration schema", () => {
       "CREATE TABLE IF NOT EXISTS approval_requests",
     );
     expect(batches[2]).toContain("CREATE INDEX");
+    expect(batches[3]).toContain(
+      "CREATE TABLE IF NOT EXISTS slack_read_cursors",
+    );
   });
 
   test("indexes created_at and plans the sweep through that index", async () => {
@@ -612,6 +620,32 @@ describe("approval request storage", () => {
         request_id: "req-live",
         state: "pending",
       },
+    ]);
+  });
+});
+
+describe("slack read cursor storage", () => {
+  test("keeps one watermark per channel and reads it back", async () => {
+    const { db } = migrated();
+    const store = createSqlSlackReadCursorStore(db);
+
+    expect(await store.load("C1")).toBeUndefined();
+    await store.save("C1", "1800000000.000000", NOW);
+    await store.save("C2", "1799999000.000000", NOW);
+    await store.save("C1", "1800000001.000000", NOW);
+
+    expect(await store.load("C1")).toBe("1800000001.000000");
+    expect(await store.load("C2")).toBe("1799999000.000000");
+    expect(await store.load("C3")).toBeUndefined();
+
+    const rows = await db
+      .prepare(
+        "SELECT channel_id, cursor_ts, updated_at FROM slack_read_cursors ORDER BY channel_id",
+      )
+      .all();
+    expect(rows.results).toEqual([
+      { channel_id: "C1", cursor_ts: "1800000001.000000", updated_at: NOW },
+      { channel_id: "C2", cursor_ts: "1799999000.000000", updated_at: NOW },
     ]);
   });
 });
