@@ -1,7 +1,6 @@
 import { defineTool } from "@flue/runtime";
 import type { ToolDefinition } from "@flue/runtime";
 import * as v from "valibot";
-import type { ConversationSurface } from "./retention.ts";
 
 type Fetcher = (
   input: RequestInfo | URL,
@@ -50,7 +49,7 @@ export const createSqlSlackReadCursorStore = (
 
 export interface SlackReadBinding {
   readonly channelId: string;
-  readonly surface: ConversationSurface;
+  readonly readsMemberChannels: boolean;
   readonly threadTs: string;
 }
 
@@ -349,7 +348,7 @@ const boundToChannel = (
   binding: SlackReadBinding,
   bound: string,
   unbound: string,
-): string => (binding.surface === "channel" ? bound : unbound);
+): string => (binding.readsMemberChannels ? unbound : bound);
 
 const requestedChannel = (
   binding: SlackReadBinding,
@@ -357,7 +356,7 @@ const requestedChannel = (
   tool: string,
 ): string => {
   const channel = requested?.trim() ?? "";
-  if (binding.surface === "channel") {
+  if (!binding.readsMemberChannels) {
     if (channel !== "" && channel !== binding.channelId) {
       throw new Error(`${tool} can only read this conversation's channel`);
     }
@@ -393,7 +392,7 @@ const readThread = async (
   data: v.InferOutput<typeof threadInput>,
 ): Promise<SlackReadPage> => {
   const channelId = requestedChannel(binding, data.channel, "read_thread");
-  if (binding.surface === "private") {
+  if (binding.readsMemberChannels) {
     await requireMembership(ctx.caller, channelId);
   }
   const requestedThread = data.threadTs?.trim() ?? "";
@@ -504,7 +503,7 @@ const readChannelSince = async (
     data.channel,
     "read_channel_since",
   );
-  if (binding.surface === "private") {
+  if (binding.readsMemberChannels) {
     await requireMembership(ctx.caller, channelId);
   }
   const stored = await options.cursorStore.load(channelId);

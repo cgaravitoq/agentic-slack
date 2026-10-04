@@ -191,7 +191,7 @@ A reply under a parent older than the lookback is outside the scan, so it is not
 The model never chooses which conversation a read may touch.
 In a channel conversation the tools read only the channel and thread of the delivered message, taken from the delivery binding, and any other channel argument is refused.
 In the owner's DM the model may name a channel, and the read happens only if `conversations.info` reports the bot as a member of it.
-Pair the option with `allowedUserIds` so only the owner reaches that surface.
+An owner is a user named in `allowedUserIds`; any other DM, and every DM while `allowedUserIds` is unset, reads only its own conversation.
 
 The per-channel watermark in D1 (`slack_read_cursors`, migration `0004_slack_read_cursors.sql`) records how far `read_channel_since` has covered a channel.
 It advances only as far as coverage is complete: to the last returned message of a truncated page, or to the moment of a read that reached the end of its window, and never past an `oldest` that skips ahead of the stored cursor.

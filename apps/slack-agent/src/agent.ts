@@ -150,12 +150,21 @@ export const SlackAgent = (props: AgentProps) => {
     const slack = v.safeParse(slackDeliveryBindingSchema, delivery.attributes);
     if (slack.success) {
       const cursorStore = createSqlSlackReadCursorStore(env.DB);
-      const tools = createSlackReadTools(slack.output, {
-        cursorStore,
-        lookbackSeconds: config.read.lookbackSeconds,
-        maxMessages: config.read.maxMessages,
-        token: botToken(),
-      });
+      const tools = createSlackReadTools(
+        {
+          channelId: slack.output.channelId,
+          readsMemberChannels:
+            slack.output.surface === "private" &&
+            config.allowedUserIds.includes(slack.output.recipientUserId),
+          threadTs: slack.output.threadTs,
+        },
+        {
+          cursorStore,
+          lookbackSeconds: config.read.lookbackSeconds,
+          maxMessages: config.read.maxMessages,
+          token: botToken(),
+        },
+      );
       for (const tool of tools) {
         useTool(tool);
       }

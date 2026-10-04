@@ -179,7 +179,7 @@ const readHarness = (options: ReadHarnessFixture): ReadHarness => {
 const channelBinding = (
   channelId: string,
   threadTs: string,
-): SlackReadBinding => ({ channelId, surface: "channel", threadTs });
+): SlackReadBinding => ({ channelId, readsMemberChannels: false, threadTs });
 
 const withFixedClock = async <TResult>(
   run: () => Promise<TResult>,
@@ -460,7 +460,11 @@ test("refuses to read another channel from a channel conversation", async () => 
 test("reads a channel the bot joined only from a direct message", async () => {
   const parentTs = at(-800);
   const harness = readHarness({
-    binding: { channelId: "D777", surface: "private", threadTs: at(-100) },
+    binding: {
+      channelId: "D777",
+      readsMemberChannels: true,
+      threadTs: at(-100),
+    },
     fixture: {
       channels: { CJOINED: [{ text: "hello", ts: at(-50), user: "U111" }] },
       members: ["CJOINED"],
@@ -502,7 +506,11 @@ test("reads a channel the bot joined only from a direct message", async () => {
 
 test("refuses a direct-message read without a channel or without membership", async () => {
   const harness = readHarness({
-    binding: { channelId: "D777", surface: "private", threadTs: at(-100) },
+    binding: {
+      channelId: "D777",
+      readsMemberChannels: true,
+      threadTs: at(-100),
+    },
     fixture: {
       channels: { CFOREIGN: [{ text: "elsewhere", ts: at(-50) }] },
       members: [],
@@ -553,6 +561,7 @@ test("refuses a direct-message read without a channel or without membership", as
 });
 
 const readConfig = defineAgentConfig({
+  allowedUserIds: ["U111", "U222"],
   description: "Reads Slack conversations.",
   name: "Reader Agent",
   ownerInstructions: "Prefer short answers.",
@@ -838,6 +847,97 @@ test("lets the owner's direct message name the channel it reads", async () => {
         ?.params.get("channel"),
     ).toBe("CJOINED");
     expect(db.rows.get("CJOINED")).toBe(NOW_TS);
+  } finally {
+    network.mockRestore();
+    await mock.module("../agent.config.ts", () => ({ default: shipped }));
+  }
+});
+
+test("binds a direct message from a user who is not an owner to its own conversation", async () => {
+  const { default: shipped } = await import("../agent.config.ts");
+  const fixture: FakeSlackFixture = {
+    channels: {
+      CJOINED: [{ text: "private plans", ts: at(-50), user: "U111" }],
+      D888: [{ text: "hi", ts: at(-40), user: "U333" }],
+    },
+    members: ["CJOINED"],
+    pageSize: 50,
+    threads: {},
+    users: { U333: "Grace" },
+  };
+  const api = fakeSlack(fixture);
+  const network = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(
+      (input: RequestInfo | URL, init?: RequestInit) =>
+        api.fetcher(input, init),
+      { preconnect: fetch.preconnect },
+    ),
+  );
+  const db = fakeReadDb();
+  workerEnv.DB = db.db;
+  const unlisted = defineAgentConfig({
+    description: "Reads Slack conversations.",
+    name: "Reader Agent",
+    ownerInstructions: "Prefer short answers.",
+    read: { lookbackSeconds: 3600, maxMessages: 50 },
+  });
+  const configs = [
+    { config: readConfig, specifier: "../src/agent.ts?read-dm-guest" },
+    { config: unlisted, specifier: "../src/agent.ts?read-dm-unlisted" },
+  ];
+  try {
+    for (const { config, specifier } of configs) {
+      // oxlint-disable-next-line no-await-in-loop
+      await mock.module("../agent.config.ts", () => ({ default: config }));
+      // oxlint-disable-next-line no-await-in-loop
+      const entry: unknown = await import(specifier);
+      const slackAgent = v.parse(
+        v.object({ SlackAgent: v.function() }),
+        entry,
+      ).SlackAgent;
+      mounted.length = 0;
+      delivery = {
+        ...directMessage,
+        attributes: {
+          ...directMessage.attributes,
+          channelId: "D888",
+          recipientUserId: "U333",
+        },
+      };
+      slackAgent({ id: "test" });
+
+      const readChannelSince = mounted.find(
+        (tool) => tool.name === "read_channel_since",
+      );
+      if (readChannelSince === undefined) {
+        throw new Error("read_channel_since was not mounted");
+      }
+      expect(
+        // oxlint-disable-next-line no-await-in-loop
+        await failureOf(
+          Promise.resolve(
+            readChannelSince.run({
+              data: { channel: "CJOINED" },
+              log: silentLog,
+              toolCallId: "read-call",
+            }),
+          ),
+        ),
+      ).toBe("read_channel_since can only read this conversation's channel");
+      // oxlint-disable-next-line no-await-in-loop
+      await withFixedClock(async () => {
+        await readChannelSince.run({
+          data: {},
+          log: silentLog,
+          toolCallId: "read-call",
+        });
+      });
+    }
+    expect(
+      api.calls
+        .filter((call) => call.method === "conversations.history")
+        .map((call) => call.params.get("channel")),
+    ).toEqual(["D888", "D888"]);
   } finally {
     network.mockRestore();
     await mock.module("../agent.config.ts", () => ({ default: shipped }));
