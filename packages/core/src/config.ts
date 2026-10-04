@@ -163,16 +163,16 @@ const resolveSkills = (skills: readonly Skill[]): readonly Skill[] => {
   return Object.freeze([...skills]);
 };
 
-const resolveRetentionDays = (
+const resolvePositiveInteger = (
   field: string,
   value: number | undefined,
   fallback: number,
 ): number => {
-  const days = value ?? fallback;
-  if (!(Number.isInteger(days) && days > 0)) {
+  const resolved = value ?? fallback;
+  if (!(Number.isInteger(resolved) && resolved > 0)) {
     throw new Error(`Agent config requires positive integer ${field}`);
   }
-  return days;
+  return resolved;
 };
 
 // The one predicate that decides whether the deployment can ask a person to
@@ -212,12 +212,12 @@ export const defineAgentConfig = (config: AgentConfig): ResolvedAgentConfig => {
     name: config.name.trim(),
     ownerInstructions: config.ownerInstructions.trim(),
     retention: Object.freeze({
-      channelDays: resolveRetentionDays(
+      channelDays: resolvePositiveInteger(
         "channelDays",
         config.retention?.channelDays,
         CHANNEL_RETENTION_DAYS,
       ),
-      privateDays: resolveRetentionDays(
+      privateDays: resolvePositiveInteger(
         "privateDays",
         config.retention?.privateDays,
         PRIVATE_RETENTION_DAYS,
