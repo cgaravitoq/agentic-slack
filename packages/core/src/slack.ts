@@ -59,6 +59,7 @@ export interface RoutedSlackLifecycle {
   appId: string;
   channelId: string;
   threadTs: string;
+  userId: string;
 }
 
 export type RoutedSlackEvent = RoutedSlackTurn | RoutedSlackLifecycle;
@@ -88,6 +89,7 @@ const routeSlackEvent = (
       kind: "lifecycle",
       teamId: payload.team_id,
       threadTs: event.assistant_thread.thread_ts,
+      userId: event.assistant_thread.user_id,
     };
   }
   if (event.type === "app_mention") {
