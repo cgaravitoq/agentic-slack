@@ -5,7 +5,7 @@
   "type": "module",
   "dependencies": {
     "@agentic-slack/core": "workspace:*",
-    "@flue/runtime": "2.0.3",
+    "@flue/runtime": "2.2.2",
     "hono": "4.13.7",
     "valibot": "1.4.2"
   }
