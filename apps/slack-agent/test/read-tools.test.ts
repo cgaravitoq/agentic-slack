@@ -254,6 +254,46 @@ test("returns every message of a thread that spans two pages", async () => {
   ).toHaveLength(2);
 });
 
+test("bounds a thread read across a page boundary and resumes it to the end", async () => {
+  const parentTs = at(-300);
+  const messages = threadMessages(parentTs, 21);
+  const harness = readHarness({
+    binding: channelBinding("C1", parentTs),
+    fixture: {
+      channels: {},
+      members: [],
+      pageSize: 20,
+      threads: { [`C1:${parentTs}`]: messages },
+      users: { U111: "Ada", U222: "Grace" },
+    },
+    lookbackSeconds: 3600,
+    maxMessages: 20,
+  });
+  const allTs = messages.map((message) => message.ts);
+
+  const first = await harness.threadTool.run({
+    data: {},
+    log: silentLog,
+    toolCallId: "read-call",
+  });
+  expect(first.output.messages.map((message) => message.ts)).toEqual(
+    allTs.slice(0, 20),
+  );
+  expect(first.output.coverage.truncated).toBe(true);
+  expect(first.output.coverage.nextCursor).toBe(allTs[19] ?? null);
+
+  const second = await harness.threadTool.run({
+    data: { oldest: first.output.coverage.nextCursor ?? undefined },
+    log: silentLog,
+    toolCallId: "read-call",
+  });
+  expect(second.output.messages.map((message) => message.ts)).toEqual(
+    allTs.slice(20),
+  );
+  expect(second.output.coverage.truncated).toBe(false);
+  expect(second.output.coverage.nextCursor).toBeNull();
+});
+
 test("expands a parent older than the cursor when its reply is not", async () => {
   const parentTs = at(-800);
   const replyTs = at(-300);
