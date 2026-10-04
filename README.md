@@ -8,8 +8,8 @@ Replies always go to the requesting thread.
 
 The agent has no built-in business integrations or external tools.
 Business tools live in an MCP server you operate, and procedures ship as Agent Skills; both are declared in `apps/slack-agent/agent.config.ts`.
-It receives admitted mentions and DMs, not the complete history of a Slack channel.
-Configure its name, instructions, suggested prompts, allowed users, retention, model, MCP servers, and skills in `apps/slack-agent/agent.config.ts`.
+It receives admitted mentions and DMs, not the complete history of a Slack channel; with the opt-in `read` option it can also read a thread or a channel's recent messages it is allowed to see.
+Configure its name, instructions, suggested prompts, allowed users, retention, model, MCP servers, skills, and read tools in `apps/slack-agent/agent.config.ts`.
 
 This Bun monorepo separates reusable Slack admission and delivery code from the deployed application.
 The current runtime uses Flue, Cloudflare Workers, Durable Objects, D1, and Workers AI.
@@ -33,10 +33,10 @@ flowchart LR
 
 ## Architecture
 
-The core owns Slack admission and delivery, deduplication, retention helpers, and instruction composition.
-The application selects Workers AI and connects the Flue agent lifecycle to durable delivery and retention.
+The core owns Slack admission and delivery, deduplication, retention helpers, instruction composition, and the opt-in Slack read tools.
+The application selects Workers AI and connects the Flue agent lifecycle to durable delivery, retention, and the read tools' delivery-bound scope.
 
-The operator surface is `apps/slack-agent/agent.config.ts`: name, description, owner instructions, allowed users, suggested prompts, retention, model, MCP servers, and skills.
+The operator surface is `apps/slack-agent/agent.config.ts`: name, description, owner instructions, allowed users, suggested prompts, retention, model, MCP servers, skills, and the opt-in `read` tools.
 An operator repository that pins this one can keep that file outside it; see [Consume a pinned copy](#consume-a-pinned-copy).
 
 The Worker claims the event in D1 and dispatches the turn to the Durable Object before it acknowledges, so an event Slack is told to stop retrying is already admitted durably.
@@ -156,6 +156,50 @@ The instructions load when the model activates the skill, and any other file in 
 The build packages the whole directory into the Worker, so a skill directory must contain no secrets or private keys.
 Two skills that share a name are rejected when the config is defined.
 
+## Reading Slack conversations
+
+Reading Slack is opt-in, with the `read` option in `apps/slack-agent/agent.config.ts`:
+
+```ts
+export default defineAgentConfig({
+  // ...the rest of your configuration
+  read: {
+    lookbackSeconds: 86_400,
+    maxMessages: 200,
+  },
+});
+```
+
+`read` mounts two tools for the model:
+
+- `read_thread` pages `conversations.replies` to the end of one thread.
+- `read_channel_since` reads the messages posted in one channel after a cursor, oldest first, and expands the parents whose `latest_reply` is after that cursor, because `conversations.history` returns top-level messages only.
+
+Both return compact records - author display name, timestamp, permalink, text - plus a coverage block, and both are bounded by `maxMessages` per call.
+`lookbackSeconds` bounds how far before the cursor `read_channel_since` scans for thread parents.
+The defaults are 86400 seconds and 200 messages.
+
+### The coverage contract
+
+A result carries `coverage: { oldest, latest, lookback, parentsExpanded, truncated, nextCursor }`.
+`oldest` is the earliest point the call looked at and `latest` the newest it reached, `parentsExpanded` counts the threads it expanded, and `truncated` says the `maxMessages` bound cut the returned messages short, in which case `nextCursor` names the last message returned.
+A truncated result is resumable: call the tool again with `oldest` set to `nextCursor`, and continue until `truncated` is false and `nextCursor` is null.
+A reply under a parent older than the lookback is outside the scan, so it is not returned; `oldest` names that boundary, which is what makes the gap visible instead of silent.
+
+### The read bound comes from trusted code
+
+The model never chooses which conversation a read may touch.
+In a channel conversation the tools read only the channel and thread of the delivered message, taken from the delivery binding, and any other channel argument is refused.
+In the owner's DM the model may name a channel, and the read happens only if `conversations.info` reports the bot as a member of it.
+Pair the option with `allowedUserIds` so only the owner reaches that surface.
+
+The per-channel watermark in D1 (`slack_read_cursors`, migration `0004_slack_read_cursors.sql`) records how far `read_channel_since` has covered a channel.
+It advances only as far as coverage is complete: to the last returned message of a truncated page, or to the moment of a read that reached the end of its window, and never past an `oldest` that skips ahead of the stored cursor.
+Slack stays the source of truth: that cursor is the only thing stored, no message is mirrored, and the tools use the bot token you already configured.
+
+Enabling the option adds three bot token scopes: `channels:history` and `groups:history` to read public and private channels, and `users:read` to resolve author display names, cached per call.
+Add them in your Slack app and reinstall it; `bun run manifest` includes them as soon as `read` is set.
+
 ## Who can talk to the agent
 
 By default any eligible human in the workspace can mention the agent or DM it.
@@ -207,7 +251,7 @@ Keep the `flue-class-FlueSlackAgentAgent` SQLite migration: Flue injects the Dur
 bun run db:migrate:staging
 ```
 
-This applies the checked-in deduplication and approval schemas to the database in your local deployment configuration.
+This applies the checked-in deduplication, approval, and Slack read cursor schemas to the database in your local deployment configuration.
 `bun run db:migrate:local` only migrates the local development store.
 
 ### 3. Create the Slack app
@@ -220,6 +264,9 @@ Under **OAuth & Permissions**, add these bot token scopes and install the app to
 - `chat:write`
 - `im:history`
 - `reactions:write`
+
+The bot token scopes are the neutral default.
+An agent configuration with the `read` option also needs `channels:history`, `groups:history`, and `users:read`; `bun run manifest` generates them with the rest.
 
 Copy the bot token from **OAuth & Permissions** and the signing secret and app ID from **Basic Information**.
 Open Slack in a browser; the workspace ID is the `T...` segment in `https://app.slack.com/client/T.../C...`.
@@ -327,6 +374,7 @@ Slack requests pass signature verification and must match the configured workspa
 When `allowedUserIds` is set, only those users can start a turn or an assistant thread; everyone else's event is answered `2xx` and dropped before it reaches the database.
 When the option is unset, any eligible human in that workspace who can reach the installed app can interact with it.
 Delivery destinations come from trusted event data, not model output.
+The Slack read tools read only what the delivered message or the bot's channel membership allows; with the `read` option unset the agent has no way to read a conversation it was not addressed in.
 A tool the operator gates with `requireApproval` reaches its MCP server only after the person who asked approves that exact call in the thread it came from.
 Instructions and output filtering reduce accidental disclosure but do not make untrusted prompts safe to receive credentials.
 Conversation data is processed by Slack and Cloudflare, including Workers AI.
