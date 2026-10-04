@@ -20,8 +20,6 @@ const MODEL_PROVIDERS = [
   MODEL_PROVIDER_BROKER,
 ] as const;
 
-// The prefix of `model` selects the backend a deployment runs on, and so which
-// binding the readiness check requires.
 export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
 
 interface SlackReadConfig {

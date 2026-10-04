@@ -20,8 +20,7 @@ const BROKER_MODEL = "gpt-6-luna";
 const TOOL_CALL_NAME = "read_thread";
 const TOOL_RESULT_TEXT = "The thread holds three messages.";
 
-// Verbatim from a Codex response recorded through the broker; only the events
-// pi-ai parses matter, so the recording's own prompt and model stay as recorded.
+// A recorded Codex response, so its model and prompt differ from this test's.
 const textFixture = await Bun.file(
   new URL("fixtures/codex-responses-text.sse", import.meta.url),
 ).text();
@@ -195,8 +194,6 @@ test("a broker turn sends its Responses request through the binding only", async
   expect(call.body.model).toBe(BROKER_MODEL);
   expect(call.body.stream).toBe(true);
   expect(call.headers.get("accept")).toBe("text/event-stream");
-  // A well-formed placeholder the broker overwrites: pi-ai only reaches the
-  // account header by parsing the bearer it is handed.
   expect(call.headers.get("authorization")).toMatch(/^Bearer \S+\.\S+\.\S+$/u);
   expect(call.headers.get("chatgpt-account-id")).not.toBeNull();
 });
