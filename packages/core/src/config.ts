@@ -2,6 +2,8 @@ import type { Skill } from "@flue/runtime";
 
 export const PRIVATE_RETENTION_DAYS = 7;
 export const CHANNEL_RETENTION_DAYS = 15;
+const READ_LOOKBACK_SECONDS = 24 * 60 * 60;
+const READ_MAX_MESSAGES = 200;
 export const MODEL = "cloudflare/@cf/zai-org/glm-4.7-flash";
 export const CLOUDFLARE_TRACING_CONTENT = false;
 export const MAX_SUGGESTED_PROMPTS = 4;
@@ -9,6 +11,16 @@ export const MAX_SUGGESTED_PROMPTS = 4;
 export interface SuggestedPrompt {
   title: string;
   message: string;
+}
+
+interface SlackReadConfig {
+  lookbackSeconds?: number;
+  maxMessages?: number;
+}
+
+interface ResolvedSlackReadConfig {
+  lookbackSeconds: number;
+  maxMessages: number;
 }
 
 interface McpServerConfig {
@@ -30,6 +42,7 @@ export interface AgentConfig {
     privateDays?: number;
     channelDays?: number;
   };
+  read?: SlackReadConfig;
   model?: string;
   mcpServers?: readonly McpServerConfig[];
   skills?: readonly Skill[];
@@ -45,6 +58,7 @@ export interface ResolvedAgentConfig {
     privateDays: number;
     channelDays: number;
   };
+  read?: ResolvedSlackReadConfig;
   model: string;
   mcpServers: readonly McpServerConfig[];
   skills: readonly Skill[];
@@ -175,6 +189,26 @@ const resolvePositiveInteger = (
   return resolved;
 };
 
+const resolveRead = (
+  read: SlackReadConfig | undefined,
+): ResolvedSlackReadConfig | undefined => {
+  if (read === undefined) {
+    return undefined;
+  }
+  return Object.freeze({
+    lookbackSeconds: resolvePositiveInteger(
+      "read.lookbackSeconds",
+      read.lookbackSeconds,
+      READ_LOOKBACK_SECONDS,
+    ),
+    maxMessages: resolvePositiveInteger(
+      "read.maxMessages",
+      read.maxMessages,
+      READ_MAX_MESSAGES,
+    ),
+  });
+};
+
 // The one predicate that decides whether the deployment can ask a person to
 // approve a call: the manifest enables interactivity on it, and the worker
 // mounts the interactions route on it.
@@ -211,6 +245,7 @@ export const defineAgentConfig = (config: AgentConfig): ResolvedAgentConfig => {
     model,
     name: config.name.trim(),
     ownerInstructions: config.ownerInstructions.trim(),
+    read: resolveRead(config.read),
     retention: Object.freeze({
       channelDays: resolvePositiveInteger(
         "channelDays",

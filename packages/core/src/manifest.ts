@@ -7,6 +7,16 @@ export const generateSlackManifest = (
 ): string => {
   const { origin } = new URL(deployedUrl);
   const gatesACall = requiresApproval(config);
+  const botScopes = [
+    "app_mentions:read",
+    "assistant:write",
+    "chat:write",
+    "im:history",
+    "reactions:write",
+    ...(config.read === undefined
+      ? []
+      : ["channels:history", "groups:history", "users:read"]),
+  ].toSorted();
   return JSON.stringify(
     {
       display_information: {
@@ -23,13 +33,7 @@ export const generateSlackManifest = (
       },
       oauth_config: {
         scopes: {
-          bot: [
-            "app_mentions:read",
-            "assistant:write",
-            "chat:write",
-            "im:history",
-            "reactions:write",
-          ],
+          bot: botScopes,
         },
       },
       settings: {

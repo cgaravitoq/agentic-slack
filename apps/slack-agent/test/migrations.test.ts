@@ -144,6 +144,7 @@ describe("D1 migration schema", () => {
       "0001_seen_events.sql",
       "0002_seen_events_created_at.sql",
       "0003_approval_requests.sql",
+      "0004_slack_read_cursors.sql",
     ]);
     expect(
       applyOrder([
@@ -164,6 +165,9 @@ describe("D1 migration schema", () => {
       "CREATE TABLE IF NOT EXISTS approval_requests",
     );
     expect(batches[2]).toContain("CREATE INDEX");
+    expect(batches[3]).toContain(
+      "CREATE TABLE IF NOT EXISTS slack_read_cursors",
+    );
   });
 
   test("indexes created_at and plans the sweep through that index", async () => {
