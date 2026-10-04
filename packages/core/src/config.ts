@@ -24,6 +24,7 @@ export interface AgentConfig {
   name: string;
   description: string;
   ownerInstructions: string;
+  allowedUserIds?: readonly string[];
   suggestedPrompts?: readonly SuggestedPrompt[];
   retention?: {
     privateDays?: number;
@@ -38,6 +39,7 @@ export interface ResolvedAgentConfig {
   name: string;
   description: string;
   ownerInstructions: string;
+  allowedUserIds: readonly string[];
   suggestedPrompts: readonly SuggestedPrompt[];
   retention: {
     privateDays: number;
@@ -47,6 +49,27 @@ export interface ResolvedAgentConfig {
   mcpServers: readonly McpServerConfig[];
   skills: readonly Skill[];
 }
+
+const SLACK_USER_ID_PATTERN = /^[UW][A-Z0-9]+$/u;
+
+const resolveAllowedUserIds = (
+  userIds: readonly string[],
+): readonly string[] => {
+  if (userIds.length === 0) {
+    throw new Error("Agent config requires at least one allowedUserId");
+  }
+  const allowed = new Set<string>();
+  for (const entry of userIds) {
+    const userId = entry.trim();
+    if (!SLACK_USER_ID_PATTERN.test(userId)) {
+      throw new Error(
+        `Agent config requires allowedUserIds entries to be Slack user ids, not ${entry}`,
+      );
+    }
+    allowed.add(userId);
+  }
+  return Object.freeze([...allowed]);
+};
 
 const resolveSuggestedPrompt = (prompt: SuggestedPrompt): SuggestedPrompt => {
   const title = prompt.title.trim();
@@ -179,6 +202,10 @@ export const defineAgentConfig = (config: AgentConfig): ResolvedAgentConfig => {
     );
   }
   return Object.freeze({
+    allowedUserIds:
+      config.allowedUserIds === undefined
+        ? Object.freeze([])
+        : resolveAllowedUserIds(config.allowedUserIds),
     description: config.description.trim(),
     mcpServers: resolveMcpServers(config.mcpServers ?? []),
     model,

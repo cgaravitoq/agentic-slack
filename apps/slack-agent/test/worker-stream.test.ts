@@ -288,7 +288,7 @@ const { SlackAgent } = v.parse(
 );
 
 class FakeD1 {
-  private readonly seen = new Set<string>();
+  readonly seen = new Set<string>();
   private values: unknown[] = [];
 
   prepare(sql: string) {
@@ -334,10 +334,10 @@ const workerBindings = v.object({
   SLACK_TEAM_ID: v.string(),
 });
 
-const testBindings = (): Cloudflare.Env => {
+const testBindings = (db: FakeD1 = new FakeD1()): Cloudflare.Env => {
   const value = {
     AI: {},
-    DB: new FakeD1(),
+    DB: db,
     FLUE_SLACK_AGENT_AGENT: {
       getByName: () => ({ refreshRetention: () => Promise.resolve() }),
     },
@@ -352,25 +352,7 @@ const testBindings = (): Cloudflare.Env => {
   return value;
 };
 
-const signedMention = async (
-  eventId: string,
-  text = "<@UAPP> hello",
-  threadTs = "171.0",
-): Promise<Request> => {
-  const body = JSON.stringify({
-    api_app_id: "A123",
-    event: {
-      channel: "C777",
-      text,
-      thread_ts: threadTs,
-      ts: "171.1",
-      type: "app_mention",
-      user: "U777",
-    },
-    event_id: eventId,
-    team_id: "T123",
-    type: "event_callback",
-  });
+const signedEventsRequest = async (body: string): Promise<Request> => {
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const key = await crypto.subtle.importKey(
     "raw",
@@ -397,50 +379,74 @@ const signedMention = async (
   });
 };
 
+const signedMention = async (
+  eventId: string,
+  text = "<@UAPP> hello",
+  threadTs = "171.0",
+  user = "U777",
+): Promise<Request> =>
+  await signedEventsRequest(
+    JSON.stringify({
+      api_app_id: "A123",
+      event: {
+        channel: "C777",
+        text,
+        thread_ts: threadTs,
+        ts: "171.1",
+        type: "app_mention",
+        user,
+      },
+      event_id: eventId,
+      team_id: "T123",
+      type: "event_callback",
+    }),
+  );
+
 const signedDirectMessage = async (
   eventId: string,
   ts: string,
   text = "hello",
-): Promise<Request> => {
-  const body = JSON.stringify({
-    api_app_id: "A123",
-    event: {
-      channel: "D777",
-      channel_type: "im",
-      text,
-      ts,
-      type: "message",
-      user: "U777",
-    },
-    event_id: eventId,
-    team_id: "T123",
-    type: "event_callback",
-  });
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(SIGNING_SECRET),
-    { hash: "SHA-256", name: "HMAC" },
-    false,
-    ["sign"],
+  user = "U777",
+): Promise<Request> =>
+  await signedEventsRequest(
+    JSON.stringify({
+      api_app_id: "A123",
+      event: {
+        channel: "D777",
+        channel_type: "im",
+        text,
+        ts,
+        type: "message",
+        user,
+      },
+      event_id: eventId,
+      team_id: "T123",
+      type: "event_callback",
+    }),
   );
-  const bytes = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    new TextEncoder().encode(`v0:${timestamp}:${body}`),
+
+const signedAssistantThreadStarted = async (
+  eventId: string,
+  userId: string,
+): Promise<Request> =>
+  await signedEventsRequest(
+    JSON.stringify({
+      api_app_id: "A123",
+      event: {
+        assistant_thread: {
+          channel_id: "D888",
+          context: {},
+          thread_ts: "190.1",
+          user_id: userId,
+        },
+        event_ts: "190.2",
+        type: "assistant_thread_started",
+      },
+      event_id: eventId,
+      team_id: "T123",
+      type: "event_callback",
+    }),
   );
-  return new Request("https://example.com/channels/slack/events", {
-    body,
-    headers: {
-      "content-type": "application/json",
-      "x-slack-request-timestamp": timestamp,
-      "x-slack-signature": `v0=${Array.from(new Uint8Array(bytes), (byte) =>
-        byte.toString(16).padStart(2, "0"),
-      ).join("")}`,
-    },
-    method: "POST",
-  });
-};
 
 // The ingress awaits the claim and the dispatch, so it defers nothing to the
 // request's context; the worker's own `waitUntil` is where the reaction lives.
@@ -1336,4 +1342,76 @@ test("mounts the interactions route only when the config gates a call", async ()
     ),
   ).toBe(200);
   expect(await interactionStatusFor([], "../src/index.ts?ungated")).toBe(404);
+});
+
+// The allowlist has to hold on the real entry point, where the reaction and the
+// model dispatch live, not only inside the ingress: an event from anyone the
+// config does not name must leave no Slack call, no D1 row and no dispatch.
+test("admits the allowlisted user and drops every other user before any side effect", async () => {
+  const { default: shipped } = await import("../agent.config.ts");
+  await mock.module("../agent.config.ts", () => ({
+    default: defineAgentConfig({
+      allowedUserIds: ["U777"],
+      description: "Answers Slack conversations.",
+      name: "Owner Agent",
+      ownerInstructions: "Prefer short answers.",
+    }),
+  }));
+  const db = new FakeD1();
+  const bindings = testBindings(db);
+  const specifier = `../src/index.ts?owner-allowlist`;
+  try {
+    const entry: unknown = await import(specifier);
+    const worker = v.parse(
+      v.object({ default: v.object({ request: v.function() }) }),
+      entry,
+    ).default;
+    const deferred: Promise<unknown>[] = [];
+    const deliver = async (request: Request): Promise<number> => {
+      const response: unknown = await worker.request(
+        request,
+        undefined,
+        bindings,
+        {
+          passThroughOnException() {},
+          props: {},
+          waitUntil(promise: Promise<unknown>) {
+            deferred.push(promise);
+          },
+        },
+      );
+      return v.parse(v.instance(Response), response).status;
+    };
+
+    const refused = [
+      await signedMention(
+        "Ev-stranger-mention",
+        "<@UAPP> hello",
+        "171.0",
+        "U888",
+      ),
+      await signedDirectMessage("Ev-stranger-dm", "172.1", "hello", "U888"),
+      await signedAssistantThreadStarted("Ev-stranger-assistant", "U888"),
+    ];
+    for (const request of refused) {
+      // oxlint-disable-next-line no-await-in-loop
+      expect(await deliver(request)).toBe(200);
+    }
+    await Promise.all(workerWaitUntil);
+
+    expect(deferred).toEqual([]);
+    expect(workerWaitUntil).toEqual([]);
+    expect(db.seen.size).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect(slackCalls).toEqual([]);
+
+    expect(await deliver(await signedMention("Ev-owner-mention"))).toBe(200);
+    await Promise.all(workerWaitUntil);
+
+    expect(db.seen.has("Ev-owner-mention")).toBe(true);
+    expect(dispatched).toHaveLength(1);
+    expect(slackCalls.map((call) => call.method)).toEqual(["reactions.add"]);
+  } finally {
+    await mock.module("../agent.config.ts", () => ({ default: shipped }));
+  }
 });

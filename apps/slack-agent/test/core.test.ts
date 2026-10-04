@@ -125,6 +125,37 @@ describe("neutral core composition", () => {
       }),
     ).toThrow("Agent config requires positive integer channelDays");
   });
+
+  test("admits every user until an allowlist names the ones it trusts", () => {
+    expect(config.allowedUserIds).toEqual([]);
+
+    const allowed = defineAgentConfig({
+      allowedUserIds: ["U123", " W456 "],
+      description: "Restricts who can talk to it.",
+      name: "Owner Agent",
+      ownerInstructions: "Prefer short answers.",
+    });
+
+    expect(allowed.allowedUserIds).toEqual(["U123", "W456"]);
+    expect(Object.isFrozen(allowed.allowedUserIds)).toBe(true);
+  });
+
+  test("rejects an empty or malformed allowlist at config time", () => {
+    const required = {
+      description: "Rejects invalid operator fields.",
+      name: "Invalid Agent",
+      ownerInstructions: "Be concise.",
+    };
+
+    expect(() =>
+      defineAgentConfig({ ...required, allowedUserIds: [] }),
+    ).toThrow("Agent config requires at least one allowedUserId");
+    for (const allowedUserIds of [["owner"], ["u123"], ["U 123"], [""]]) {
+      expect(() => defineAgentConfig({ ...required, allowedUserIds })).toThrow(
+        "Agent config requires allowedUserIds entries to be Slack user ids",
+      );
+    }
+  });
 });
 
 describe("D1 claim lifecycle", () => {

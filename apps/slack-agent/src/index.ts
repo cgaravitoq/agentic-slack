@@ -18,6 +18,7 @@ import { createLifecycleHandler } from "./lifecycle.ts";
 
 const bindings: WorkerBindings = env;
 const trusted = {
+  allowedUserIds: config.allowedUserIds,
   appId: bindings.SLACK_APP_ID,
   botToken: bindings.SLACK_BOT_TOKEN,
   signingSecret: bindings.SLACK_SIGNING_SECRET,

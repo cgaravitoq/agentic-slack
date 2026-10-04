@@ -37,6 +37,7 @@ export interface TrustedSlackConfig {
   botToken: string;
   teamId: string;
   appId: string;
+  allowedUserIds?: readonly string[];
 }
 
 export interface RoutedSlackTurn {
@@ -59,6 +60,7 @@ export interface RoutedSlackLifecycle {
   appId: string;
   channelId: string;
   threadTs: string;
+  userId: string;
 }
 
 export type RoutedSlackEvent = RoutedSlackTurn | RoutedSlackLifecycle;
@@ -88,6 +90,7 @@ const routeSlackEvent = (
       kind: "lifecycle",
       teamId: payload.team_id,
       threadTs: event.assistant_thread.thread_ts,
+      userId: event.assistant_thread.user_id,
     };
   }
   if (event.type === "app_mention") {
@@ -201,6 +204,7 @@ export const createSlackIngress = (
       trusted.teamId &&
       trusted.appId,
   );
+  const allowedUserIds = trusted.allowedUserIds ?? [];
   // `createSlackChannel` mounts `/interactions` only for a handler it is given,
   // so a deployment with no decision handler exposes no endpoint whose only
   // answer is 200.
@@ -214,6 +218,14 @@ export const createSlackIngress = (
         !routed ||
         routed.teamId !== trusted.teamId ||
         routed.appId !== trusted.appId
+      ) {
+        return ack(200);
+      }
+      // A refused user is answered like a foreign workspace: before the claim,
+      // so no row, reaction, reply or model call can ever follow the event.
+      if (
+        allowedUserIds.length > 0 &&
+        !allowedUserIds.includes(routed.userId)
       ) {
         return ack(200);
       }

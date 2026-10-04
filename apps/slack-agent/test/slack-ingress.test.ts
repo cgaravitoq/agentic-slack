@@ -92,6 +92,7 @@ interface EventOverrides {
   readonly bot_id?: string;
   readonly text?: string;
   readonly thread_ts?: string;
+  readonly user?: string;
 }
 
 const eventEnvelope = v.object({
@@ -186,6 +187,23 @@ const signedRequest = (
   url = "https://example.com/events",
 ): Promise<Request> =>
   signedBody(JSON.stringify(payload), "application/json", url);
+
+const assistantStarted = (userId: string): AssistantEnvelope => ({
+  api_app_id: "A123",
+  event: {
+    assistant_thread: {
+      channel_id: "D999",
+      context: {},
+      thread_ts: "180.1",
+      user_id: userId,
+    },
+    event_ts: "181.9",
+    type: "assistant_thread_started",
+  },
+  event_id: "Ev-assistant-allowlist",
+  team_id: "T123",
+  type: "event_callback",
+});
 
 // Slack posts interactivity as a form field holding the JSON payload.
 const signedInteraction = (
@@ -314,6 +332,87 @@ describe("signed Slack ingress", () => {
       }),
     );
     expect(admitted).toEqual([]);
+  });
+});
+
+describe("owner allowlist", () => {
+  const owner = { ...trusted, allowedUserIds: ["U123"] };
+  const directMessage = (userId: string, eventId: string): EventEnvelope => ({
+    ...event(),
+    event: {
+      channel: "D123",
+      channel_type: "im",
+      text: "private hello",
+      ts: "172.1",
+      type: "message",
+      user: userId,
+    },
+    event_id: eventId,
+  });
+
+  test("claims and dispatches a listed user's mention and DM", async () => {
+    const db = new FakeD1();
+    const admitted: string[] = [];
+    const channel = createSlackIngress(owner, (turn) => {
+      admitted.push(`${turn.userId}:${turn.eventId}`);
+      return Promise.resolve();
+    });
+    const bindings = testBindings(db);
+
+    const mention = await channel
+      .route()
+      .request(await signedRequest(event()), undefined, bindings);
+    expect(mention.status).toBe(200);
+    expect(db.seen.has("Ev123")).toBe(true);
+
+    const dm = await channel
+      .route()
+      .request(
+        await signedRequest(directMessage("U123", "Ev-dm")),
+        undefined,
+        bindings,
+      );
+    expect(dm.status).toBe(200);
+    expect(db.seen.has("Ev-dm")).toBe(true);
+    expect(admitted).toEqual(["U123:Ev123", "U123:Ev-dm"]);
+  });
+
+  // Slack must stop redelivering a refused event, and nothing may follow it:
+  // no claim row, no reaction, no reply and no model call.
+  test("answers 2xx and claims nothing for a mention, a DM or an assistant start from anyone else", async () => {
+    const db = new FakeD1();
+    const turns: string[] = [];
+    const lifecycles: string[] = [];
+    const channel = createSlackIngress(
+      owner,
+      (turn) => {
+        turns.push(turn.eventId);
+        return Promise.resolve();
+      },
+      (lifecycle) => {
+        lifecycles.push(lifecycle.eventId);
+        return Promise.resolve();
+      },
+    );
+    const bindings = testBindings(db);
+
+    const refused: (AssistantEnvelope | EventEnvelope)[] = [
+      event({ user: "U999" }),
+      directMessage("U999", "Ev-dm-refused"),
+      assistantStarted("U999"),
+    ];
+    await Promise.all(
+      refused.map(async (payload) => {
+        const response = await channel
+          .route()
+          .request(await signedRequest(payload), undefined, bindings);
+        expect(response.status).toBe(200);
+      }),
+    );
+
+    expect(db.seen.size).toBe(0);
+    expect(turns).toEqual([]);
+    expect(lifecycles).toEqual([]);
   });
 });
 
