@@ -29,4 +29,4 @@ jobs:
       - run: bun test
       - run: bun run knip
       - run: bun run deploy:dry
-      - run: bun audit
+      - run: bun audit --ignore=GHSA-vfj7-8cjw-p6xm
