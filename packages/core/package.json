@@ -5,8 +5,8 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
-    "@flue/runtime": "2.0.3",
-    "@flue/slack": "2.0.3",
+    "@flue/runtime": "2.2.2",
+    "@flue/slack": "2.2.2",
     "valibot": "1.4.2"
   }
 }

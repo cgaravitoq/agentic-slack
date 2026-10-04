@@ -2,9 +2,11 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import {
   createSlackIngress,
   defineAgentConfig,
+  MODEL_PROVIDER_CLOUDFLARE,
   setSuggestedPrompts,
 } from "@agentic-slack/core";
 import type {
+  ModelBrokerBinding,
   SlackBlockActionsPayload,
   SlackCoreBindings,
 } from "@agentic-slack/core";
@@ -74,6 +76,10 @@ const workerBindings = v.object({
     (value): value is DurableObjectNamespace<ConversationLifecycleAgent> =>
       value !== null && typeof value === "object",
   ),
+  MODEL_BROKER: v.custom<ModelBrokerBinding>(
+    (value): value is ModelBrokerBinding =>
+      value !== null && typeof value === "object",
+  ),
 });
 
 const testBindings = (db: FakeD1): SlackCoreBindings => {
@@ -81,6 +87,7 @@ const testBindings = (db: FakeD1): SlackCoreBindings => {
     AI: {},
     DB: db,
     FLUE_SLACK_AGENT_AGENT: {},
+    MODEL_BROKER: { fetch: () => Promise.resolve(new Response(null)) },
   };
   if (!v.is(workerBindings, value)) {
     throw new Error("Invalid test bindings");
@@ -787,6 +794,7 @@ describe("assistant thread lifecycle", () => {
     });
     const app = createApp(
       trusted,
+      MODEL_PROVIDER_CLOUDFLARE,
       (turn) => {
         turns.push(turn.eventId);
         return Promise.resolve();
@@ -858,6 +866,7 @@ describe("assistant thread lifecycle", () => {
     });
     const app = createApp(
       secondTrusted,
+      MODEL_PROVIDER_CLOUDFLARE,
       (turn) => {
         turns.push(turn.eventId);
         return Promise.resolve();

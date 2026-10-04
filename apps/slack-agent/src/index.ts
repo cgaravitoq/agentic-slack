@@ -8,13 +8,13 @@ import {
 } from "@agentic-slack/core";
 import { init, instrument, setProvider } from "@flue/runtime";
 import { createCloudflareTracing } from "@flue/runtime/cloudflare";
-import { cloudflareBindingProvider } from "@flue/runtime/cloudflare/workers-ai";
 import config from "../agent.config.ts";
 import { SlackAgent } from "./agent.ts";
 import { createApp } from "./app.ts";
 import type { WorkerBindings } from "./app.ts";
 import { createApprovalHandler } from "./approval.ts";
 import { createLifecycleHandler } from "./lifecycle.ts";
+import { selectProvider } from "./provider.ts";
 
 const bindings: WorkerBindings = env;
 const trusted = {
@@ -26,14 +26,13 @@ const trusted = {
 };
 
 instrument(createCloudflareTracing({ content: CLOUDFLARE_TRACING_CONTENT }));
-setProvider(
-  cloudflareBindingProvider({ binding: bindings.AI, gateway: false }),
-);
+setProvider(selectProvider(config.modelProvider, bindings));
 
 // The Workers runtime calls this default export; no repo code imports it.
 /** @public */
 export default createApp(
   trusted,
+  config.modelProvider,
   async (turn, instanceId, turnBindings) => {
     await refreshRetention(
       turnBindings.FLUE_SLACK_AGENT_AGENT,

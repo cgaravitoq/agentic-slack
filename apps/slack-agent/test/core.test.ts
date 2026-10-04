@@ -11,6 +11,8 @@ import {
   expireLatest,
   generateSlackManifest,
   missingReadiness,
+  MODEL_PROVIDER_BROKER,
+  MODEL_PROVIDER_CLOUDFLARE,
   replaceRetention,
   setSuggestedPrompts,
 } from "@agentic-slack/core";
@@ -124,6 +126,43 @@ describe("neutral core composition", () => {
         retention: { channelDays: 1.5, privateDays: 7 },
       }),
     ).toThrow("Agent config requires positive integer channelDays");
+  });
+
+  test("rejects a model whose prefix names no known provider", () => {
+    expect(() =>
+      defineAgentConfig({
+        description: "Rejects an unknown provider prefix.",
+        model: "unknown/test-model",
+        name: "Unknown Provider Agent",
+        ownerInstructions: "Be concise.",
+      }),
+    ).toThrow("Agent config requires model to name a known provider");
+    expect(() =>
+      defineAgentConfig({
+        description: "Rejects a model without a provider prefix.",
+        model: "test-model",
+        name: "Bare Model Agent",
+        ownerInstructions: "Be concise.",
+      }),
+    ).toThrow("Agent config requires model to name a known provider");
+  });
+
+  test("keeps the provider prefix with the model it selects", () => {
+    const required = {
+      description: "Selects a provider.",
+      name: "Provider Agent",
+      ownerInstructions: "Be concise.",
+    };
+    const defaulted = defineAgentConfig(required);
+    expect(defaulted.model).toBe(MODEL);
+    expect(defaulted.modelProvider).toBe(MODEL_PROVIDER_CLOUDFLARE);
+
+    const brokered = defineAgentConfig({
+      ...required,
+      model: "broker/gpt-6-luna",
+    });
+    expect(brokered.model).toBe("broker/gpt-6-luna");
+    expect(brokered.modelProvider).toBe(MODEL_PROVIDER_BROKER);
   });
 
   test("admits every user until an allowlist names the ones it trusts", () => {
@@ -330,6 +369,7 @@ describe("readiness and manifest", () => {
           teamId: "",
         },
         {},
+        MODEL_PROVIDER_CLOUDFLARE,
       ),
     ).toEqual([
       "SLACK_SIGNING_SECRET",

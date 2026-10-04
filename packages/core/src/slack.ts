@@ -4,6 +4,8 @@ import type {
   SlackEventCallbackPayload,
   SlackEventsApiPayload,
 } from "@flue/slack";
+import { MODEL_PROVIDER_CLOUDFLARE } from "./config.ts";
+import type { ModelProvider } from "./config.ts";
 import { claimAndRun } from "./dedup.ts";
 import type {
   ConversationLifecycleAgent,
@@ -26,10 +28,15 @@ const isEventCallbackEnvelope = (
   payload.api_app_id !== "" &&
   payload.event_id !== "";
 
+export interface ModelBrokerBinding {
+  fetch: (request: Request) => Promise<Response>;
+}
+
 export interface SlackCoreBindings {
   DB: D1Database;
   FLUE_SLACK_AGENT_AGENT: DurableObjectNamespace<ConversationLifecycleAgent>;
   AI: Ai;
+  MODEL_BROKER: ModelBrokerBinding;
 }
 
 export interface TrustedSlackConfig {
@@ -156,6 +163,7 @@ const claimThenAcknowledge = async (
 export const missingReadiness = (
   trusted: TrustedSlackConfig,
   bindings: Partial<SlackCoreBindings>,
+  modelProvider: ModelProvider,
 ): string[] => {
   const missing: string[] = [];
   if (!trusted.signingSecret) {
@@ -176,8 +184,12 @@ export const missingReadiness = (
   if (!bindings.FLUE_SLACK_AGENT_AGENT) {
     missing.push("FLUE_SLACK_AGENT_AGENT");
   }
-  if (!bindings.AI) {
-    missing.push("AI");
+  if (modelProvider === MODEL_PROVIDER_CLOUDFLARE) {
+    if (!bindings.AI) {
+      missing.push("AI");
+    }
+  } else if (!bindings.MODEL_BROKER) {
+    missing.push("MODEL_BROKER");
   }
   return missing;
 };

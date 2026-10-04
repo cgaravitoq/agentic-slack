@@ -18,9 +18,11 @@ export { setSuggestedPrompts } from "./assistant.ts";
 export {
   CLOUDFLARE_TRACING_CONTENT,
   defineAgentConfig,
+  MODEL_PROVIDER_BROKER,
+  MODEL_PROVIDER_CLOUDFLARE,
   requiresApproval,
 } from "./config.ts";
-export type { ResolvedAgentConfig } from "./config.ts";
+export type { ModelProvider, ResolvedAgentConfig } from "./config.ts";
 export {
   applySlackDeliveryEvent,
   createSqlSlackDeliveryStore,
@@ -47,6 +49,7 @@ export {
 export type { ExpiryPayload, ExpirySchedule } from "./retention.ts";
 export { createSlackIngress, missingReadiness } from "./slack.ts";
 export type {
+  ModelBrokerBinding,
   RoutedSlackLifecycle,
   RoutedSlackTurn,
   SlackCoreBindings,
