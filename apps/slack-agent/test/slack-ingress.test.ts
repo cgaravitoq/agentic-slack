@@ -384,8 +384,6 @@ describe("owner allowlist", () => {
     expect(admitted).toEqual(["U123:Ev123", "U123:Ev-dm"]);
   });
 
-  // Slack must stop redelivering a refused event, and nothing may follow it:
-  // no claim row, no reaction, no reply and no model call.
   test("answers 2xx and claims nothing for a mention, a DM or an assistant start from anyone else", async () => {
     const db = new FakeD1();
     const turns: string[] = [];

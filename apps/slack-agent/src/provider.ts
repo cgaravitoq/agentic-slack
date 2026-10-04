@@ -94,9 +94,6 @@ const brokerProvider = (broker: ModelBrokerBinding): RuntimeProvider => {
   });
 };
 
-// Flue resolves `provider-id/model-id` against the providers registered here,
-// so the config's model prefix and this map are the one place that pairs a
-// deployment's chosen backend with the binding it needs.
 const providerFactories = {
   [MODEL_PROVIDER_BROKER]: (bindings: SlackCoreBindings) =>
     brokerProvider(bindings.MODEL_BROKER),
