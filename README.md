@@ -12,7 +12,7 @@ It receives admitted mentions and DMs, not the complete history of a Slack chann
 Configure its name, instructions, suggested prompts, allowed users, retention, model, MCP servers, skills, and read tools in `apps/slack-agent/agent.config.ts`.
 
 This Bun monorepo separates reusable Slack admission and delivery code from the deployed application.
-The current runtime uses Flue, Cloudflare Workers, Durable Objects, D1, and Workers AI.
+The current runtime uses Flue, Cloudflare Workers, Durable Objects, and D1, and runs the model on Workers AI or through a credential broker you operate; see [Model providers](#model-providers).
 It is self-hosted in your Cloudflare account; it is not a cloud-independent runtime or a locally hosted model.
 
 ![A real Slack thread where Bloop turns a fictional release plan into a checklist, then keeps the task owners while moving the release to Monday.](assets/slack-demo.png)
@@ -26,7 +26,7 @@ flowchart LR
     Slack[Slack mention or DM] --> Ingress[Worker: verify signature and workspace]
     Ingress --> Dedup[D1: deduplicate event]
     Dedup --> Agent[Durable Object: conversation and delivery]
-    Agent --> Model[Workers AI]
+    Agent --> Model[Workers AI or a credential broker]
     Model --> Agent
     Agent --> Reply[Slack: stream to the requesting thread]
 ```
@@ -34,7 +34,7 @@ flowchart LR
 ## Architecture
 
 The core owns Slack admission and delivery, deduplication, retention helpers, instruction composition, and the opt-in Slack read tools.
-The application selects Workers AI and connects the Flue agent lifecycle to durable delivery, retention, and the read tools' delivery-bound scope.
+The application selects the provider the model prefix names and connects the Flue agent lifecycle to durable delivery, retention, and the read tools' delivery-bound scope.
 
 The operator surface is `apps/slack-agent/agent.config.ts`: name, description, owner instructions, allowed users, suggested prompts, retention, model, MCP servers, skills, and the opt-in `read` tools.
 An operator repository that pins this one can keep that file outside it; see [Consume a pinned copy](#consume-a-pinned-copy).
@@ -47,6 +47,49 @@ The stream destination rides in each dispatched message's attributes, set by the
 Flue answers a message that arrives while the conversation is busy inside the running response, so one response can carry several requesting threads.
 The delivery record keeps every one of those destinations and delivers the reply to each, which is what keeps a burst of DMs from leaving all but the first unanswered.
 A tool the operator gates with `requireApproval` is stopped inside its MCP connection: the Worker records the request in D1 and posts the Approve/Reject card, and only the approved call is forwarded to the server.
+
+## Model providers
+
+`model` is `provider-id/model-id`, and its prefix selects one of two providers:
+
+- `cloudflare/...` runs the model on Workers AI through the `AI` binding, which is what the shipped configuration and `wrangler.jsonc` use.
+- `broker/...` runs a Codex model on the Responses API through a service binding named `MODEL_BROKER`, so the deployment holds no model credential.
+
+Leaving `model` unset is the same as a `cloudflare/...` model, and any other prefix fails when the configuration is defined.
+`/health` lists exactly the binding the prefix needs: `AI` for `cloudflare`, `MODEL_BROKER` for `broker`, and never both.
+
+### Run on Workers AI
+
+The default, `cloudflare/@cf/zai-org/glm-4.7-flash`, is served by the Workers AI binding your Wrangler configuration binds as `AI`.
+Any `@cf/...` id works after the prefix, whether or not the pinned runtime's catalog declares it; an id it does not know resolves without model metadata.
+
+### Run through a credential broker
+
+`broker/gpt-6-luna` runs the model on a credential broker you operate: a Worker entrypoint that adds the credential, calls the model, and streams the answer back.
+This repository never holds that credential, and neither its code nor its configuration names the Worker that does; the deployment only names the binding.
+Bind the entrypoint as a service binding called `MODEL_BROKER`:
+
+```jsonc
+{
+  "services": [
+    {
+      "binding": "MODEL_BROKER",
+      "service": "your-broker-worker",
+      "entrypoint": "YourBrokerEntrypoint"
+    }
+  ]
+}
+```
+
+The broker contract is one route:
+
+- `POST /codex/responses` receives the Responses API request body with the `authorization` and `chatgpt-account-id` headers the app sends, and answers with the upstream SSE stream.
+- The broker overwrites both of those headers with the credential it holds, strips `cf-*` and `x-forwarded-*` request headers before calling the model, and never lets the credential reach the caller.
+- The app sends a well-formed placeholder bearer; the provider protocol reads the account id out of it before every request, and the broker replaces it.
+
+Requests are SSE only: the model protocol's WebSocket transport ignores an injected fetch, so a broker can carry requests only over SSE.
+The model ids available after `broker/` are the Codex Responses models the pinned `@earendil-works/pi-ai` release declares, `gpt-6-luna` among them.
+A brokered turn streams the same way a Workers AI turn does, including tool calls and compaction.
 
 ## Delivery
 
@@ -218,8 +261,8 @@ The option is admission only: an admitted user can still ask for anything the co
 
 ## Self-hosting
 
-You need Git, Bun **1.3.14**, a Cloudflare account with Workers AI enabled, and permission to create and install a Slack app in your workspace.
-Workers, Durable Objects, D1, and model inference use your Cloudflare account's quotas and billing.
+You need Git, Bun **1.3.14**, a Cloudflare account with Workers AI enabled for the default model, and permission to create and install a Slack app in your workspace.
+Workers, Durable Objects, D1, and Workers AI inference use your Cloudflare account's quotas and billing; a brokered model spends the credential your broker holds instead.
 One deployment serves one Slack app in one workspace.
 Run the commands below from the repository root.
 
@@ -377,7 +420,7 @@ Delivery destinations come from trusted event data, not model output.
 The Slack read tools read only what the delivered message or the bot's channel membership allows; with the `read` option unset the agent has no way to read a conversation it was not addressed in.
 A tool the operator gates with `requireApproval` reaches its MCP server only after the person who asked approves that exact call in the thread it came from.
 Instructions and output filtering reduce accidental disclosure but do not make untrusted prompts safe to receive credentials.
-Conversation data is processed by Slack and Cloudflare, including Workers AI.
+Conversation data is processed by Slack, by Cloudflare, and by the model provider your configuration selects.
 Tracing is enabled with model content capture disabled in the application configuration.
 
 For a suspected vulnerability, use GitHub's **Report a vulnerability** option on the repository's Security tab when it is enabled.
