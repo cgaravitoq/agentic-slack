@@ -5,6 +5,7 @@
   "type": "module",
   "dependencies": {
     "@agentic-slack/core": "workspace:*",
+    "@earendil-works/pi-ai": "0.87.1",
     "@flue/runtime": "2.2.2",
     "hono": "4.13.7",
     "valibot": "1.4.2"

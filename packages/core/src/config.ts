@@ -5,6 +5,7 @@ export const CHANNEL_RETENTION_DAYS = 15;
 const READ_LOOKBACK_SECONDS = 24 * 60 * 60;
 const READ_MAX_MESSAGES = 200;
 export const MODEL_PROVIDER_CLOUDFLARE = "cloudflare";
+export const MODEL_PROVIDER_BROKER = "broker";
 export const MODEL = `${MODEL_PROVIDER_CLOUDFLARE}/@cf/zai-org/glm-4.7-flash`;
 export const CLOUDFLARE_TRACING_CONTENT = false;
 export const MAX_SUGGESTED_PROMPTS = 4;
@@ -14,7 +15,10 @@ export interface SuggestedPrompt {
   message: string;
 }
 
-const MODEL_PROVIDERS = [MODEL_PROVIDER_CLOUDFLARE] as const;
+const MODEL_PROVIDERS = [
+  MODEL_PROVIDER_CLOUDFLARE,
+  MODEL_PROVIDER_BROKER,
+] as const;
 
 // The prefix of `model` selects the backend a deployment runs on, and so which
 // binding the readiness check requires.

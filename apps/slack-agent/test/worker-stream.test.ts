@@ -3,6 +3,7 @@ import {
   defineAgentConfig,
   slackDeliveryBindingSchema,
 } from "@agentic-slack/core";
+import type { ModelBrokerBinding } from "@agentic-slack/core";
 import {
   evictLiveSlackDelivery,
   SLACK_DELIVERY_FALLBACK,
@@ -328,6 +329,10 @@ const workerBindings = v.object({
     (value): value is DurableObjectNamespace<ConversationLifecycleAgent> =>
       value !== null && typeof value === "object",
   ),
+  MODEL_BROKER: v.custom<ModelBrokerBinding>(
+    (value): value is ModelBrokerBinding =>
+      value !== null && typeof value === "object",
+  ),
   SLACK_APP_ID: v.string(),
   SLACK_BOT_TOKEN: v.string(),
   SLACK_SIGNING_SECRET: v.string(),
@@ -341,6 +346,7 @@ const testBindings = (db: FakeD1 = new FakeD1()): Cloudflare.Env => {
     FLUE_SLACK_AGENT_AGENT: {
       getByName: () => ({ refreshRetention: () => Promise.resolve() }),
     },
+    MODEL_BROKER: { fetch: () => Promise.resolve(new Response(null)) },
     SLACK_APP_ID: "A123",
     SLACK_BOT_TOKEN: BOT_TOKEN,
     SLACK_SIGNING_SECRET: SIGNING_SECRET,

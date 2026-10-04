@@ -28,10 +28,15 @@ const isEventCallbackEnvelope = (
   payload.api_app_id !== "" &&
   payload.event_id !== "";
 
+export interface ModelBrokerBinding {
+  fetch: (request: Request) => Promise<Response>;
+}
+
 export interface SlackCoreBindings {
   DB: D1Database;
   FLUE_SLACK_AGENT_AGENT: DurableObjectNamespace<ConversationLifecycleAgent>;
   AI: Ai;
+  MODEL_BROKER: ModelBrokerBinding;
 }
 
 export interface TrustedSlackConfig {
@@ -179,8 +184,12 @@ export const missingReadiness = (
   if (!bindings.FLUE_SLACK_AGENT_AGENT) {
     missing.push("FLUE_SLACK_AGENT_AGENT");
   }
-  if (modelProvider === MODEL_PROVIDER_CLOUDFLARE && !bindings.AI) {
-    missing.push("AI");
+  if (modelProvider === MODEL_PROVIDER_CLOUDFLARE) {
+    if (!bindings.AI) {
+      missing.push("AI");
+    }
+  } else if (!bindings.MODEL_BROKER) {
+    missing.push("MODEL_BROKER");
   }
   return missing;
 };
