@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { MODEL_PROVIDER_CLOUDFLARE } from "@agentic-slack/core";
+import {
+  MODEL_PROVIDER_BROKER,
+  MODEL_PROVIDER_CLOUDFLARE,
+} from "@agentic-slack/core";
 import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
 import * as v from "valibot";
 import { createApp } from "../src/app.ts";
@@ -27,7 +30,7 @@ const trusted = {
 };
 
 describe("GET /health", () => {
-  test("is ready only with complete Slack configuration and bindings", async () => {
+  test("requires AI, and not the broker binding, for a Workers AI model", async () => {
     const app = createApp(trusted, MODEL_PROVIDER_CLOUDFLARE, async () => {});
     const rawBindings = {
       AI: {},
@@ -62,6 +65,28 @@ describe("GET /health", () => {
     expect(incompleteResponse.status).toBe(503);
     expect(JSON.parse(await incompleteResponse.text())).toEqual({
       missing: ["SLACK_TEAM_ID"],
+      status: "not_ready",
+    });
+  });
+
+  test("requires the broker binding, and not AI, for a brokered model", async () => {
+    const app = createApp(trusted, MODEL_PROVIDER_BROKER, async () => {});
+    const ready = await app.request("/health", undefined, {
+      DB: {},
+      FLUE_SLACK_AGENT_AGENT: {},
+      MODEL_BROKER: { fetch: () => Promise.resolve(new Response(null)) },
+    });
+    expect(ready.status).toBe(200);
+    expect(JSON.parse(await ready.text())).toEqual({ status: "ready" });
+
+    const withoutBroker = await app.request("/health", undefined, {
+      AI: {},
+      DB: {},
+      FLUE_SLACK_AGENT_AGENT: {},
+    });
+    expect(withoutBroker.status).toBe(503);
+    expect(JSON.parse(await withoutBroker.text())).toEqual({
+      missing: ["MODEL_BROKER"],
       status: "not_ready",
     });
   });

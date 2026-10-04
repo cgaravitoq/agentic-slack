@@ -1,0 +1,18 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_tool_1","status":"in_progress","output":[]},"sequence_number":0}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"fc_1","type":"function_call","status":"in_progress","arguments":"","call_id":"call_1","name":"read_thread"},"output_index":0,"sequence_number":1}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\"channel\":","sequence_number":2}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"\"C1\"}","sequence_number":3}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","status":"completed","arguments":"{\"channel\":\"C1\"}","call_id":"call_1","name":"read_thread"},"output_index":0,"sequence_number":4}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_tool_1","status":"completed","output":[],"usage":{"input_tokens":11,"input_tokens_details":{"cached_tokens":0},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":14}},"sequence_number":5}
+

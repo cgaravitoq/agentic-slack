@@ -11,6 +11,7 @@ import {
   expireLatest,
   generateSlackManifest,
   missingReadiness,
+  MODEL_PROVIDER_BROKER,
   MODEL_PROVIDER_CLOUDFLARE,
   replaceRetention,
   setSuggestedPrompts,
@@ -144,6 +145,24 @@ describe("neutral core composition", () => {
         ownerInstructions: "Be concise.",
       }),
     ).toThrow("Agent config requires model to name a known provider");
+  });
+
+  test("keeps the provider prefix with the model it selects", () => {
+    const required = {
+      description: "Selects a provider.",
+      name: "Provider Agent",
+      ownerInstructions: "Be concise.",
+    };
+    const defaulted = defineAgentConfig(required);
+    expect(defaulted.model).toBe(MODEL);
+    expect(defaulted.modelProvider).toBe(MODEL_PROVIDER_CLOUDFLARE);
+
+    const brokered = defineAgentConfig({
+      ...required,
+      model: "broker/gpt-6-luna",
+    });
+    expect(brokered.model).toBe("broker/gpt-6-luna");
+    expect(brokered.modelProvider).toBe(MODEL_PROVIDER_BROKER);
   });
 
   test("admits every user until an allowlist names the ones it trusts", () => {
