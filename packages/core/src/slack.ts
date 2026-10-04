@@ -4,6 +4,8 @@ import type {
   SlackEventCallbackPayload,
   SlackEventsApiPayload,
 } from "@flue/slack";
+import { MODEL_PROVIDER_CLOUDFLARE } from "./config.ts";
+import type { ModelProvider } from "./config.ts";
 import { claimAndRun } from "./dedup.ts";
 import type {
   ConversationLifecycleAgent,
@@ -156,6 +158,7 @@ const claimThenAcknowledge = async (
 export const missingReadiness = (
   trusted: TrustedSlackConfig,
   bindings: Partial<SlackCoreBindings>,
+  modelProvider: ModelProvider,
 ): string[] => {
   const missing: string[] = [];
   if (!trusted.signingSecret) {
@@ -176,7 +179,7 @@ export const missingReadiness = (
   if (!bindings.FLUE_SLACK_AGENT_AGENT) {
     missing.push("FLUE_SLACK_AGENT_AGENT");
   }
-  if (!bindings.AI) {
+  if (modelProvider === MODEL_PROVIDER_CLOUDFLARE && !bindings.AI) {
     missing.push("AI");
   }
   return missing;

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { MODEL_PROVIDER_CLOUDFLARE } from "@agentic-slack/core";
 import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
 import * as v from "valibot";
 import { createApp } from "../src/app.ts";
@@ -27,7 +28,7 @@ const trusted = {
 
 describe("GET /health", () => {
   test("is ready only with complete Slack configuration and bindings", async () => {
-    const app = createApp(trusted, async () => {});
+    const app = createApp(trusted, MODEL_PROVIDER_CLOUDFLARE, async () => {});
     const rawBindings = {
       AI: {},
       DB: {},
@@ -48,7 +49,11 @@ describe("GET /health", () => {
       status: "not_ready",
     });
 
-    const incomplete = createApp({ ...trusted, teamId: "" }, async () => {});
+    const incomplete = createApp(
+      { ...trusted, teamId: "" },
+      MODEL_PROVIDER_CLOUDFLARE,
+      async () => {},
+    );
     const incompleteResponse = await incomplete.request(
       "/health",
       undefined,

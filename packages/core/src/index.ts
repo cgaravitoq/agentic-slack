@@ -18,9 +18,10 @@ export { setSuggestedPrompts } from "./assistant.ts";
 export {
   CLOUDFLARE_TRACING_CONTENT,
   defineAgentConfig,
+  MODEL_PROVIDER_CLOUDFLARE,
   requiresApproval,
 } from "./config.ts";
-export type { ResolvedAgentConfig } from "./config.ts";
+export type { ModelProvider, ResolvedAgentConfig } from "./config.ts";
 export {
   applySlackDeliveryEvent,
   createSqlSlackDeliveryStore,

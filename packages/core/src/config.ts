@@ -4,7 +4,8 @@ export const PRIVATE_RETENTION_DAYS = 7;
 export const CHANNEL_RETENTION_DAYS = 15;
 const READ_LOOKBACK_SECONDS = 24 * 60 * 60;
 const READ_MAX_MESSAGES = 200;
-export const MODEL = "cloudflare/@cf/zai-org/glm-4.7-flash";
+export const MODEL_PROVIDER_CLOUDFLARE = "cloudflare";
+export const MODEL = `${MODEL_PROVIDER_CLOUDFLARE}/@cf/zai-org/glm-4.7-flash`;
 export const CLOUDFLARE_TRACING_CONTENT = false;
 export const MAX_SUGGESTED_PROMPTS = 4;
 
@@ -12,6 +13,12 @@ export interface SuggestedPrompt {
   title: string;
   message: string;
 }
+
+const MODEL_PROVIDERS = [MODEL_PROVIDER_CLOUDFLARE] as const;
+
+// The prefix of `model` selects the backend a deployment runs on, and so which
+// binding the readiness check requires.
+export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
 
 interface SlackReadConfig {
   lookbackSeconds?: number;
@@ -60,6 +67,7 @@ export interface ResolvedAgentConfig {
   };
   read?: ResolvedSlackReadConfig;
   model: string;
+  modelProvider: ModelProvider;
   mcpServers: readonly McpServerConfig[];
   skills: readonly Skill[];
 }
@@ -215,6 +223,20 @@ const resolveRead = (
 export const requiresApproval = (config: ResolvedAgentConfig): boolean =>
   config.mcpServers.some((server) => (server.requireApproval?.length ?? 0) > 0);
 
+const isModelProvider = (provider: string): provider is ModelProvider =>
+  MODEL_PROVIDERS.some((known) => known === provider);
+
+const resolveModelProvider = (model: string): ModelProvider => {
+  const separator = model.indexOf("/");
+  const provider = separator === -1 ? "" : model.slice(0, separator);
+  if (!isModelProvider(provider)) {
+    throw new Error(
+      `Agent config requires model to name a known provider (${MODEL_PROVIDERS.join(", ")}) before the slash`,
+    );
+  }
+  return provider;
+};
+
 export const defineAgentConfig = (config: AgentConfig): ResolvedAgentConfig => {
   const model = (config.model ?? MODEL).trim();
   for (const [field, value] of Object.entries({
@@ -243,6 +265,7 @@ export const defineAgentConfig = (config: AgentConfig): ResolvedAgentConfig => {
     description: config.description.trim(),
     mcpServers: resolveMcpServers(config.mcpServers ?? []),
     model,
+    modelProvider: resolveModelProvider(model),
     name: config.name.trim(),
     ownerInstructions: config.ownerInstructions.trim(),
     read: resolveRead(config.read),

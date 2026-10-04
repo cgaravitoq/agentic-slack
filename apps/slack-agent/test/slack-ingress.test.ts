@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import {
   createSlackIngress,
   defineAgentConfig,
+  MODEL_PROVIDER_CLOUDFLARE,
   setSuggestedPrompts,
 } from "@agentic-slack/core";
 import type {
@@ -787,6 +788,7 @@ describe("assistant thread lifecycle", () => {
     });
     const app = createApp(
       trusted,
+      MODEL_PROVIDER_CLOUDFLARE,
       (turn) => {
         turns.push(turn.eventId);
         return Promise.resolve();
@@ -858,6 +860,7 @@ describe("assistant thread lifecycle", () => {
     });
     const app = createApp(
       secondTrusted,
+      MODEL_PROVIDER_CLOUDFLARE,
       (turn) => {
         turns.push(turn.eventId);
         return Promise.resolve();
