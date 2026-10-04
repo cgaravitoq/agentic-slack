@@ -9,7 +9,7 @@ Replies always go to the requesting thread.
 The agent has no built-in business integrations or external tools.
 Business tools live in an MCP server you operate, and procedures ship as Agent Skills; both are declared in `apps/slack-agent/agent.config.ts`.
 It receives admitted mentions and DMs, not the complete history of a Slack channel.
-Configure its name, instructions, suggested prompts, retention, model, MCP servers, and skills in `apps/slack-agent/agent.config.ts`.
+Configure its name, instructions, suggested prompts, allowed users, retention, model, MCP servers, and skills in `apps/slack-agent/agent.config.ts`.
 
 This Bun monorepo separates reusable Slack admission and delivery code from the deployed application.
 The current runtime uses Flue, Cloudflare Workers, Durable Objects, D1, and Workers AI.
@@ -36,7 +36,7 @@ flowchart LR
 The core owns Slack admission and delivery, deduplication, retention helpers, and instruction composition.
 The application selects Workers AI and connects the Flue agent lifecycle to durable delivery and retention.
 
-The operator surface is `apps/slack-agent/agent.config.ts`: name, description, owner instructions, suggested prompts, retention, model, MCP servers, and skills.
+The operator surface is `apps/slack-agent/agent.config.ts`: name, description, owner instructions, allowed users, suggested prompts, retention, model, MCP servers, and skills.
 An operator repository that pins this one can keep that file outside it; see [Consume a pinned copy](#consume-a-pinned-copy).
 
 The Worker claims the event in D1 and dispatches the turn to the Durable Object before it acknowledges, so an event Slack is told to stop retrying is already admitted durably.
@@ -155,6 +155,22 @@ Only the description is always in context, so it carries the routing decision: s
 The instructions load when the model activates the skill, and any other file in the directory, such as a `POLICY.md`, is packaged and read only on demand.
 The build packages the whole directory into the Worker, so a skill directory must contain no secrets or private keys.
 Two skills that share a name are rejected when the config is defined.
+
+## Who can talk to the agent
+
+By default any eligible human in the workspace can mention the agent or DM it.
+Set `allowedUserIds` to the Slack user ids that may start a turn or an assistant thread, and the app ignores everyone else:
+
+```ts
+export default defineAgentConfig({
+  // ...the rest of your configuration
+  allowedUserIds: ["U0123ABCDEF"],
+});
+```
+
+Each entry must be a Slack user id, such as `U...` or the `W...` of a migrated account; a blank entry, a name, an email address, or an empty list fails when the configuration is defined.
+An event from a user who is not listed is answered `2xx` before it reaches the database, so Slack stops retrying it and it produces no reaction, no reply, and no model call.
+The option is admission only: an admitted user can still ask for anything the configuration allows.
 
 ## Self-hosting
 
@@ -308,7 +324,8 @@ A dependency that resolves `@agentic-slack/core` through your own `node_modules`
 ## Security and support
 
 Slack requests pass signature verification and must match the configured workspace and app before a turn is admitted.
-Any eligible human in that workspace who can reach the installed app can interact with it; there is no per-user allowlist.
+When `allowedUserIds` is set, only those users can start a turn or an assistant thread; everyone else's event is answered `2xx` and dropped before it reaches the database.
+When the option is unset, any eligible human in that workspace who can reach the installed app can interact with it.
 Delivery destinations come from trusted event data, not model output.
 A tool the operator gates with `requireApproval` reaches its MCP server only after the person who asked approves that exact call in the thread it came from.
 Instructions and output filtering reduce accidental disclosure but do not make untrusted prompts safe to receive credentials.
