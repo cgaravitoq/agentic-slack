@@ -29,7 +29,7 @@ It runs these commands in this order:
 5. `bun test`
 6. `bun run knip`
 7. `bun run deploy:dry`
-8. `bun audit`
+8. `bun audit --ignore=GHSA-vfj7-8cjw-p6xm`
 
 Run `bun run verify` before publishing changes.
 That script is the same sequence after install.

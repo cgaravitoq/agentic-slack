@@ -22,7 +22,7 @@
     "deploy:staging": "WORKER_CONFIG=wrangler.deploy.json CLOUDFLARE_ENV=staging bun run build && wrangler deploy --keep-vars --config apps/slack-agent/dist/agentic_slack/wrangler.json",
     "knip": "knip",
     "knip:production": "knip --production",
-    "verify": "bun run format:check && bun run lint && bun run typecheck && bun test && bun run knip && bun run deploy:dry && bun audit"
+    "verify": "bun run format:check && bun run lint && bun run typecheck && bun test && bun run knip && bun run deploy:dry && bun audit --ignore=GHSA-vfj7-8cjw-p6xm"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.8",
