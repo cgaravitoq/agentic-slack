@@ -8,6 +8,7 @@ import {
   evictLiveSlackDelivery,
   SLACK_DELIVERY_FALLBACK,
 } from "../../../packages/core/src/delivery.ts";
+import { slackInstanceId } from "../../../packages/core/src/progress.ts";
 import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
 import type {
   Agent,
@@ -52,6 +53,7 @@ interface HandleDispatchRequest {
 
 const slackCalls: SlackCall[] = [];
 const dispatched: { instanceId: string; request: HandleDispatchRequest }[] = [];
+const retentionRefreshes: { id: string; surface: string }[] = [];
 let reactionError: string | undefined;
 let reactionHang = false;
 let reactionStatus = 200;
@@ -120,6 +122,14 @@ const toolOutputError = (
 
 await mockCloudflareWorkers({
   AI: {},
+  FLUE_SLACK_AGENT_AGENT: {
+    getByName: (id: string) => ({
+      refreshRetention: (surface: string) => {
+        retentionRefreshes.push({ id, surface });
+        return Promise.resolve();
+      },
+    }),
+  },
   SLACK_APP_ID: "A123",
   SLACK_BOT_TOKEN: BOT_TOKEN,
   SLACK_SIGNING_SECRET: SIGNING_SECRET,
@@ -626,6 +636,7 @@ beforeEach(() => {
   reactionHang = false;
   reactionStatus = 200;
   workerWaitUntil.length = 0;
+  retentionRefreshes.length = 0;
   deltas = [];
   toolChunks = [];
   replyText = "";
@@ -1420,4 +1431,50 @@ test("admits the allowlisted user and drops every other user before any side eff
   } finally {
     await mock.module("../agent.config.ts", () => ({ default: shipped }));
   }
+});
+
+test("a narrated milestone turns in the thread its conversation already holds", async () => {
+  deltas = ["Hello."];
+  replyText = "Hello.";
+  expect(await runTurn("Ev-narration-thread")).toBe(200);
+  const [mention] = dispatched;
+  if (mention === undefined) {
+    throw new Error("the mention dispatched no turn");
+  }
+  const binding = {
+    channelId: "C777",
+    fallbackText: "Kicked off\nhttps://example.com/run",
+    recipientTeamId: "T123",
+    recipientUserId: "U777",
+    surface: "channel" as const,
+    threadTs: "171.0",
+  };
+  dispatched.length = 0;
+
+  await workerModule.narrateProgressTurn({
+    binding,
+    body: "Rewrite this milestone in that voice.",
+    instanceId: slackInstanceId({
+      channelId: binding.channelId,
+      teamId: binding.recipientTeamId,
+      threadTs: binding.threadTs,
+    }),
+  });
+
+  expect(dispatched).toEqual([
+    {
+      instanceId: mention.instanceId,
+      request: {
+        message: {
+          attributes: binding,
+          body: "Rewrite this milestone in that voice.",
+          kind: "signal",
+          type: "slack.progress",
+        },
+      },
+    },
+  ]);
+  expect(retentionRefreshes).toEqual([
+    { id: mention.instanceId, surface: "channel" },
+  ]);
 });

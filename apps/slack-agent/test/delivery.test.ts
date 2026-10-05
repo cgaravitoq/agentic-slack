@@ -2401,4 +2401,120 @@ describe("durable Slack delivery", () => {
       slack.methods().filter((method) => method === "chat.startStream"),
     ).toHaveLength(1);
   });
+
+  const fallbackBinding = () => ({
+    ...slackDeliveryBinding(channelTarget),
+    fallbackText: "Kicked off\nhttps://example.com/run",
+  });
+
+  test("posts the delivery's fallback text in place of the failure notice", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "narration",
+      fallbackBinding(),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    applySlackDeliveryEvent(store, "narration", {
+      text: "partial narration",
+      type: "text",
+    });
+    await failSlackDelivery(store, "narration", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "partial narration",
+      "Kicked off\nhttps://example.com/run",
+    ]);
+  });
+
+  test("posts the delivery's fallback text when the turn produced no reply", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "empty",
+      fallbackBinding(),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    await finishSlackDelivery(store, "empty", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "Kicked off\nhttps://example.com/run",
+    ]);
+    expect(slack.markdown()).not.toContain(SLACK_DELIVERY_FALLBACK);
+  });
+
+  test("replays the delivery's fallback text from the durable record", async () => {
+    const slack = createFakeSlack();
+    const store = serializingStore();
+    openSlackDelivery(
+      store,
+      "durable",
+      fallbackBinding(),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("durable");
+    applySlackDeliveryEvent(store, "durable", {
+      text: "partial narration",
+      type: "text",
+    });
+
+    await failSlackDelivery(store, "durable", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "partial narration",
+      "Kicked off\nhttps://example.com/run",
+    ]);
+    expect(slack.markdown()).not.toContain(SLACK_STREAM_FAILURE_NOTICE);
+  });
+
+  test("owes the thread every fallback text that joined its response", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const later = { ...fallbackBinding(), fallbackText: "Opened the PR" };
+    openSlackDelivery(
+      store,
+      "joined",
+      fallbackBinding(),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    openSlackDelivery(store, "joined", later, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "joined", later, BOT_TOKEN, slack.fetcher);
+    await failSlackDelivery(store, "joined", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "Kicked off\nhttps://example.com/run\n\nOpened the PR",
+    ]);
+  });
+
+  test("answers a Slack call that broke with the delivery's fallback text", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "invalid_chunks" },
+      { limit: 1, skip: 1 },
+    );
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "broke",
+      fallbackBinding(),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    applySlackDeliveryEvent(store, "broke", {
+      text: "a".repeat(COALESCE_CHARS),
+      type: "text",
+    });
+    await finishSlackDelivery(store, "broke", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "a".repeat(STREAM_TAIL_LENGTH),
+      "Kicked off\nhttps://example.com/run",
+    ]);
+    expect(slack.markdown()).not.toContain(SLACK_STREAM_FAILURE_NOTICE);
+  });
 });

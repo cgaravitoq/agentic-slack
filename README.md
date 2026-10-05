@@ -263,11 +263,17 @@ export default defineAgentConfig({
       merged: "Merged",
       done: "Done",
     },
+    narration:
+      "Write in Spanish, warm and brief, as one or two sentences for the team.",
   },
 });
 ```
 
 `authSecret` names the Worker secret holding the bearer token the sender presents, and `labels` names the word each status kind shows in the root message.
+`narration` is optional and names the voice the replies are written in.
+With it, each milestone is a short agent turn in that task's thread instead of the curated line posted as given: the turn rewrites the milestone in that voice, sees the earlier milestones of the thread as context, and answers with one or two sentences that restate only what those milestones say.
+Without it, milestones are posted exactly as the sender wrote them.
+Either way the thread owes the milestone an answer: when a narrated turn cannot deliver, the thread gets the curated line rather than the generic failure notice, and a milestone is never silently dropped.
 Store the token as a Worker secret rather than in the config file:
 
 ```sh
@@ -290,13 +296,14 @@ A success answers `200 {"ok":true}`; a refusal answers a 4xx with `{"ok":false,"
 - `id` identifies the event: a retry with an id that already posted is a no-op that still answers success.
 - `task` identifies the task inside the channel; its first event posts the root and stores the root timestamp in D1 (`slack_progress_roots`, migration `0006_slack_progress_roots.sql`), and later events reply in that thread.
 - `kind` is one of `started`, `progress`, `blocked`, `pr`, `review`, `merged`, `done`; the root reads `<title> · <label of the kind>` and is edited whenever that text changes, so the root always shows the task's current status.
-- `text` posts as the reply, with `url` on the line below it when the sender provides one.
+  A root Slack refuses to edit is logged and the milestone still gets its reply; when Slack answers that the root is gone, the next milestone posts a fresh one.
+- `text` and its optional `url` are the milestone: without `narration` they post as the reply, with `url` on the line below `text`, and with it they are what the turn rewrites and what the thread falls back to when that turn cannot deliver.
 - `title`, `text`, `id`, `task`, `channel` and `url` are bounded, `url` must be HTTPS, and the channel must already carry the admission an allowlisted user's invitation wrote.
 
 The refusals are `401` for a missing or wrong bearer, `400` for a body that is not a milestone, and `403` for a channel no allowed user admitted.
 A Slack failure answers `500` so the sender can retry, and the retry is deduplicated by `id` once a request has succeeded.
 `chat:write` covers both `chat.postMessage` and `chat.update`, so the option adds no scope.
-Milestone content arrives curated and is posted as given: the bot does not narrate or rewrite it.
+Milestone content arrives curated: without `narration` it is posted as given, and with it the bot only restates what the milestone and the thread's earlier milestones already say.
 
 ## Who can talk to the agent
 
