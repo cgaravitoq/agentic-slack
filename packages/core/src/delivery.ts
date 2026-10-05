@@ -126,6 +126,7 @@ const routedOrigin = Symbol("routedOrigin");
 
 interface SlackStreamTarget {
   readonly channelId: string;
+  readonly fallbackText?: string;
   readonly threadTs: string;
   readonly recipientUserId: string;
   readonly recipientTeamId: string;
@@ -145,6 +146,12 @@ export const streamTargetFor = (turn: RoutedSlackTurn): SlackStreamTarget =>
 
 export const slackDeliveryBindingSchema = v.object({
   channelId: v.pipe(v.string(), v.minLength(1)),
+  // The text this delivery owes its thread when the turn cannot speak: a
+  // delivery with one answers a failure or an empty turn with it instead of
+  // the generic notice.
+  fallbackText: v.optional(
+    v.pipe(v.string(), v.minLength(1), v.maxLength(MAX_SLACK_APPEND_LENGTH)),
+  ),
   recipientTeamId: v.pipe(v.string(), v.minLength(1)),
   recipientUserId: v.pipe(v.string(), v.minLength(1)),
   surface: v.picklist(["channel", "private"]),
@@ -169,17 +176,20 @@ export const slackDeliveryBinding = (
 const streamTargetFromBinding = (
   binding: SlackDeliveryBinding,
 ): SlackStreamTarget =>
-  streamTargetFor({
-    appId: "_",
-    channelId: binding.channelId,
-    eventId: "_",
-    kind: "turn",
-    messageTs: "_",
-    surface: binding.surface,
-    teamId: binding.recipientTeamId,
-    text: "_",
-    threadTs: binding.threadTs,
-    userId: binding.recipientUserId,
+  Object.freeze({
+    ...streamTargetFor({
+      appId: "_",
+      channelId: binding.channelId,
+      eventId: "_",
+      kind: "turn",
+      messageTs: "_",
+      surface: binding.surface,
+      teamId: binding.recipientTeamId,
+      text: "_",
+      threadTs: binding.threadTs,
+      userId: binding.recipientUserId,
+    }),
+    fallbackText: binding.fallbackText,
   });
 
 export interface SlackStream {
@@ -379,6 +389,7 @@ export const createSlackStream = (
 ): SlackStream => {
   const { channelId } = target;
   const sanitizer = createStreamSanitizer();
+  const fallbackNotice = target.fallbackText ?? SLACK_STREAM_FAILURE_NOTICE;
   let queue: Promise<void> = Promise.resolve();
   let streamTs: string | undefined;
   let appended = false;
@@ -649,8 +660,7 @@ export const createSlackStream = (
     // stream: otherwise they keep the partial content with nothing telling them
     // the turn broke. `closed` keeps it to one notice per stream.
     if (always || !appended || failure !== undefined) {
-      const notice =
-        failure === undefined ? trailer : SLACK_STREAM_FAILURE_NOTICE;
+      const notice = failure === undefined ? trailer : fallbackNotice;
       // `post`, not `send`: the closing word is not stream content, and a reply
       // that already hit the content cap would otherwise clip it away and leave
       // the user with a truncated answer and no sign the turn broke.
@@ -766,8 +776,14 @@ const feedSlackStream = (
   }
 };
 
-const replyTrailer = (replyText: string): string =>
-  replyText === "" ? SLACK_DELIVERY_FALLBACK : replyText;
+const replyTrailer = (
+  replyText: string,
+  fallbackText: string | undefined,
+): string =>
+  replyText === "" ? (fallbackText ?? SLACK_DELIVERY_FALLBACK) : replyText;
+
+const failureNotice = (binding: SlackDeliveryBinding): string =>
+  binding.fallbackText ?? SLACK_STREAM_FAILURE_NOTICE;
 
 const HIGH_SURROGATE_TAIL = /[\uD800-\uDBFF]$/u;
 const ORPHAN_LOW_SURROGATE_TAIL = /(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]$/u;
@@ -894,7 +910,7 @@ const runSlackAlarmDelivery = async (
   feedSlackStream(stream, work.events);
   // No `fail` on the way out: `finish` already sent the failure notice and
   // closed the stream before it rethrows.
-  await stream.finish(replyTrailer(work.replyText));
+  await stream.finish(replyTrailer(work.replyText, binding.fallbackText));
 };
 
 const emptyRecord = (binding: SlackDeliveryBinding): SlackDeliveryRecord => ({
@@ -972,7 +988,7 @@ const replaySlackFailure = async (
     fetcher,
   );
   feedSlackStream(stream, replay.events);
-  if (!(await stream.fail(SLACK_STREAM_FAILURE_NOTICE, replay.replyText))) {
+  if (!(await stream.fail(failureNotice(binding), replay.replyText))) {
     throw new Error("Slack failure notice was not delivered");
   }
 };
@@ -1130,7 +1146,7 @@ export const failSlackDelivery = async (
     live === undefined
       ? () => replaySlackFailure(record.binding, token, replay, fetcher)
       : async () => {
-          await live.stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+          await live.stream.fail(failureNotice(record.binding));
         };
   try {
     await settleDestination(primary);
@@ -1169,7 +1185,10 @@ export const finishSlackDelivery = async (
   const primary =
     live === undefined
       ? () => runSlackAlarmDelivery(record.binding, token, replay, fetcher)
-      : () => live.stream.finish(replyTrailer(record.replyText));
+      : () =>
+          live.stream.finish(
+            replyTrailer(record.replyText, record.binding.fallbackText),
+          );
   try {
     await settleDestination(primary);
     await Promise.all(
