@@ -156,6 +156,17 @@ interface ChannelInfo {
   readonly name?: string;
 }
 
+const callBody = (init: RequestInit | undefined): Record<string, string> => {
+  const raw = init?.body;
+  if (raw instanceof URLSearchParams) {
+    return Object.fromEntries(raw);
+  }
+  return v.parse(
+    v.record(v.string(), v.string()),
+    JSON.parse(v.parse(v.string(), raw)),
+  );
+};
+
 const slackRecorder =
   (
     calls: RecordedCall[],
@@ -166,12 +177,17 @@ const slackRecorder =
     const url = v.parse(v.string(), input);
     const method = url.slice(url.lastIndexOf("/") + 1);
     const attempt = calls.length;
-    const body = v.parse(
-      v.record(v.string(), v.string()),
-      JSON.parse(v.parse(v.string(), init?.body)),
-    );
+    const form = init?.body instanceof URLSearchParams;
+    const body = callBody(init);
     calls.push({ body, method });
     if (method === "conversations.info") {
+      // Slack refuses a JSON body on a read method, as it did live on
+      // right-hand-staging before progress.ts sent this one form-encoded.
+      if (!form) {
+        return Promise.resolve(
+          Response.json({ error: "invalid_arguments", ok: false }),
+        );
+      }
       const info = infos[body.channel];
       return Promise.resolve(
         Response.json(
