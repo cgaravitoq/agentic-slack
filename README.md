@@ -260,7 +260,7 @@ Each entry must be a Slack user id, such as `U...` or the `W...` of a migrated a
 An event from a user who is not listed is answered `2xx` before it reaches the database, so Slack stops retrying it and it produces no reaction, no reply, and no model call.
 The option is admission only: an admitted user can still ask for anything the configuration allows.
 It is also what puts the bot in a channel at all: the bot acts only where an allowlisted user invited it, and any other invitation, a missing `inviter` included, is answered by leaving the channel at once, reading nothing there, and DMing every user in `allowedUserIds` the channel it left and who added it.
-Joins by other members are ignored, and while `allowedUserIds` is unset the bot has no one who may invite it, so it leaves every channel it is added to.
+Joins by other members are ignored, and while `allowedUserIds` is unset any user's invitation admits the channel, while a join with no `inviter` still leaves it.
 
 ## Self-hosting
 
@@ -424,7 +424,7 @@ A dependency that resolves `@agentic-slack/core` through your own `node_modules`
 
 Slack requests pass signature verification and must match the configured workspace and app before a turn is admitted.
 When `allowedUserIds` is set, only those users can start a turn or an assistant thread; everyone else's event is answered `2xx` and dropped before it reaches the database.
-When the option is unset, any eligible human in that workspace who can reach the installed app can interact with it, but the bot leaves every channel it is invited to, because nobody may invite it.
+When the option is unset, any eligible human in that workspace who can reach the installed app can interact with it or invite it to a channel.
 Delivery destinations come from trusted event data, not model output.
 The Slack read tools read only the conversation the delivered message came from and the channels an allowlisted user invited the bot to; with the `read` option unset the agent has no way to read a conversation it was not addressed in.
 A tool the operator gates with `requireApproval` reaches its MCP server only after the person who asked approves that exact call in the thread it came from.

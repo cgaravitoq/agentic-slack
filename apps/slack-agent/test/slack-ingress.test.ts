@@ -1253,6 +1253,53 @@ describe("channel guard", () => {
     expect(reported).toHaveLength(2);
   });
 
+  test("admits any inviter while allowedUserIds is unset, as the ingress admits any user", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const openConfig = defineAgentConfig({
+      description: "Admits everyone.",
+      name: "Open Agent",
+      ownerInstructions: "Prefer short answers.",
+    });
+    const channel = createSlackIngress(
+      trusted,
+      () => Promise.resolve(),
+      undefined,
+      undefined,
+      createMembershipHandler(
+        openConfig,
+        trusted.botToken,
+        guardSlackFetcher(guardCalls),
+      ),
+    );
+
+    const invited = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-open", { inviter: "U999" })),
+        undefined,
+        testBindings(db),
+      );
+    expect(invited.status).toBe(200);
+    expect(guardCalls.map((call) => call.method)).toEqual(["auth.test"]);
+    expect([...db.admissions]).toEqual(["CFOREIGN"]);
+
+    const uninvited = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-open-nobody")),
+        undefined,
+        testBindings(db),
+      );
+    expect(uninvited.status).toBe(200);
+    expect(guardCalls.map((call) => call.method)).toEqual([
+      "auth.test",
+      "auth.test",
+      "conversations.leave",
+    ]);
+    expect(db.admissions.size).toBe(0);
+  });
+
   test("answers non-2xx when Slack cannot say who the bot is, so Slack retries", async () => {
     const db = new FakeD1();
     const guardCalls: RecordedCall[] = [];

@@ -114,7 +114,8 @@ export const createMembershipHandler =
     const store = createSqlSlackChannelAdmissionStore(bindings.DB);
     if (
       membership.inviterId !== "" &&
-      config.allowedUserIds.includes(membership.inviterId)
+      (config.allowedUserIds.length === 0 ||
+        config.allowedUserIds.includes(membership.inviterId))
     ) {
       await store.admit(membership.channelId, membership.inviterId, Date.now());
       return;
