@@ -547,6 +547,8 @@ describe("readiness and manifest", () => {
       "groups:read",
       "groups:write",
       "im:history",
+      "mpim:read",
+      "mpim:write",
       "reactions:write",
     ]);
   });

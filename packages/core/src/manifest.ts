@@ -16,10 +16,12 @@ export const generateSlackManifest = (
     "groups:read",
     "groups:write",
     "im:history",
+    "mpim:read",
+    "mpim:write",
     "reactions:write",
     ...(config.read === undefined
       ? []
-      : ["channels:history", "groups:history", "users:read"]),
+      : ["channels:history", "groups:history", "mpim:history", "users:read"]),
   ].toSorted();
   return JSON.stringify(
     {
