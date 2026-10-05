@@ -39,6 +39,8 @@ export {
 export type { SlackDeliveryBinding, SlackDeliveryStore } from "./delivery.ts";
 export { generateSlackManifest } from "./manifest.ts";
 export { composeInstructions } from "./prompt.ts";
+export { createSlackProgressEndpoint } from "./progress.ts";
+export type { SlackProgressEndpoint } from "./progress.ts";
 export {
   createSlackReadTools,
   createSqlSlackReadCursorStore,
@@ -49,7 +51,11 @@ export {
   replaceRetention,
 } from "./retention.ts";
 export type { ExpiryPayload, ExpirySchedule } from "./retention.ts";
-export { createSlackIngress, missingReadiness } from "./slack.ts";
+export {
+  createSlackIngress,
+  missingReadiness,
+  workerSecretValue,
+} from "./slack.ts";
 export type {
   ModelBrokerBinding,
   RoutedSlackLifecycle,

@@ -6,6 +6,7 @@ import type {
   RoutedSlackTurn,
   SlackBlockActionsPayload,
   SlackCoreBindings,
+  SlackProgressEndpoint,
   TrustedSlackConfig,
 } from "@agentic-slack/core";
 import { Hono } from "hono";
@@ -36,6 +37,7 @@ export const createApp = (
     membership: RoutedSlackMembership,
     bindings: SlackCoreBindings,
   ) => Promise<void> | void,
+  progress?: SlackProgressEndpoint,
 ) => {
   const channel = createSlackIngress(
     trusted,
@@ -46,11 +48,22 @@ export const createApp = (
   );
   const app = new Hono<WorkerEnv>();
   app.get("/health", (context) => {
-    const missing = missingReadiness(trusted, context.env, modelProvider);
+    const missing = missingReadiness(
+      trusted,
+      context.env,
+      modelProvider,
+      progress?.authSecret,
+    );
     return missing.length === 0
       ? context.json({ status: "ready" })
       : context.json({ missing, status: "not_ready" }, 503);
   });
+  if (progress !== undefined) {
+    app.post(
+      "/progress",
+      async (context) => await progress.handle(context.req.raw),
+    );
+  }
   app.route("/channels/slack", channel.route());
   return app;
 };

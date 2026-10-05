@@ -1,10 +1,12 @@
 import { env, waitUntil } from "cloudflare:workers";
 import {
   CLOUDFLARE_TRACING_CONTENT,
+  createSlackProgressEndpoint,
   refreshRetention,
   requiresApproval,
   slackDeliveryBinding,
   streamTargetFor,
+  workerSecretValue,
 } from "@agentic-slack/core";
 import { init, instrument, setProvider } from "@flue/runtime";
 import { createCloudflareTracing } from "@flue/runtime/cloudflare";
@@ -25,6 +27,14 @@ const trusted = {
   signingSecret: bindings.SLACK_SIGNING_SECRET,
   teamId: bindings.SLACK_TEAM_ID,
 };
+const progress =
+  config.progress === undefined
+    ? undefined
+    : createSlackProgressEndpoint(config.progress, {
+        bearer: workerSecretValue(bindings, config.progress.authSecret) ?? "",
+        db: bindings.DB,
+        token: trusted.botToken,
+      });
 
 instrument(createCloudflareTracing({ content: CLOUDFLARE_TRACING_CONTENT }));
 setProvider(selectProvider(config.modelProvider, bindings));
@@ -80,4 +90,5 @@ export default createApp(
     ? createApprovalHandler(trusted.botToken)
     : undefined,
   createMembershipHandler(config, trusted.botToken),
+  progress,
 );

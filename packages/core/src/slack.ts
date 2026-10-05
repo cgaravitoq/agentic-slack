@@ -5,6 +5,7 @@ import type {
   SlackEventCallbackPayload,
   SlackEventsApiPayload,
 } from "@flue/slack";
+import * as v from "valibot";
 import { MODEL_PROVIDER_CLOUDFLARE } from "./config.ts";
 import type { ModelProvider } from "./config.ts";
 import { claimAndRun } from "./dedup.ts";
@@ -213,10 +214,22 @@ const claimThenAcknowledge = async (
   }
 };
 
+export const workerSecretValue = (
+  bindings: Partial<SlackCoreBindings>,
+  name: string,
+): string | undefined => {
+  const parsed = v.safeParse(
+    v.object({ [name]: v.pipe(v.string(), v.nonEmpty()) }),
+    bindings,
+  );
+  return parsed.success ? parsed.output[name] : undefined;
+};
+
 export const missingReadiness = (
   trusted: TrustedSlackConfig,
   bindings: Partial<SlackCoreBindings>,
   modelProvider: ModelProvider,
+  progressSecret?: string,
 ): string[] => {
   const missing: string[] = [];
   if (!trusted.signingSecret) {
@@ -243,6 +256,12 @@ export const missingReadiness = (
     }
   } else if (!bindings.MODEL_BROKER) {
     missing.push("MODEL_BROKER");
+  }
+  if (
+    progressSecret !== undefined &&
+    workerSecretValue(bindings, progressSecret) === undefined
+  ) {
+    missing.push(progressSecret);
   }
   return missing;
 };
