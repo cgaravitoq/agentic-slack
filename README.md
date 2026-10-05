@@ -280,7 +280,7 @@ Store the token as a Worker secret rather than in the config file:
 bunx wrangler secret put SLACK_PROGRESS_BEARER --config apps/slack-agent/wrangler.deploy.json --env staging
 ```
 
-It mounts `POST /progress`; without the block the route does not exist and nothing else changes.
+It mounts `POST /progress` and `GET /progress/channels`; without the block neither route exists and nothing else changes.
 The sender posts one milestone per event:
 
 ```sh
@@ -293,14 +293,25 @@ curl --fail https://your-worker.example.com/progress \
 
 A success answers `200 {"ok":true}`; a refusal answers a 4xx with `{"ok":false,"error":"..."}` and calls Slack not at all.
 
+A client that would rather not store an id lists the channels the bot may post to:
+
+```sh
+curl --fail --header "authorization: Bearer $SLACK_PROGRESS_BEARER" \
+  https://your-worker.example.com/progress/channels
+```
+
+It answers `{"ok":true,"channels":[{"id":"C0123456789","name":"sandbox","kind":"channel"}]}`: one entry per admitted channel, where `kind` is `channel`, `private`, or `group` (a group DM) and `name` is the channel's name, or `null` for a channel Slack will not describe.
+It takes the same bearer and answers `401` without it.
+
 - `id` identifies the event: a retry with an id that already posted is a no-op that still answers success.
 - `task` identifies the task inside the channel; its first event posts the root and stores the root timestamp in D1 (`slack_progress_roots`, migration `0006_slack_progress_roots.sql`), and later events reply in that thread.
 - `kind` is one of `started`, `progress`, `blocked`, `pr`, `review`, `merged`, `done`; the root reads `<title> · <label of the kind>` and is edited whenever that text changes, so the root always shows the task's current status.
   A root Slack refuses to edit is logged and the milestone still gets its reply; when Slack answers that the root is gone, the next milestone posts a fresh one.
 - `text` and its optional `url` are the milestone: without `narration` they post as the reply, with `url` on the line below `text`, and with it they are what the turn rewrites and what the thread falls back to when that turn cannot deliver.
-- `title`, `text`, `id`, `task`, `channel` and `url` are bounded, `url` must be HTTPS, and the channel must already carry the admission an allowlisted user's invitation wrote.
+- `title`, `text`, `id`, `task`, `channel` and `url` are bounded, `url` must be HTTPS, and `channel` names the destination as an id or as a name.
+  A name may carry its leading `#` and is compared case-insensitively against the admitted channels, so either form must already carry the admission an allowlisted user's invitation wrote.
 
-The refusals are `401` for a missing or wrong bearer, `400` for a body that is not a milestone, and `403` for a channel no allowed user admitted.
+The refusals are `401` for a missing or wrong bearer, `400` for a body that is not a milestone, `403` for a channel the admission does not cover, and `409` for a name several admitted channels answer to.
 A Slack failure answers `500` so the sender can retry, and the retry is deduplicated by `id` once a request has succeeded.
 `chat:write` covers both `chat.postMessage` and `chat.update`, so the option adds no scope.
 Milestone content arrives curated: without `narration` it is posted as given, and with it the bot only restates what the milestone and the thread's earlier milestones already say.
@@ -491,7 +502,7 @@ When `allowedUserIds` is set, only those users can start a turn or an assistant 
 When the option is unset, any eligible human in that workspace who can reach the installed app can interact with it or invite it to a channel.
 Delivery destinations come from trusted event data, not model output.
 The Slack read tools read only the conversation the delivered message came from and the channels an allowlisted user invited the bot to; with the `read` option unset the agent has no way to read a conversation it was not addressed in.
-The `progress` route exists only when the configuration names it, every request must carry its bearer secret, and it posts only into a channel an allowlisted user's invitation admitted.
+The `progress` routes exist only when the configuration names them, every request must carry its bearer secret, the channel listing describes only the channels an allowlisted user's invitation admitted, and a milestone posts only into one of them.
 A tool the operator gates with `requireApproval` reaches its MCP server only after the person who asked approves that exact call in the thread it came from.
 Instructions and output filtering reduce accidental disclosure but do not make untrusted prompts safe to receive credentials.
 Conversation data is processed by Slack, by Cloudflare, and by the model provider your configuration selects.

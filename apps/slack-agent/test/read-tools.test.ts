@@ -175,6 +175,7 @@ const admittedStore = (...channels: string[]): SlackChannelAdmissionStore => {
       return Promise.resolve();
     },
     isAdmitted: (channelId) => Promise.resolve(admitted.has(channelId)),
+    listAdmittedChannelIds: () => Promise.resolve([...admitted]),
   };
 };
 

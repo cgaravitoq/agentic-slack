@@ -77,11 +77,12 @@ export const resolveSlackProgressConfig = (
 const MILESTONE_ID_LIMIT = 200;
 const TASK_LIMIT = 200;
 const TITLE_LIMIT = 300;
-const CHANNEL_ID_LIMIT = 64;
+// Group DM names run past the 80 Slack bounds a channel name to.
+const CHANNEL_LIMIT = 255;
 const URL_LIMIT = 2048;
 
 const milestoneSchema = v.object({
-  channel: v.pipe(v.string(), v.nonEmpty(), v.maxLength(CHANNEL_ID_LIMIT)),
+  channel: v.pipe(v.string(), v.nonEmpty(), v.maxLength(CHANNEL_LIMIT)),
   id: v.pipe(v.string(), v.nonEmpty(), v.maxLength(MILESTONE_ID_LIMIT)),
   kind: v.picklist(PROGRESS_KINDS),
   task: v.pipe(v.string(), v.nonEmpty(), v.maxLength(TASK_LIMIT)),
@@ -170,16 +171,34 @@ const slackEnvelope = v.object({
   ts: v.optional(v.string()),
 });
 
+const slackChannelSchema = v.object({
+  is_mpim: v.optional(v.boolean()),
+  is_private: v.optional(v.boolean()),
+  name: v.optional(v.string()),
+});
+
+const conversationsInfoEnvelope = v.object({
+  channel: v.optional(slackChannelSchema),
+  error: v.optional(v.string()),
+  ok: v.optional(v.boolean()),
+});
+
+interface SlackEnvelope {
+  readonly error?: string;
+  readonly ok?: boolean;
+}
+
 interface SlackCaller {
   readonly fetcher: Fetcher;
   readonly token: string;
 }
 
-const callSlack = async (
+const callSlack = async <TOutput extends SlackEnvelope>(
   caller: SlackCaller,
   method: string,
   body: Record<string, string>,
-): Promise<v.InferOutput<typeof slackEnvelope>> => {
+  schema: v.GenericSchema<unknown, TOutput>,
+): Promise<TOutput> => {
   // A fetcher reached through an object would run with that object as its
   // receiver, which workerd's global fetch rejects as an illegal invocation.
   const { fetcher } = caller;
@@ -191,7 +210,7 @@ const callSlack = async (
     },
     method: "POST",
   });
-  const result = v.parse(slackEnvelope, await response.json());
+  const result = v.parse(schema, await response.json());
   if (result.ok !== true) {
     throw new Error(
       `Slack ${method} failed: ${result.error ?? response.status}`,
@@ -203,6 +222,20 @@ const callSlack = async (
 export interface SlackProgressEndpoint {
   readonly authSecret: string;
   readonly handle: (request: Request) => Promise<Response>;
+  readonly handleChannels: (request: Request) => Promise<Response>;
+}
+
+type SlackChannelKind = "channel" | "group" | "private";
+
+interface SlackChannelDescription {
+  readonly kind: SlackChannelKind;
+  readonly name: string | null;
+}
+
+interface SlackProgressChannel {
+  readonly id: string;
+  readonly kind: SlackChannelKind;
+  readonly name: string | null;
 }
 
 export interface SlackProgressTurn {
@@ -276,6 +309,10 @@ const milestoneFrom = async (
   }
 };
 
+type ChannelResolution =
+  | { readonly channelId: string }
+  | { readonly refusal: "ambiguous_channel" | "channel_not_admitted" };
+
 export const createSlackProgressEndpoint = (
   config: ResolvedSlackProgressConfig,
   options: SlackProgressEndpointOptions,
@@ -288,6 +325,65 @@ export const createSlackProgressEndpoint = (
   const roots = createSqlSlackProgressRootStore(options.db);
   const authorization = `Bearer ${options.bearer}`;
 
+  const authorized = (request: Request): boolean =>
+    options.bearer !== "" &&
+    constantTimeEquals(
+      request.headers.get("authorization") ?? "",
+      authorization,
+    );
+
+  const describeChannel = async (
+    channelId: string,
+  ): Promise<SlackChannelDescription> => {
+    try {
+      const { channel } = await callSlack(
+        caller,
+        "conversations.info",
+        { channel: channelId },
+        conversationsInfoEnvelope,
+      );
+      if (channel === undefined) {
+        return { kind: "channel", name: null };
+      }
+      let kind: SlackChannelKind = "channel";
+      if (channel.is_mpim === true) {
+        kind = "group";
+      } else if (channel.is_private === true) {
+        kind = "private";
+      }
+      return { kind, name: channel.name ?? null };
+    } catch {
+      // A channel Slack will not describe is not a reason to hide it from the
+      // client choosing one, nor a channel it can match by name.
+      return { kind: "channel", name: null };
+    }
+  };
+
+  const resolveChannel = async (
+    channel: string,
+  ): Promise<ChannelResolution> => {
+    const admittedChannelIds = await admissionStore.listAdmittedChannelIds();
+    if (admittedChannelIds.includes(channel)) {
+      return { channelId: channel };
+    }
+    const name = (
+      channel.startsWith("#") ? channel.slice(1) : channel
+    ).toLowerCase();
+    const descriptions = await Promise.all(
+      admittedChannelIds.map(describeChannel),
+    );
+    const matches = admittedChannelIds.filter(
+      (_, index) => descriptions[index]?.name?.toLowerCase() === name,
+    );
+    const [match] = matches;
+    if (match === undefined) {
+      return { refusal: "channel_not_admitted" };
+    }
+    return matches.length === 1
+      ? { channelId: match }
+      : { refusal: "ambiguous_channel" };
+  };
+
   const rootOf = (milestone: SlackProgressMilestone): string =>
     `${milestone.title} · ${config.labels[milestone.kind]}`;
 
@@ -297,10 +393,15 @@ export const createSlackProgressEndpoint = (
   ): Promise<SlackProgressRoot> => {
     const stored = await roots.load(milestone.channel, milestone.task);
     if (stored === undefined) {
-      const posted = await callSlack(caller, "chat.postMessage", {
-        channel: milestone.channel,
-        text,
-      });
+      const posted = await callSlack(
+        caller,
+        "chat.postMessage",
+        {
+          channel: milestone.channel,
+          text,
+        },
+        slackEnvelope,
+      );
       const rootTs = posted.ts ?? "";
       if (rootTs === "") {
         throw new Error(
@@ -313,11 +414,16 @@ export const createSlackProgressEndpoint = (
     }
     if (stored.rootText !== text) {
       try {
-        await callSlack(caller, "chat.update", {
-          channel: milestone.channel,
-          text,
-          ts: stored.rootTs,
-        });
+        await callSlack(
+          caller,
+          "chat.update",
+          {
+            channel: milestone.channel,
+            text,
+            ts: stored.rootTs,
+          },
+          slackEnvelope,
+        );
       } catch (error: unknown) {
         // A root Slack refuses to edit must not swallow the milestone: the
         // reply still goes out, and a root Slack no longer has is forgotten so
@@ -340,11 +446,16 @@ export const createSlackProgressEndpoint = (
     threadTs: string,
     text: string,
   ): Promise<void> => {
-    await callSlack(caller, "chat.postMessage", {
-      channel: channelId,
-      text,
-      thread_ts: threadTs,
-    });
+    await callSlack(
+      caller,
+      "chat.postMessage",
+      {
+        channel: channelId,
+        text,
+        thread_ts: threadTs,
+      },
+      slackEnvelope,
+    );
   };
 
   const narrateMilestone = async (
@@ -395,30 +506,50 @@ export const createSlackProgressEndpoint = (
   return {
     authSecret: config.authSecret,
     async handle(request) {
-      const provided = request.headers.get("authorization") ?? "";
-      if (
-        options.bearer === "" ||
-        !constantTimeEquals(provided, authorization)
-      ) {
+      if (!authorized(request)) {
         return refusal(401, "unauthorized");
       }
       const milestone = await milestoneFrom(request);
       if (milestone === undefined) {
         return refusal(400, "invalid_request");
       }
-      const admittedBy = await admissionStore.admittedBy(milestone.channel);
+      const resolved = await resolveChannel(milestone.channel);
+      if ("refusal" in resolved) {
+        return refusal(
+          resolved.refusal === "ambiguous_channel" ? 409 : 403,
+          resolved.refusal,
+        );
+      }
+      const admittedBy = await admissionStore.admittedBy(resolved.channelId);
       if (admittedBy === undefined) {
         return refusal(403, "channel_not_admitted");
       }
+      const resolvedMilestone = {
+        ...milestone,
+        channel: resolved.channelId,
+      };
       try {
-        await claimAndRun(options.db, `progress:${milestone.id}`, () =>
-          postMilestone(milestone, admittedBy),
+        await claimAndRun(options.db, `progress:${resolvedMilestone.id}`, () =>
+          postMilestone(resolvedMilestone, admittedBy),
         );
       } catch (error: unknown) {
         console.error("Slack progress milestone failed", error);
         return refusal(500, "slack_failed");
       }
       return Response.json({ ok: true });
+    },
+    async handleChannels(request) {
+      if (!authorized(request)) {
+        return refusal(401, "unauthorized");
+      }
+      const admittedChannelIds = await admissionStore.listAdmittedChannelIds();
+      const channels: SlackProgressChannel[] = await Promise.all(
+        admittedChannelIds.map(async (id) => ({
+          id,
+          ...(await describeChannel(id)),
+        })),
+      );
+      return Response.json({ channels, ok: true });
     },
   };
 };
