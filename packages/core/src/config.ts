@@ -1,4 +1,9 @@
 import type { Skill } from "@flue/runtime";
+import { resolveSlackProgressConfig } from "./progress.ts";
+import type {
+  ResolvedSlackProgressConfig,
+  SlackProgressConfig,
+} from "./progress.ts";
 
 export const PRIVATE_RETENTION_DAYS = 7;
 export const CHANNEL_RETENTION_DAYS = 15;
@@ -52,6 +57,7 @@ export interface AgentConfig {
     channelDays?: number;
   };
   read?: SlackReadConfig;
+  progress?: SlackProgressConfig;
   model?: string;
   mcpServers?: readonly McpServerConfig[];
   skills?: readonly Skill[];
@@ -68,6 +74,7 @@ export interface ResolvedAgentConfig {
     channelDays: number;
   };
   read?: ResolvedSlackReadConfig;
+  progress?: ResolvedSlackProgressConfig;
   model: string;
   modelProvider: ModelProvider;
   mcpServers: readonly McpServerConfig[];
@@ -270,6 +277,7 @@ export const defineAgentConfig = (config: AgentConfig): ResolvedAgentConfig => {
     modelProvider: resolveModelProvider(model),
     name: config.name.trim(),
     ownerInstructions: config.ownerInstructions.trim(),
+    progress: resolveSlackProgressConfig(config.progress),
     read: resolveRead(config.read),
     retention: Object.freeze({
       channelDays: resolvePositiveInteger(
