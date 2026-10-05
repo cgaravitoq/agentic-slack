@@ -12,6 +12,7 @@ export interface SlackChannelAdmissionStore {
   readonly admittedBy: (channelId: string) => Promise<string | undefined>;
   readonly drop: (channelId: string) => Promise<void>;
   readonly isAdmitted: (channelId: string) => Promise<boolean>;
+  readonly listAdmittedChannelIds: () => Promise<readonly string[]>;
 }
 
 export const createSqlSlackChannelAdmissionStore = (
@@ -51,5 +52,15 @@ export const createSqlSlackChannelAdmissionStore = (
       .bind(channelId)
       .all();
     return results.some((row) => v.is(channelRow, row));
+  },
+  async listAdmittedChannelIds() {
+    const { results } = await db
+      .prepare(
+        "SELECT channel_id FROM slack_channel_admissions ORDER BY channel_id",
+      )
+      .all();
+    return results.flatMap((row) =>
+      v.is(channelRow, row) ? [row.channel_id] : [],
+    );
   },
 });

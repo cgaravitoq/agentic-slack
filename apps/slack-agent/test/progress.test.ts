@@ -35,6 +35,16 @@ class FakeD1 {
     return {
       all: () => {
         if (sql.includes("slack_channel_admissions")) {
+          if (!sql.includes("WHERE")) {
+            return Promise.resolve({
+              results: [...this.admissions.entries()]
+                .toSorted(([left], [right]) => left.localeCompare(right))
+                .map(([channel_id, admitted_by]) => ({
+                  admitted_by,
+                  channel_id,
+                })),
+            });
+          }
           const channelId = String(this.values[0]);
           const admittedBy = this.admissions.get(channelId);
           return Promise.resolve({
@@ -140,19 +150,37 @@ const strictFetch = (delegate: Fetcher): Fetcher =>
     return delegate(input, init);
   };
 
+interface ChannelInfo {
+  readonly is_mpim?: boolean;
+  readonly is_private?: boolean;
+  readonly name?: string;
+}
+
 const slackRecorder =
-  (calls: RecordedCall[], refusals: readonly (string | undefined)[] = []) =>
+  (
+    calls: RecordedCall[],
+    refusals: readonly (string | undefined)[] = [],
+    infos: Readonly<Record<string, ChannelInfo>> = {},
+  ) =>
   (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = v.parse(v.string(), input);
     const method = url.slice(url.lastIndexOf("/") + 1);
     const attempt = calls.length;
-    calls.push({
-      body: v.parse(
-        v.record(v.string(), v.string()),
-        JSON.parse(v.parse(v.string(), init?.body)),
-      ),
-      method,
-    });
+    const body = v.parse(
+      v.record(v.string(), v.string()),
+      JSON.parse(v.parse(v.string(), init?.body)),
+    );
+    calls.push({ body, method });
+    if (method === "conversations.info") {
+      const info = infos[body.channel];
+      return Promise.resolve(
+        Response.json(
+          info === undefined
+            ? { error: "channel_not_found", ok: false }
+            : { channel: info, ok: true },
+        ),
+      );
+    }
     const refusal = refusals[attempt];
     return Promise.resolve(
       Response.json(
@@ -191,6 +219,7 @@ const progressConfig = (narration?: string): ResolvedSlackProgressConfig => {
 interface EndpointOverrides {
   readonly bearer?: string;
   readonly fetcher?: Fetcher;
+  readonly infos?: Readonly<Record<string, ChannelInfo>>;
   readonly narration?: string;
   readonly narrate?: (turn: SlackProgressTurn) => Promise<void>;
   readonly refusals?: readonly (string | undefined)[];
@@ -204,7 +233,9 @@ const endpointFor = (
   createSlackProgressEndpoint(progressConfig(overrides.narration), {
     bearer: overrides.bearer ?? BEARER,
     db: testBindings(db).DB,
-    fetcher: overrides.fetcher ?? slackRecorder(calls, overrides.refusals),
+    fetcher:
+      overrides.fetcher ??
+      slackRecorder(calls, overrides.refusals, overrides.infos),
     narrate: overrides.narrate ?? (() => Promise.resolve()),
     teamId: trusted.teamId,
     token: trusted.botToken,
@@ -245,6 +276,13 @@ const postMilestone = (
   authorization: string | null = `Bearer ${BEARER}`,
 ): Request =>
   post(JSON.stringify({ ...milestone, ...overrides }), authorization);
+
+const getChannels = (
+  authorization: string | null = `Bearer ${BEARER}`,
+): Request =>
+  new Request("https://example.com/progress/channels", {
+    headers: authorization === null ? {} : { authorization },
+  });
 
 const authorizationRefusals = [null, "Bearer wrong", `Bearer ${BEARER}x`];
 
@@ -316,6 +354,7 @@ describe("progress endpoint", () => {
       "not json",
       "{}",
       JSON.stringify({ ...milestone, channel: "" }),
+      JSON.stringify({ ...milestone, channel: "x".repeat(256) }),
       JSON.stringify({ ...milestone, kind: "shipped" }),
       JSON.stringify({ ...milestone, text: "" }),
       JSON.stringify({ ...milestone, title: "x".repeat(301) }),
@@ -359,6 +398,215 @@ describe("progress endpoint", () => {
     });
     expect(calls).toEqual([]);
     expect(db.seen.size).toBe(0);
+  });
+
+  test("posts to the channel an admitted name resolves to, with or without # and in any case", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls, {
+      fetcher: strictFetch(
+        slackRecorder(calls, [], { C1: { name: "Sandbox" } }),
+      ),
+    });
+
+    const named = await endpoint.handle(postMilestone({ channel: "sandbox" }));
+    const hashed = await endpoint.handle(
+      postMilestone({ channel: "#SANDBOX", id: "evt-2" }),
+    );
+    const cased = await endpoint.handle(
+      postMilestone({ channel: "SaNdBoX", id: "evt-3" }),
+    );
+
+    expect([named.status, hashed.status, cased.status]).toEqual([
+      200, 200, 200,
+    ]);
+    expect(calls).toEqual([
+      { body: { channel: "C1" }, method: "conversations.info" },
+      ...rootCalls,
+      { body: { channel: "C1" }, method: "conversations.info" },
+      {
+        body: {
+          channel: "C1",
+          text: "Kicked off\nhttps://example.com/run",
+          thread_ts: "171.1",
+        },
+        method: "chat.postMessage",
+      },
+      { body: { channel: "C1" }, method: "conversations.info" },
+      {
+        body: {
+          channel: "C1",
+          text: "Kicked off\nhttps://example.com/run",
+          thread_ts: "171.1",
+        },
+        method: "chat.postMessage",
+      },
+    ]);
+  });
+
+  test("keys the root and the narration by the resolved id", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const { narrate, turns } = narrations();
+    const endpoint = endpointFor(db, calls, {
+      fetcher: strictFetch(
+        slackRecorder(calls, [], { C1: { is_private: true, name: "secret" } }),
+      ),
+      narrate,
+      narration: "Write in Spanish, warm and brief.",
+    });
+
+    const byName = await endpoint.handle(postMilestone({ channel: "#secret" }));
+    const byId = await endpoint.handle(
+      postMilestone({ channel: "C1", id: "evt-2" }),
+    );
+
+    expect([byName.status, byId.status]).toEqual([200, 200]);
+    expect(calls).toEqual([
+      { body: { channel: "C1" }, method: "conversations.info" },
+      {
+        body: { channel: "C1", text: "Release 42 · Started" },
+        method: "chat.postMessage",
+      },
+    ]);
+    expect([...db.roots.values()]).toEqual([
+      { root_text: "Release 42 · Started", root_ts: "171.1" },
+    ]);
+    expect(
+      turns.map((turn) => [turn.binding.channelId, turn.instanceId]),
+    ).toEqual([
+      ["C1", "slack:v1:T123:C1:171.1"],
+      ["C1", "slack:v1:T123:C1:171.1"],
+    ]);
+  });
+
+  test("refuses a name that matches no admitted channel and an id that is not admitted", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls, {
+      fetcher: strictFetch(
+        slackRecorder(calls, [], { C1: { name: "Sandbox" } }),
+      ),
+    });
+
+    const unknown = await endpoint.handle(
+      postMilestone({ channel: "release" }),
+    );
+    const foreign = await endpoint.handle(
+      postMilestone({ channel: "C9", id: "evt-2" }),
+    );
+
+    expect([unknown.status, foreign.status]).toEqual([403, 403]);
+    expect(await unknown.json()).toEqual({
+      error: "channel_not_admitted",
+      ok: false,
+    });
+    expect(await foreign.json()).toEqual({
+      error: "channel_not_admitted",
+      ok: false,
+    });
+    expect(calls).toEqual([
+      { body: { channel: "C1" }, method: "conversations.info" },
+      { body: { channel: "C1" }, method: "conversations.info" },
+    ]);
+    expect(db.roots.size).toBe(0);
+    expect(db.seen.size).toBe(0);
+  });
+
+  test("refuses a name that matches several admitted channels", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    db.admissions.set("C2", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls, {
+      fetcher: strictFetch(
+        slackRecorder(calls, [], {
+          C1: { name: "Sandbox" },
+          C2: { name: "sandbox" },
+        }),
+      ),
+    });
+
+    const response = await endpoint.handle(
+      postMilestone({ channel: "sandbox" }),
+    );
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error: "ambiguous_channel",
+      ok: false,
+    });
+    expect(calls).toEqual([
+      { body: { channel: "C1" }, method: "conversations.info" },
+      { body: { channel: "C2" }, method: "conversations.info" },
+    ]);
+    expect(db.roots.size).toBe(0);
+    expect(db.seen.size).toBe(0);
+  });
+
+  test("lists every admitted channel, naming the one Slack refuses to describe", async () => {
+    const db = new FakeD1();
+    for (const channelId of ["C1", "C2", "C3", "C9", "G1"]) {
+      db.admissions.set(channelId, ADMITTED_BY);
+    }
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls, {
+      fetcher: strictFetch(
+        slackRecorder(calls, [], {
+          C1: { name: "sandbox" },
+          C2: { is_mpim: true, name: "mpdm-ana--bo-1" },
+          C3: { is_private: true, name: "secret" },
+          G1: { is_private: true, name: "archive" },
+        }),
+      ),
+    });
+
+    const response = await endpoint.handleChannels(getChannels());
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      channels: [
+        { id: "C1", kind: "channel", name: "sandbox" },
+        { id: "C2", kind: "group", name: "mpdm-ana--bo-1" },
+        { id: "C3", kind: "private", name: "secret" },
+        { id: "C9", kind: "channel", name: null },
+        { id: "G1", kind: "private", name: "archive" },
+      ],
+      ok: true,
+    });
+    expect(calls).toEqual(
+      ["C1", "C2", "C3", "C9", "G1"].map((channel) => ({
+        body: { channel },
+        method: "conversations.info",
+      })),
+    );
+  });
+
+  test("guards the channel listing with the same bearer", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+
+    const refusals = await Promise.all(
+      authorizationRefusals.map(async (authorization) => {
+        const response = await endpoint.handleChannels(
+          getChannels(authorization),
+        );
+        return { body: await response.json(), status: response.status };
+      }),
+    );
+
+    expect(refusals).toEqual(
+      authorizationRefusals.map(() => ({
+        body: { error: "unauthorized", ok: false },
+        status: 401,
+      })),
+    );
+    expect(calls).toEqual([]);
   });
 
   test("posts the root and the reply for the first milestone of a task", async () => {
@@ -760,5 +1008,54 @@ describe("progress route", () => {
     );
     expect(ready.status).toBe(200);
     expect(JSON.parse(await ready.text())).toEqual({ status: "ready" });
+  });
+
+  test("serves the channel listing only when the endpoint is configured", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const app = createApp(
+      trusted,
+      MODEL_PROVIDER_CLOUDFLARE,
+      async () => {},
+      undefined,
+      undefined,
+      undefined,
+      endpointFor(db, calls, {
+        fetcher: strictFetch(
+          slackRecorder(calls, [], { C1: { name: "sandbox" } }),
+        ),
+      }),
+    );
+
+    const listed = await app.request(
+      "/progress/channels",
+      { headers: { authorization: `Bearer ${BEARER}` } },
+      testBindings(db),
+    );
+    expect(listed.status).toBe(200);
+    expect(await listed.json()).toEqual({
+      channels: [{ id: "C1", kind: "channel", name: "sandbox" }],
+      ok: true,
+    });
+
+    const refused = await app.request(
+      "/progress/channels",
+      undefined,
+      testBindings(db),
+    );
+    expect(refused.status).toBe(401);
+
+    const unconfigured = createApp(
+      trusted,
+      MODEL_PROVIDER_CLOUDFLARE,
+      async () => {},
+    );
+    const absent = await unconfigured.request(
+      "/progress/channels",
+      undefined,
+      testBindings(db),
+    );
+    expect(absent.status).toBe(404);
   });
 });
