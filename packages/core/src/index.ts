@@ -1,3 +1,5 @@
+export { createSqlSlackChannelAdmissionStore } from "./admission.ts";
+export type { SlackChannelAdmissionStore } from "./admission.ts";
 export {
   APPROVAL_TTL_SECONDS,
   canonicalJson,
