@@ -241,7 +241,7 @@ It advances only as far as coverage is complete: to the last returned message of
 Slack stays the source of truth: that cursor is the only thing stored, no message is mirrored, and the tools use the bot token you already configured.
 The admission in D1 (`slack_channel_admissions`, migration `0005_slack_channel_admissions.sql`) records which allowlisted user invited the bot to a channel and when, and every read checks it before its first Slack call.
 
-The option adds three more bot token scopes: `channels:history` and `groups:history` to read public and private channels, and `users:read` to resolve author display names, cached per call.
+The option adds four more bot token scopes: `channels:history` and `groups:history` to read public and private channels, `mpim:history` to read group DMs, and `users:read` to resolve author display names, cached per call.
 Add them in your Slack app and reinstall it; `bun run manifest` includes them as soon as `read` is set.
 
 ## Reporting task progress
@@ -374,11 +374,14 @@ Under **OAuth & Permissions**, add these bot token scopes and install the app to
 - `groups:read`
 - `groups:write`
 - `im:history`
+- `mpim:read`
+- `mpim:write`
 - `reactions:write`
 
 The bot token scopes are the neutral default.
 `channels:read` and `groups:read` are what deliver a join in a public or private channel, and `channels:manage` and `groups:write` are what let the bot leave one.
-An agent configuration with the `read` option also needs `channels:history`, `groups:history`, and `users:read`; `bun run manifest` generates them with the rest.
+`mpim:read` and `mpim:write` do the same for a group DM.
+An agent configuration with the `read` option also needs `channels:history`, `groups:history`, `mpim:history`, and `users:read`; `bun run manifest` generates them with the rest.
 
 Copy the bot token from **OAuth & Permissions** and the signing secret and app ID from **Basic Information**.
 Open Slack in a browser; the workspace ID is the `T...` segment in `https://app.slack.com/client/T.../C...`.

@@ -793,6 +793,8 @@ test("adds the read scopes only when the option is set", () => {
     "groups:read",
     "groups:write",
     "im:history",
+    "mpim:read",
+    "mpim:write",
     "reactions:write",
   ]);
   expect(manifestScopes(readConfig)).toEqual([
@@ -806,6 +808,9 @@ test("adds the read scopes only when the option is set", () => {
     "groups:read",
     "groups:write",
     "im:history",
+    "mpim:history",
+    "mpim:read",
+    "mpim:write",
     "reactions:write",
     "users:read",
   ]);
