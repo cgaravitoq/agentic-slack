@@ -60,8 +60,14 @@ const botUserId = async (fetcher: Fetcher, token: string): Promise<string> => {
   return userId;
 };
 
-const channelGuardNotice = (channelId: string, inviterId: string): string =>
-  `I left ${channelId} after ${inviterId} added me there. I only act in channels an allowed user invited me to.`;
+const channelGuardNotice = (
+  channelId: string,
+  inviterId: string,
+  leaveRefusal: string | undefined,
+): string =>
+  leaveRefusal === undefined
+    ? `I left ${channelId} after ${inviterId} added me there. I only act in channels an allowed user invited me to.`
+    : `I could not leave ${channelId} after ${inviterId} added me there (Slack said ${leaveRefusal}), so remove me from it. I only act in channels an allowed user invited me to.`;
 
 // A leave Slack refuses for good cannot be fixed by redelivering the event, and
 // the admission is already gone, so it is reported rather than retried; a
@@ -70,13 +76,14 @@ const leaveChannel = async (
   fetcher: Fetcher,
   token: string,
   channelId: string,
-): Promise<void> => {
+): Promise<string | undefined> => {
   const refusal = await slackRefusal(fetcher, token, "conversations.leave", {
     channel: channelId,
   });
   if (refusal !== undefined) {
     console.error("Slack conversations.leave failed", channelId, refusal);
   }
+  return refusal;
 };
 
 const notifyOwners = async (
@@ -84,8 +91,13 @@ const notifyOwners = async (
   token: string,
   ownerIds: readonly string[],
   membership: RoutedSlackMembership,
+  leaveRefusal: string | undefined,
 ): Promise<void> => {
-  const text = channelGuardNotice(membership.channelId, membership.inviterId);
+  const text = channelGuardNotice(
+    membership.channelId,
+    membership.inviterId,
+    leaveRefusal,
+  );
   for (const ownerId of ownerIds) {
     try {
       // oxlint-disable-next-line no-await-in-loop
@@ -121,6 +133,16 @@ export const createMembershipHandler =
       return;
     }
     await store.drop(membership.channelId);
-    await leaveChannel(fetcher, botToken, membership.channelId);
-    await notifyOwners(fetcher, botToken, config.allowedUserIds, membership);
+    const leaveRefusal = await leaveChannel(
+      fetcher,
+      botToken,
+      membership.channelId,
+    );
+    await notifyOwners(
+      fetcher,
+      botToken,
+      config.allowedUserIds,
+      membership,
+      leaveRefusal,
+    );
   };

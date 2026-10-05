@@ -1300,6 +1300,40 @@ describe("channel guard", () => {
     expect(db.admissions.size).toBe(0);
   });
 
+  test("tells the owners the bot is still there when Slack refuses the leave", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      const channel = guardChannel(db, guardCalls, {
+        "conversations.leave": { error: "missing_scope", ok: false },
+      });
+
+      const response = await channel
+        .route()
+        .request(
+          await signedRequest(joined("Ev-stuck", { inviter: "U999" })),
+          undefined,
+          testBindings(db),
+        );
+
+      expect(response.status).toBe(200);
+    } finally {
+      console.error = originalError;
+    }
+
+    const notices = guardCalls.filter(
+      (call) => call.method === "chat.postMessage",
+    );
+    expect(notices.map((call) => call.body.channel)).toEqual(["U111", "U222"]);
+    for (const notice of notices) {
+      expect(notice.body.text).toContain("I could not leave CFOREIGN");
+      expect(notice.body.text).toContain("missing_scope");
+    }
+    expect(db.admissions.size).toBe(0);
+  });
+
   test("answers non-2xx when Slack cannot say who the bot is, so Slack retries", async () => {
     const db = new FakeD1();
     const guardCalls: RecordedCall[] = [];
