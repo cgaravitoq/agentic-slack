@@ -129,6 +129,18 @@ const fakeSlack = (fixture: FakeSlackFixture): FakeSlackApi => {
   return { calls, fetcher };
 };
 
+// workerd rejects a built-in fetch invoked with a receiver, while Bun ignores
+// the receiver, so only a strict wrapper lets a test observe the difference.
+const strictFetch = (delegate: Fetcher): Fetcher =>
+  function rejectReceiver(this: undefined, input, init) {
+    if (this !== undefined) {
+      throw new Error(
+        "Illegal invocation: function called with incorrect `this` reference",
+      );
+    }
+    return delegate(input, init);
+  };
+
 const failureOf = async (operation: Promise<unknown>): Promise<string> => {
   try {
     await operation;
@@ -600,6 +612,56 @@ test("refuses a direct-message read without a channel or without membership", as
   ).toEqual([]);
 });
 
+test("calls an injected fetcher with no receiver on both read tools", async () => {
+  const parentTs = at(-300);
+  const api = fakeSlack({
+    channels: { C1: [{ text: "hello", ts: at(-50), user: "U111" }] },
+    members: [],
+    pageSize: 50,
+    threads: { [`C1:${parentTs}`]: threadMessages(parentTs, 2) },
+    users: { U111: "Ada" },
+  });
+  const cursors = new Map<string, string>();
+  const [threadTool, channelTool] = createSlackReadTools(
+    channelBinding("C1", parentTs),
+    {
+      cursorStore: {
+        load: (channelId) => Promise.resolve(cursors.get(channelId)),
+        save: (channelId, cursor) => {
+          cursors.set(channelId, cursor);
+          return Promise.resolve();
+        },
+      },
+      fetcher: strictFetch(api.fetcher),
+      lookbackSeconds: 3600,
+      maxMessages: 50,
+      token: "xoxb-test-token",
+    },
+  );
+
+  const thread = await threadTool.run({
+    data: {},
+    log: silentLog,
+    toolCallId: "read-call",
+  });
+  expect(thread.output.messages.map((message) => message.ts)).toEqual([
+    parentTs,
+    at(0, 200),
+  ]);
+
+  await withFixedClock(async () => {
+    const channel = await channelTool.run({
+      data: {},
+      log: silentLog,
+      toolCallId: "read-call",
+    });
+    expect(channel.output.messages.map((message) => message.ts)).toEqual([
+      at(-50),
+    ]);
+    expect(cursors.get("C1")).toBe(NOW_TS);
+  });
+});
+
 const readConfig = defineAgentConfig({
   allowedUserIds: ["U111", "U222"],
   description: "Reads Slack conversations.",
@@ -887,6 +949,71 @@ test("lets the owner's direct message name the channel it reads", async () => {
         ?.params.get("channel"),
     ).toBe("CJOINED");
     expect(db.rows.get("CJOINED")).toBe(NOW_TS);
+  } finally {
+    network.mockRestore();
+    await mock.module("../agent.config.ts", () => ({ default: shipped }));
+  }
+});
+
+test("reads through the tools agent.ts mounts when the global fetch rejects a receiver", async () => {
+  const { default: shipped } = await import("../agent.config.ts");
+  const parentTs = at(-300);
+  const api = fakeSlack({
+    channels: { C1: [{ text: "hello", ts: at(-50), user: "U111" }] },
+    members: [],
+    pageSize: 50,
+    threads: { [`C1:${parentTs}`]: threadMessages(parentTs, 2) },
+    users: { U111: "Ada" },
+  });
+  const network = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(strictFetch(api.fetcher), { preconnect: fetch.preconnect }),
+  );
+  const db = fakeReadDb();
+  workerEnv.DB = db.db;
+  await mock.module("../agent.config.ts", () => ({ default: readConfig }));
+  try {
+    const specifier = "../src/agent.ts?read-strict-fetch";
+    const entry: unknown = await import(specifier);
+    const slackAgent = v.parse(
+      v.object({ SlackAgent: v.function() }),
+      entry,
+    ).SlackAgent;
+    mounted.length = 0;
+    delivery = channelMention;
+    slackAgent({ id: "test" });
+
+    const readThread = mounted.find((tool) => tool.name === "read_thread");
+    const readChannelSince = mounted.find(
+      (tool) => tool.name === "read_channel_since",
+    );
+    if (readThread === undefined || readChannelSince === undefined) {
+      throw new Error("the read tools were not mounted");
+    }
+
+    await readThread.run({
+      data: {},
+      log: silentLog,
+      toolCallId: "read-call",
+    });
+    await withFixedClock(async () => {
+      await readChannelSince.run({
+        data: {},
+        log: silentLog,
+        toolCallId: "read-call",
+      });
+    });
+
+    expect(
+      api.calls
+        .filter((call) => call.method === "conversations.replies")
+        .map((call) => call.params.get("ts")),
+    ).toEqual([parentTs]);
+    expect(
+      api.calls
+        .filter((call) => call.method === "conversations.history")
+        .map((call) => call.params.get("channel")),
+    ).toEqual(["C1"]);
+    expect(db.rows.get("C1")).toBe(NOW_TS);
   } finally {
     network.mockRestore();
     await mock.module("../agent.config.ts", () => ({ default: shipped }));
