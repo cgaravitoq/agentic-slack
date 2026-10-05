@@ -13,6 +13,7 @@ import {
   claimEvent,
   releaseEvent,
 } from "../../../packages/core/src/dedup.ts";
+import { createSqlSlackProgressRootStore } from "../../../packages/core/src/progress.ts";
 import * as v from "valibot";
 
 const bindings = v.array(
@@ -151,6 +152,7 @@ describe("D1 migration schema", () => {
       "0003_approval_requests.sql",
       "0004_slack_read_cursors.sql",
       "0005_slack_channel_admissions.sql",
+      "0006_slack_progress_roots.sql",
     ]);
     expect(
       applyOrder([
@@ -176,6 +178,9 @@ describe("D1 migration schema", () => {
     );
     expect(batches[4]).toContain(
       "CREATE TABLE IF NOT EXISTS slack_channel_admissions",
+    );
+    expect(batches[5]).toContain(
+      "CREATE TABLE IF NOT EXISTS slack_progress_roots",
     );
   });
 
@@ -651,6 +656,65 @@ describe("slack read cursor storage", () => {
     expect(rows.results).toEqual([
       { channel_id: "C1", cursor_ts: "1800000001.000000", updated_at: NOW },
       { channel_id: "C2", cursor_ts: "1799999000.000000", updated_at: NOW },
+    ]);
+  });
+});
+
+describe("slack progress root storage", () => {
+  test("keeps one root per task in a channel and updates it in place", async () => {
+    const { db } = migrated();
+    const store = createSqlSlackProgressRootStore(db);
+
+    expect(await store.load("C1", "task-1")).toBeUndefined();
+    await store.save(
+      "C1",
+      "task-1",
+      { rootText: "Release 42 · Started", rootTs: "171.1" },
+      NOW,
+    );
+    await store.save(
+      "C1",
+      "task-2",
+      { rootText: "Release 43 · Started", rootTs: "171.2" },
+      NOW,
+    );
+    await store.save(
+      "C1",
+      "task-1",
+      { rootText: "Release 42 · Blocked", rootTs: "171.1" },
+      NOW + 60,
+    );
+
+    expect(await store.load("C1", "task-1")).toEqual({
+      rootText: "Release 42 · Blocked",
+      rootTs: "171.1",
+    });
+    expect(await store.load("C1", "task-2")).toEqual({
+      rootText: "Release 43 · Started",
+      rootTs: "171.2",
+    });
+    expect(await store.load("C2", "task-1")).toBeUndefined();
+
+    const rows = await db
+      .prepare(
+        "SELECT channel_id, task_id, root_ts, root_text, updated_at FROM slack_progress_roots ORDER BY channel_id, task_id",
+      )
+      .all();
+    expect(rows.results).toEqual([
+      {
+        channel_id: "C1",
+        root_text: "Release 42 · Blocked",
+        root_ts: "171.1",
+        task_id: "task-1",
+        updated_at: NOW + 60,
+      },
+      {
+        channel_id: "C1",
+        root_text: "Release 43 · Started",
+        root_ts: "171.2",
+        task_id: "task-2",
+        updated_at: NOW,
+      },
     ]);
   });
 });

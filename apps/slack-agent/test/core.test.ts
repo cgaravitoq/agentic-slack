@@ -195,6 +195,88 @@ describe("neutral core composition", () => {
       );
     }
   });
+
+  test("ships no progress reporting until the operator configures it", () => {
+    expect(config.progress).toBeUndefined();
+
+    const reporting = defineAgentConfig({
+      description: "Reports task progress.",
+      name: "Progress Agent",
+      ownerInstructions: "Be concise.",
+      progress: {
+        authSecret: "  PROGRESS_BEARER  ",
+        labels: {
+          blocked: " Blocked ",
+          done: "Done",
+          merged: "Merged",
+          pr: "Pull request",
+          progress: "In progress",
+          review: "In review",
+          started: "Started",
+        },
+      },
+    });
+
+    expect(reporting.progress).toEqual({
+      authSecret: "PROGRESS_BEARER",
+      labels: {
+        blocked: "Blocked",
+        done: "Done",
+        merged: "Merged",
+        pr: "Pull request",
+        progress: "In progress",
+        review: "In review",
+        started: "Started",
+      },
+    });
+    expect(Object.isFrozen(reporting.progress?.labels)).toBe(true);
+  });
+
+  test("rejects a progress block with no secret or a missing label", () => {
+    const required = {
+      description: "Rejects invalid operator fields.",
+      name: "Invalid Agent",
+      ownerInstructions: "Be concise.",
+    };
+    const labels = {
+      blocked: "Blocked",
+      done: "Done",
+      merged: "Merged",
+      pr: "Pull request",
+      progress: "In progress",
+      review: "In review",
+      started: "Started",
+    };
+
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        progress: { authSecret: "   ", labels },
+      }),
+    ).toThrow("Agent config requires progress authSecret");
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        progress: { authSecret: "X", labels: { ...labels, done: " " } },
+      }),
+    ).toThrow("Agent config requires a progress label for done");
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        progress: {
+          authSecret: "X",
+          labels: {
+            blocked: "Blocked",
+            merged: "Merged",
+            pr: "Pull request",
+            progress: "In progress",
+            review: "In review",
+            started: "Started",
+          },
+        },
+      }),
+    ).toThrow("Agent config requires a progress label for done");
+  });
 });
 
 describe("D1 claim lifecycle", () => {

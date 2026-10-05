@@ -9,7 +9,7 @@ Replies always go to the requesting thread.
 The agent has no built-in business integrations or external tools.
 Business tools live in an MCP server you operate, and procedures ship as Agent Skills; both are declared in `apps/slack-agent/agent.config.ts`.
 It receives admitted mentions and DMs, not the complete history of a Slack channel; with the opt-in `read` option it can also read a thread or a channel's recent messages it is allowed to see.
-Configure its name, instructions, suggested prompts, allowed users, retention, model, MCP servers, skills, and read tools in `apps/slack-agent/agent.config.ts`.
+Configure its name, instructions, suggested prompts, allowed users, retention, model, MCP servers, skills, read tools, and progress reporting in `apps/slack-agent/agent.config.ts`.
 
 This Bun monorepo separates reusable Slack admission and delivery code from the deployed application.
 The current runtime uses Flue, Cloudflare Workers, Durable Objects, and D1, and runs the model on Workers AI or through a credential broker you operate; see [Model providers](#model-providers).
@@ -33,10 +33,10 @@ flowchart LR
 
 ## Architecture
 
-The core owns Slack admission and delivery, deduplication, retention helpers, instruction composition, and the opt-in Slack read tools.
+The core owns Slack admission and delivery, deduplication, retention helpers, instruction composition, the opt-in Slack read tools, and the opt-in progress endpoint.
 The application selects the provider the model prefix names and connects the Flue agent lifecycle to durable delivery, retention, and the read tools' delivery-bound scope.
 
-The operator surface is `apps/slack-agent/agent.config.ts`: name, description, owner instructions, allowed users, suggested prompts, retention, model, MCP servers, skills, and the opt-in `read` tools.
+The operator surface is `apps/slack-agent/agent.config.ts`: name, description, owner instructions, allowed users, suggested prompts, retention, model, MCP servers, skills, the opt-in `read` tools, and the opt-in `progress` endpoint.
 An operator repository that pins this one can keep that file outside it; see [Consume a pinned copy](#consume-a-pinned-copy).
 
 The Worker claims the event in D1 and dispatches the turn to the Durable Object before it acknowledges, so an event Slack is told to stop retrying is already admitted durably.
@@ -244,6 +244,60 @@ The admission in D1 (`slack_channel_admissions`, migration `0005_slack_channel_a
 The option adds three more bot token scopes: `channels:history` and `groups:history` to read public and private channels, and `users:read` to resolve author display names, cached per call.
 Add them in your Slack app and reinstall it; `bun run manifest` includes them as soon as `read` is set.
 
+## Reporting task progress
+
+An orchestrator you operate can report a task's milestones to a channel, and the bot keeps one thread per task: a root message showing the task's title and current status, and every milestone as a reply in that thread.
+The option is opt-in, with the `progress` block in `apps/slack-agent/agent.config.ts`:
+
+```ts
+export default defineAgentConfig({
+  // ...the rest of your configuration
+  progress: {
+    authSecret: "SLACK_PROGRESS_BEARER",
+    labels: {
+      started: "Started",
+      progress: "In progress",
+      blocked: "Blocked",
+      pr: "Pull request",
+      review: "In review",
+      merged: "Merged",
+      done: "Done",
+    },
+  },
+});
+```
+
+`authSecret` names the Worker secret holding the bearer token the sender presents, and `labels` names the word each status kind shows in the root message.
+Store the token as a Worker secret rather than in the config file:
+
+```sh
+bunx wrangler secret put SLACK_PROGRESS_BEARER --config apps/slack-agent/wrangler.deploy.json --env staging
+```
+
+It mounts `POST /progress`; without the block the route does not exist and nothing else changes.
+The sender posts one milestone per event:
+
+```sh
+curl --fail https://your-worker.example.com/progress \
+  --request POST \
+  --header "authorization: Bearer $SLACK_PROGRESS_BEARER" \
+  --header "content-type: application/json" \
+  --data '{"id":"evt-9f2c","task":"release-42","title":"Release 42","channel":"C0123456789","kind":"pr","text":"Opened the release pull request","url":"https://github.com/you/repo/pull/7"}'
+```
+
+A success answers `200 {"ok":true}`; a refusal answers a 4xx with `{"ok":false,"error":"..."}` and calls Slack not at all.
+
+- `id` identifies the event: a retry with an id that already posted is a no-op that still answers success.
+- `task` identifies the task inside the channel; its first event posts the root and stores the root timestamp in D1 (`slack_progress_roots`, migration `0006_slack_progress_roots.sql`), and later events reply in that thread.
+- `kind` is one of `started`, `progress`, `blocked`, `pr`, `review`, `merged`, `done`; the root reads `<title> · <label of the kind>` and is edited whenever that text changes, so the root always shows the task's current status.
+- `text` posts as the reply, with `url` on the line below it when the sender provides one.
+- `title`, `text`, `id`, `task`, `channel` and `url` are bounded, `url` must be HTTPS, and the channel must already carry the admission an allowlisted user's invitation wrote.
+
+The refusals are `401` for a missing or wrong bearer, `400` for a body that is not a milestone, and `403` for a channel no allowed user admitted.
+A Slack failure answers `500` so the sender can retry, and the retry is deduplicated by `id` once a request has succeeded.
+`chat:write` covers both `chat.postMessage` and `chat.update`, so the option adds no scope.
+Milestone content arrives curated and is posted as given: the bot does not narrate or rewrite it.
+
 ## Who can talk to the agent
 
 By default any eligible human in the workspace can mention the agent or DM it.
@@ -297,7 +351,7 @@ Keep the `flue-class-FlueSlackAgentAgent` SQLite migration: Flue injects the Dur
 bun run db:migrate:staging
 ```
 
-This applies the checked-in deduplication, approval, channel admission, and Slack read cursor schemas to the database in your local deployment configuration.
+This applies the checked-in deduplication, approval, channel admission, Slack read cursor, and progress root schemas to the database in your local deployment configuration.
 `bun run db:migrate:local` only migrates the local development store.
 
 ### 3. Create the Slack app
@@ -427,6 +481,7 @@ When `allowedUserIds` is set, only those users can start a turn or an assistant 
 When the option is unset, any eligible human in that workspace who can reach the installed app can interact with it or invite it to a channel.
 Delivery destinations come from trusted event data, not model output.
 The Slack read tools read only the conversation the delivered message came from and the channels an allowlisted user invited the bot to; with the `read` option unset the agent has no way to read a conversation it was not addressed in.
+The `progress` route exists only when the configuration names it, every request must carry its bearer secret, and it posts only into a channel an allowlisted user's invitation admitted.
 A tool the operator gates with `requireApproval` reaches its MCP server only after the person who asked approves that exact call in the thread it came from.
 Instructions and output filtering reduce accidental disclosure but do not make untrusted prompts safe to receive credentials.
 Conversation data is processed by Slack, by Cloudflare, and by the model provider your configuration selects.
