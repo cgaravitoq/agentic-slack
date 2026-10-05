@@ -193,20 +193,25 @@ interface SlackCaller {
   readonly token: string;
 }
 
+// Slack takes a JSON body on its write methods but answers a read method sent
+// one with invalid_arguments, so the body's type picks the encoding.
 const callSlack = async <TOutput extends SlackEnvelope>(
   caller: SlackCaller,
   method: string,
-  body: Record<string, string>,
+  body: Record<string, string> | URLSearchParams,
   schema: v.GenericSchema<unknown, TOutput>,
 ): Promise<TOutput> => {
   // A fetcher reached through an object would run with that object as its
   // receiver, which workerd's global fetch rejects as an illegal invocation.
   const { fetcher } = caller;
+  const form = body instanceof URLSearchParams;
   const response = await fetcher(`${SLACK_API}${method}`, {
-    body: JSON.stringify(body),
+    body: form ? body : JSON.stringify(body),
     headers: {
       authorization: `Bearer ${caller.token}`,
-      "content-type": "application/json; charset=utf-8",
+      "content-type": form
+        ? "application/x-www-form-urlencoded; charset=utf-8"
+        : "application/json; charset=utf-8",
     },
     method: "POST",
   });
@@ -339,7 +344,7 @@ export const createSlackProgressEndpoint = (
       const { channel } = await callSlack(
         caller,
         "conversations.info",
-        { channel: channelId },
+        new URLSearchParams({ channel: channelId }),
         conversationsInfoEnvelope,
       );
       if (channel === undefined) {
