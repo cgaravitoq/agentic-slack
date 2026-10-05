@@ -2472,6 +2472,26 @@ describe("durable Slack delivery", () => {
     expect(slack.markdown()).not.toContain(SLACK_STREAM_FAILURE_NOTICE);
   });
 
+  test("owes the thread every fallback text that joined its response", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const later = { ...fallbackBinding(), fallbackText: "Opened the PR" };
+    openSlackDelivery(
+      store,
+      "joined",
+      fallbackBinding(),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    openSlackDelivery(store, "joined", later, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "joined", later, BOT_TOKEN, slack.fetcher);
+    await failSlackDelivery(store, "joined", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "Kicked off\nhttps://example.com/run\n\nOpened the PR",
+    ]);
+  });
+
   test("answers a Slack call that broke with the delivery's fallback text", async () => {
     const slack = createFakeSlack(
       { "chat.appendStream": "invalid_chunks" },

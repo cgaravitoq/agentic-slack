@@ -126,7 +126,6 @@ const routedOrigin = Symbol("routedOrigin");
 
 interface SlackStreamTarget {
   readonly channelId: string;
-  readonly fallbackText?: string;
   readonly threadTs: string;
   readonly recipientUserId: string;
   readonly recipientTeamId: string;
@@ -176,26 +175,23 @@ export const slackDeliveryBinding = (
 const streamTargetFromBinding = (
   binding: SlackDeliveryBinding,
 ): SlackStreamTarget =>
-  Object.freeze({
-    ...streamTargetFor({
-      appId: "_",
-      channelId: binding.channelId,
-      eventId: "_",
-      kind: "turn",
-      messageTs: "_",
-      surface: binding.surface,
-      teamId: binding.recipientTeamId,
-      text: "_",
-      threadTs: binding.threadTs,
-      userId: binding.recipientUserId,
-    }),
-    fallbackText: binding.fallbackText,
+  streamTargetFor({
+    appId: "_",
+    channelId: binding.channelId,
+    eventId: "_",
+    kind: "turn",
+    messageTs: "_",
+    surface: binding.surface,
+    teamId: binding.recipientTeamId,
+    text: "_",
+    threadTs: binding.threadTs,
+    userId: binding.recipientUserId,
   });
 
 export interface SlackStream {
   append: (delta: string) => void;
   task: (update: SlackTaskUpdate) => void;
-  finish: (fallback: string) => Promise<void>;
+  finish: (fallback: string, notice?: string) => Promise<void>;
   // True when the closing notice reached the thread. `replyText` posts a reply
   // the stream never saw, the way `finish` posts its fallback.
   fail: (notice: string, replyText?: string) => Promise<boolean>;
@@ -389,7 +385,6 @@ export const createSlackStream = (
 ): SlackStream => {
   const { channelId } = target;
   const sanitizer = createStreamSanitizer();
-  const fallbackNotice = target.fallbackText ?? SLACK_STREAM_FAILURE_NOTICE;
   let queue: Promise<void> = Promise.resolve();
   let streamTs: string | undefined;
   let appended = false;
@@ -640,6 +635,7 @@ export const createSlackStream = (
   const close = async (
     trailer: string,
     always: boolean,
+    failureNotice: string,
     replyText?: string,
   ): Promise<boolean> => {
     if (closed) {
@@ -660,7 +656,7 @@ export const createSlackStream = (
     // stream: otherwise they keep the partial content with nothing telling them
     // the turn broke. `closed` keeps it to one notice per stream.
     if (always || !appended || failure !== undefined) {
-      const notice = failure === undefined ? trailer : fallbackNotice;
+      const notice = failure === undefined ? trailer : failureNotice;
       // `post`, not `send`: the closing word is not stream content, and a reply
       // that already hit the content cap would otherwise clip it away and leave
       // the user with a truncated answer and no sign the turn broke.
@@ -686,10 +682,10 @@ export const createSlackStream = (
       bufferAppend(sanitizer.push(delta));
     },
     fail(notice, replyText) {
-      return close(notice, true, replyText);
+      return close(notice, true, notice, replyText);
     },
-    async finish(fallback) {
-      await close(fallback, false);
+    async finish(fallback, notice = SLACK_STREAM_FAILURE_NOTICE) {
+      await close(fallback, false, notice);
       if (failure !== undefined) {
         throw failure;
       }
@@ -910,7 +906,10 @@ const runSlackAlarmDelivery = async (
   feedSlackStream(stream, work.events);
   // No `fail` on the way out: `finish` already sent the failure notice and
   // closed the stream before it rethrows.
-  await stream.finish(replyTrailer(work.replyText, binding.fallbackText));
+  await stream.finish(
+    replyTrailer(work.replyText, binding.fallbackText),
+    failureNotice(binding),
+  );
 };
 
 const emptyRecord = (binding: SlackDeliveryBinding): SlackDeliveryRecord => ({
@@ -941,14 +940,36 @@ const ownsDestination = (
 // response carries a `useAgentStart()` run per requesting thread. Every one of
 // those threads is owed the reply, so a delivery that joins an open record
 // adds its destination instead of being dropped.
+// A delivery joining a thread the record already answers still owes that
+// thread its own fallback text, so the owner carries both rather than the
+// joining one being dropped with its text.
 const adoptDestination = (
   record: SlackDeliveryRecord,
   binding: SlackDeliveryBinding,
 ): boolean => {
-  if (ownsDestination(record, binding)) {
+  if (!ownsDestination(record, binding)) {
+    record.joinedBindings.push(binding);
+    return true;
+  }
+  const owed = binding.fallbackText;
+  if (owed === undefined) {
     return false;
   }
-  record.joinedBindings.push(binding);
+  const withOwed = (owner: SlackDeliveryBinding): SlackDeliveryBinding => {
+    if (
+      !sameDestination(owner, binding) ||
+      owner.fallbackText?.includes(owed) === true
+    ) {
+      return owner;
+    }
+    const fallbackText = [owner.fallbackText, owed]
+      .filter((text) => text !== undefined)
+      .join("\n\n")
+      .slice(0, MAX_SLACK_APPEND_LENGTH);
+    return { ...owner, fallbackText };
+  };
+  record.binding = withOwed(record.binding);
+  record.joinedBindings = record.joinedBindings.map(withOwed);
   return true;
 };
 
@@ -1188,6 +1209,7 @@ export const finishSlackDelivery = async (
       : () =>
           live.stream.finish(
             replyTrailer(record.replyText, record.binding.fallbackText),
+            failureNotice(record.binding),
           );
   try {
     await settleDestination(primary);
