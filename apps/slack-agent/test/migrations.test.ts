@@ -4,6 +4,7 @@ import { readdir } from "node:fs/promises";
 import {
   APPROVAL_TTL_SECONDS,
   createApprovalStore,
+  createSqlSlackChannelAdmissionStore,
   createSqlSlackReadCursorStore,
 } from "@agentic-slack/core";
 import type { ApprovalRequest } from "@agentic-slack/core";
@@ -149,6 +150,7 @@ describe("D1 migration schema", () => {
       "0002_seen_events_created_at.sql",
       "0003_approval_requests.sql",
       "0004_slack_read_cursors.sql",
+      "0005_slack_channel_admissions.sql",
     ]);
     expect(
       applyOrder([
@@ -171,6 +173,9 @@ describe("D1 migration schema", () => {
     expect(batches[2]).toContain("CREATE INDEX");
     expect(batches[3]).toContain(
       "CREATE TABLE IF NOT EXISTS slack_read_cursors",
+    );
+    expect(batches[4]).toContain(
+      "CREATE TABLE IF NOT EXISTS slack_channel_admissions",
     );
   });
 
@@ -646,6 +651,35 @@ describe("slack read cursor storage", () => {
     expect(rows.results).toEqual([
       { channel_id: "C1", cursor_ts: "1800000001.000000", updated_at: NOW },
       { channel_id: "C2", cursor_ts: "1799999000.000000", updated_at: NOW },
+    ]);
+  });
+});
+
+describe("slack channel admission storage", () => {
+  test("admits a channel once and drops it on a later refusal", async () => {
+    const { db } = migrated();
+    const store = createSqlSlackChannelAdmissionStore(db);
+
+    expect(await store.isAdmitted("C1")).toBe(false);
+    await store.admit("C1", "U111", NOW);
+    await store.admit("C2", "U222", NOW);
+    expect(await store.isAdmitted("C1")).toBe(true);
+    expect(await store.isAdmitted("C2")).toBe(true);
+
+    await store.admit("C1", "U111", NOW + 60);
+    await store.drop("C2");
+    await store.drop("C3");
+
+    expect(await store.isAdmitted("C1")).toBe(true);
+    expect(await store.isAdmitted("C2")).toBe(false);
+
+    const rows = await db
+      .prepare(
+        "SELECT channel_id, admitted_by, admitted_at FROM slack_channel_admissions ORDER BY channel_id",
+      )
+      .all();
+    expect(rows.results).toEqual([
+      { admitted_at: NOW + 60, admitted_by: "U111", channel_id: "C1" },
     ]);
   });
 });

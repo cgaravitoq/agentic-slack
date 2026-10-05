@@ -1,6 +1,7 @@
 import { createSlackChannel } from "@flue/slack";
 import type {
   SlackBlockActionsPayload,
+  SlackEvent,
   SlackEventCallbackPayload,
   SlackEventsApiPayload,
 } from "@flue/slack";
@@ -70,7 +71,20 @@ export interface RoutedSlackLifecycle {
   userId: string;
 }
 
-export type RoutedSlackEvent = RoutedSlackTurn | RoutedSlackLifecycle;
+export interface RoutedSlackMembership {
+  kind: "membership";
+  eventId: string;
+  teamId: string;
+  appId: string;
+  channelId: string;
+  userId: string;
+  inviterId: string;
+}
+
+export type RoutedSlackEvent =
+  | RoutedSlackTurn
+  | RoutedSlackLifecycle
+  | RoutedSlackMembership;
 
 const conversationInstanceRef = (turn: RoutedSlackTurn) => ({
   channelId: turn.channelId,
@@ -81,6 +95,62 @@ const conversationInstanceRef = (turn: RoutedSlackTurn) => ({
 export interface SlackCoreEnv {
   Bindings: SlackCoreBindings;
 }
+
+interface SlackMessageEvent {
+  readonly bot_id?: string;
+  readonly bot_profile?: unknown;
+  readonly channel: string;
+  readonly text?: string;
+  readonly thread_ts?: string;
+  readonly ts: string;
+  readonly user?: string;
+}
+
+const mentionTurn = (
+  payload: SlackEventCallbackPayload,
+  event: Extract<SlackEvent, { type: "app_mention" }>,
+): RoutedSlackTurn | null => {
+  const text = event.text?.replace(LEADING_MENTION_RE, "").trim();
+  const { user } = event;
+  if (isBotEvent(event) || user === undefined || user === "" || !text) {
+    return null;
+  }
+  return {
+    appId: payload.api_app_id,
+    channelId: event.channel,
+    eventId: payload.event_id,
+    kind: "turn",
+    messageTs: event.ts,
+    surface: "channel",
+    teamId: payload.team_id,
+    text,
+    threadTs: event.thread_ts ?? event.ts,
+    userId: user,
+  };
+};
+
+const directMessageTurn = (
+  payload: SlackEventCallbackPayload,
+  event: SlackMessageEvent,
+): RoutedSlackTurn | null => {
+  const text = event.text?.trim() ?? "";
+  const { user } = event;
+  if (isBotEvent(event) || user === undefined || user === "" || text === "") {
+    return null;
+  }
+  return {
+    appId: payload.api_app_id,
+    channelId: event.channel,
+    eventId: payload.event_id,
+    kind: "turn",
+    messageTs: event.ts,
+    surface: "private",
+    teamId: payload.team_id,
+    text,
+    threadTs: event.thread_ts ?? event.ts,
+    userId: user,
+  };
+};
 
 const routeSlackEvent = (
   payload: SlackEventsApiPayload,
@@ -100,24 +170,23 @@ const routeSlackEvent = (
       userId: event.assistant_thread.user_id,
     };
   }
-  if (event.type === "app_mention") {
-    const text = event.text?.replace(LEADING_MENTION_RE, "").trim();
+  if (event.type === "member_joined_channel") {
     const { user } = event;
-    if (isBotEvent(event) || user === undefined || user === "" || !text) {
+    if (user === undefined || user === "") {
       return null;
     }
     return {
       appId: payload.api_app_id,
       channelId: event.channel,
       eventId: payload.event_id,
-      kind: "turn",
-      messageTs: event.ts,
-      surface: "channel",
+      inviterId: event.inviter ?? "",
+      kind: "membership",
       teamId: payload.team_id,
-      text,
-      threadTs: event.thread_ts ?? event.ts,
       userId: user,
     };
+  }
+  if (event.type === "app_mention") {
+    return mentionTurn(payload, event);
   }
   if (event.type !== "message") {
     return null;
@@ -125,23 +194,7 @@ const routeSlackEvent = (
   if (event.subtype !== undefined || event.channel_type !== "im") {
     return null;
   }
-  const text = event.text?.trim() ?? "";
-  const { user } = event;
-  if (isBotEvent(event) || user === undefined || user === "" || text === "") {
-    return null;
-  }
-  return {
-    appId: payload.api_app_id,
-    channelId: event.channel,
-    eventId: payload.event_id,
-    kind: "turn",
-    messageTs: event.ts,
-    surface: "private",
-    teamId: payload.team_id,
-    text,
-    threadTs: event.thread_ts ?? event.ts,
-    userId: user,
-  };
+  return directMessageTurn(payload, event);
 };
 
 const ack = (status: number): Response => new Response(null, { status });
@@ -209,6 +262,10 @@ export const createSlackIngress = (
     payload: SlackBlockActionsPayload,
     env: SlackCoreBindings,
   ) => Promise<void>,
+  handleMembership?: (
+    membership: RoutedSlackMembership,
+    env: SlackCoreBindings,
+  ) => Promise<void> | void,
 ) => {
   const identityComplete = Boolean(
     trusted.signingSecret &&
@@ -234,26 +291,35 @@ export const createSlackIngress = (
         return ack(200);
       }
       // A refused user is answered like a foreign workspace: before the claim,
-      // so no row, reaction, reply or model call can ever follow the event.
+      // so no row, reaction, reply or model call can ever follow the event. A
+      // membership event names the member that joined rather than the inviter
+      // it is judged by, so its decision belongs to the membership handler.
       if (
+        routed.kind !== "membership" &&
         allowedUserIds.length > 0 &&
         !allowedUserIds.includes(routed.userId)
       ) {
         return ack(200);
       }
-      const run =
-        routed.kind === "turn"
-          ? () =>
-              handleTurn(
-                routed,
-                channel.instanceId(conversationInstanceRef(routed)),
-                c.env,
-              )
-          : handleLifecycle && (() => handleLifecycle(routed, c.env));
-      if (!run) {
-        return ack(200);
+      const claim = (work: () => Promise<void> | void): Promise<Response> =>
+        claimThenAcknowledge(c.env.DB, routed.eventId, work);
+      if (routed.kind === "turn") {
+        return await claim(() =>
+          handleTurn(
+            routed,
+            channel.instanceId(conversationInstanceRef(routed)),
+            c.env,
+          ),
+        );
       }
-      return await claimThenAcknowledge(c.env.DB, routed.eventId, run);
+      if (routed.kind === "membership") {
+        return handleMembership === undefined
+          ? ack(200)
+          : await claim(() => handleMembership(routed, c.env));
+      }
+      return handleLifecycle === undefined
+        ? ack(200)
+        : await claim(() => handleLifecycle(routed, c.env));
     },
     interactions:
       handleInteraction === undefined

@@ -1,3 +1,5 @@
+export { createSqlSlackChannelAdmissionStore } from "./admission.ts";
+export type { SlackChannelAdmissionStore } from "./admission.ts";
 export {
   APPROVAL_TTL_SECONDS,
   canonicalJson,
@@ -51,6 +53,7 @@ export { createSlackIngress, missingReadiness } from "./slack.ts";
 export type {
   ModelBrokerBinding,
   RoutedSlackLifecycle,
+  RoutedSlackMembership,
   RoutedSlackTurn,
   SlackCoreBindings,
   TrustedSlackConfig,

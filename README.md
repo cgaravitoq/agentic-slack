@@ -233,14 +233,15 @@ A reply under a parent older than the lookback is outside the scan, so it is not
 
 The model never chooses which conversation a read may touch.
 In a channel conversation the tools read only the channel and thread of the delivered message, taken from the delivery binding, and any other channel argument is refused.
-In the owner's DM the model may name a channel, and the read happens only if `conversations.info` reports the bot as a member of it.
+In the owner's DM the model may name a channel, and the read happens only if that channel carries the admission an allowlisted user's invitation wrote.
 An owner is a user named in `allowedUserIds`; any other DM, and every DM while `allowedUserIds` is unset, reads only its own conversation.
 
 The per-channel watermark in D1 (`slack_read_cursors`, migration `0004_slack_read_cursors.sql`) records how far `read_channel_since` has covered a channel.
 It advances only as far as coverage is complete: to the last returned message of a truncated page, or to the moment of a read that reached the end of its window, and never past an `oldest` that skips ahead of the stored cursor.
 Slack stays the source of truth: that cursor is the only thing stored, no message is mirrored, and the tools use the bot token you already configured.
+The admission in D1 (`slack_channel_admissions`, migration `0005_slack_channel_admissions.sql`) records which allowlisted user invited the bot to a channel and when, and every read checks it before its first Slack call.
 
-Enabling the option adds three bot token scopes: `channels:history` and `groups:history` to read public and private channels, and `users:read` to resolve author display names, cached per call.
+The option adds three more bot token scopes: `channels:history` and `groups:history` to read public and private channels, and `users:read` to resolve author display names, cached per call.
 Add them in your Slack app and reinstall it; `bun run manifest` includes them as soon as `read` is set.
 
 ## Who can talk to the agent
@@ -258,6 +259,8 @@ export default defineAgentConfig({
 Each entry must be a Slack user id, such as `U...` or the `W...` of a migrated account; a blank entry, a name, an email address, or an empty list fails when the configuration is defined.
 An event from a user who is not listed is answered `2xx` before it reaches the database, so Slack stops retrying it and it produces no reaction, no reply, and no model call.
 The option is admission only: an admitted user can still ask for anything the configuration allows.
+It is also what puts the bot in a channel at all: the bot acts only where an allowlisted user invited it, and any other invitation, a missing `inviter` included, is answered by leaving the channel at once, reading nothing there, and DMing every user in `allowedUserIds` the channel it left and who added it.
+Joins by other members are ignored, and while `allowedUserIds` is unset any user's invitation admits the channel, while a join with no `inviter` still leaves it.
 
 ## Self-hosting
 
@@ -294,7 +297,7 @@ Keep the `flue-class-FlueSlackAgentAgent` SQLite migration: Flue injects the Dur
 bun run db:migrate:staging
 ```
 
-This applies the checked-in deduplication, approval, and Slack read cursor schemas to the database in your local deployment configuration.
+This applies the checked-in deduplication, approval, channel admission, and Slack read cursor schemas to the database in your local deployment configuration.
 `bun run db:migrate:local` only migrates the local development store.
 
 ### 3. Create the Slack app
@@ -304,11 +307,16 @@ Under **OAuth & Permissions**, add these bot token scopes and install the app to
 
 - `app_mentions:read`
 - `assistant:write`
+- `channels:manage`
+- `channels:read`
 - `chat:write`
+- `groups:read`
+- `groups:write`
 - `im:history`
 - `reactions:write`
 
 The bot token scopes are the neutral default.
+`channels:read` and `groups:read` are what deliver a join in a public or private channel, and `channels:manage` and `groups:write` are what let the bot leave one.
 An agent configuration with the `read` option also needs `channels:history`, `groups:history`, and `users:read`; `bun run manifest` generates them with the rest.
 
 Copy the bot token from **OAuth & Permissions** and the signing secret and app ID from **Basic Information**.
@@ -341,13 +349,14 @@ Replace the example URL with your deployed Worker URL in both commands.
 Paste the generated JSON into the existing Slack app's **App Manifest** and save it.
 If Slack requests reinstallation or URL verification, complete it after the Worker secrets and IDs are configured.
 The event endpoint is `/channels/slack/events`.
-The manifest enables the Messages tab, agent messaging, mentions, DMs, and assistant thread events; it enables interactivity at `/channels/slack/interactions` as soon as one MCP server requires approval.
+The manifest enables the Messages tab, agent messaging, mentions, DMs, assistant thread events, and channel joins; it enables interactivity at `/channels/slack/interactions` as soon as one MCP server requires approval.
 Org deploy, socket mode, and token rotation remain disabled.
 A ready health response is `{"status":"ready"}`; HTTP 503 lists missing binding names without revealing values.
 
 ### 5. Check the first conversation
 
-Invite the app to a test channel, then send `@Slack Agent Reply with: hello`.
+Invite the app to a test channel from a user listed in `allowedUserIds`, then send `@Slack Agent Reply with: hello`.
+An invitation from anyone else is answered with a leave and a DM instead; that is the guard working, not a failure to diagnose.
 Confirm that it acknowledges the mention and streams its reply into that thread.
 Send a follow-up mention in the same thread, then a DM to check both conversation surfaces.
 A successful `/health` response checks configuration presence; it does not prove Slack delivery or model inference.
@@ -415,9 +424,9 @@ A dependency that resolves `@agentic-slack/core` through your own `node_modules`
 
 Slack requests pass signature verification and must match the configured workspace and app before a turn is admitted.
 When `allowedUserIds` is set, only those users can start a turn or an assistant thread; everyone else's event is answered `2xx` and dropped before it reaches the database.
-When the option is unset, any eligible human in that workspace who can reach the installed app can interact with it.
+When the option is unset, any eligible human in that workspace who can reach the installed app can interact with it or invite it to a channel.
 Delivery destinations come from trusted event data, not model output.
-The Slack read tools read only what the delivered message or the bot's channel membership allows; with the `read` option unset the agent has no way to read a conversation it was not addressed in.
+The Slack read tools read only the conversation the delivered message came from and the channels an allowlisted user invited the bot to; with the `read` option unset the agent has no way to read a conversation it was not addressed in.
 A tool the operator gates with `requireApproval` reaches its MCP server only after the person who asked approves that exact call in the thread it came from.
 Instructions and output filtering reduce accidental disclosure but do not make untrusted prompts safe to receive credentials.
 Conversation data is processed by Slack, by Cloudflare, and by the model provider your configuration selects.

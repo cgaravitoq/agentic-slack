@@ -1,6 +1,8 @@
 import { defineTool } from "@flue/runtime";
 import type { ToolDefinition } from "@flue/runtime";
 import * as v from "valibot";
+import type { SlackChannelAdmissionStore } from "./admission.ts";
+import type { ConversationSurface } from "./retention.ts";
 
 type Fetcher = (
   input: RequestInfo | URL,
@@ -50,10 +52,12 @@ export const createSqlSlackReadCursorStore = (
 export interface SlackReadBinding {
   readonly channelId: string;
   readonly readsMemberChannels: boolean;
+  readonly surface: ConversationSurface;
   readonly threadTs: string;
 }
 
 export interface SlackReadOptions {
+  readonly admissionStore: SlackChannelAdmissionStore;
   readonly cursorStore: SlackReadCursorStore;
   readonly fetcher?: Fetcher;
   readonly lookbackSeconds: number;
@@ -111,11 +115,6 @@ const slackUserSchema = v.object({
 const usersInfoSchema = v.object({
   ...slackEnvelope,
   user: v.optional(slackUserSchema),
-});
-
-const conversationsInfoSchema = v.object({
-  ...slackEnvelope,
-  channel: v.optional(v.object({ is_member: v.optional(v.boolean()) })),
 });
 
 const authTestSchema = v.object({
@@ -371,19 +370,20 @@ const requestedChannel = (
   return channel;
 };
 
-const requireMembership = async (
-  caller: SlackCaller,
+// The conversation a delivery arrived in is trusted by that delivery; every
+// other channel has to have been admitted by an allowlisted inviter.
+const readsAdmittedChannel = (
+  binding: SlackReadBinding,
+  channelId: string,
+): boolean => binding.surface === "channel" || channelId !== binding.channelId;
+
+const requireAdmission = async (
+  options: SlackReadOptions,
   channelId: string,
 ): Promise<void> => {
-  const { channel } = await callSlack(
-    caller,
-    "conversations.info",
-    { channel: channelId },
-    conversationsInfoSchema,
-  );
-  if (channel?.is_member !== true) {
+  if (!(await options.admissionStore.isAdmitted(channelId))) {
     throw new Error(
-      `the bot is not a member of ${channelId}, so it cannot read it`,
+      `no allowed user invited the bot to ${channelId}, so it cannot read it`,
     );
   }
 };
@@ -395,8 +395,8 @@ const readThread = async (
   data: v.InferOutput<typeof threadInput>,
 ): Promise<SlackReadPage> => {
   const channelId = requestedChannel(binding, data.channel, "read_thread");
-  if (binding.readsMemberChannels) {
-    await requireMembership(ctx.caller, channelId);
+  if (readsAdmittedChannel(binding, channelId)) {
+    await requireAdmission(options, channelId);
   }
   const requestedThread = data.threadTs?.trim() ?? "";
   const threadTs =
@@ -506,8 +506,8 @@ const readChannelSince = async (
     data.channel,
     "read_channel_since",
   );
-  if (binding.readsMemberChannels) {
-    await requireMembership(ctx.caller, channelId);
+  if (readsAdmittedChannel(binding, channelId)) {
+    await requireAdmission(options, channelId);
   }
   const stored = await options.cursorStore.load(channelId);
   const cursor = data.oldest ?? stored;
@@ -585,7 +585,7 @@ export const createSlackReadTools = (
       description: boundToChannel(
         binding,
         "Read the whole Slack thread of this conversation, oldest message first, with no arguments needed; `threadTs` names another thread of that same channel. Returns compact records with author, timestamp, permalink and text, plus a coverage block. A `truncated` block names a `nextCursor`: call again with `oldest` set to it to read the rest. Never reads another channel.",
-        "Read one Slack thread, oldest message first: pass the `channel` it lives in and the `threadTs` of its first message. Only a channel the bot is a member of is readable. Returns compact records with author, timestamp, permalink and text, plus a coverage block. A `truncated` block names a `nextCursor`: call again with `oldest` set to it to read the rest.",
+        "Read one Slack thread, oldest message first: pass the `channel` it lives in and the `threadTs` of its first message. Only a channel an allowed user invited the bot to is readable. Returns compact records with author, timestamp, permalink and text, plus a coverage block. A `truncated` block names a `nextCursor`: call again with `oldest` set to it to read the rest.",
       ),
       input: threadInput,
       name: "read_thread",
@@ -600,7 +600,7 @@ export const createSlackReadTools = (
       description: boundToChannel(
         binding,
         "Read the messages posted in this conversation's channel after a cursor, oldest first. Without `oldest` it continues from the last complete read of this channel, or from the configured lookback window when there is none. Replies to older parents inside that window are included. Returns compact records with author, timestamp, permalink and text, plus a coverage block whose `oldest` names the earliest point it looked back to. A `truncated` block names a `nextCursor`: call again with `oldest` set to it to read the rest. Never reads another channel.",
-        "Read the messages posted in one channel after a cursor, oldest first: pass a `channel` the bot is a member of. Without `oldest` it continues from the last complete read of that channel, or from the configured lookback window when there is none. Replies to older parents inside that window are included. Returns compact records with author, timestamp, permalink and text, plus a coverage block whose `oldest` names the earliest point it looked back to. A `truncated` block names a `nextCursor`: call again with `oldest` set to it to read the rest.",
+        "Read the messages posted in one channel after a cursor, oldest first: pass a `channel` an allowed user invited the bot to. Without `oldest` it continues from the last complete read of that channel, or from the configured lookback window when there is none. Replies to older parents inside that window are included. Returns compact records with author, timestamp, permalink and text, plus a coverage block whose `oldest` names the earliest point it looked back to. A `truncated` block names a `nextCursor`: call again with `oldest` set to it to read the rest.",
       ),
       input: channelInput,
       name: "read_channel_since",

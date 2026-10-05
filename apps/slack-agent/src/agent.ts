@@ -8,6 +8,7 @@ import {
   createApprovalNotifier,
   createApprovalStore,
   createSlackReadTools,
+  createSqlSlackChannelAdmissionStore,
   createSqlSlackDeliveryStore,
   createSqlSlackReadCursorStore,
   expireLatest,
@@ -156,9 +157,11 @@ export const SlackAgent = (props: AgentProps) => {
           readsMemberChannels:
             slack.output.surface === "private" &&
             config.allowedUserIds.includes(slack.output.recipientUserId),
+          surface: slack.output.surface,
           threadTs: slack.output.threadTs,
         },
         {
+          admissionStore: createSqlSlackChannelAdmissionStore(env.DB),
           cursorStore,
           lookbackSeconds: config.read.lookbackSeconds,
           maxMessages: config.read.maxMessages,
