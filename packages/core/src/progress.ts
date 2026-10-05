@@ -1,8 +1,10 @@
 import { timingSafeEqual } from "node:crypto";
+import type { SlackThreadRef } from "@flue/slack";
 import * as v from "valibot";
 import { createSqlSlackChannelAdmissionStore } from "./admission.ts";
 import { claimAndRun } from "./dedup.ts";
 import { MAX_SLACK_MESSAGE_LENGTH } from "./delivery.ts";
+import type { SlackDeliveryBinding } from "./delivery.ts";
 
 const PROGRESS_KINDS = [
   "started",
@@ -21,11 +23,13 @@ type SlackProgressLabels = Partial<Record<ProgressKind, string>>;
 export interface SlackProgressConfig {
   authSecret: string;
   labels: SlackProgressLabels;
+  narration?: string;
 }
 
 export interface ResolvedSlackProgressConfig {
   readonly authSecret: string;
   readonly labels: Readonly<Record<ProgressKind, string>>;
+  readonly narration?: string;
 }
 
 const resolveProgressLabels = (
@@ -59,9 +63,14 @@ export const resolveSlackProgressConfig = (
   if (!authSecret) {
     throw new Error("Agent config requires progress authSecret");
   }
+  const narration = progress.narration?.trim();
+  if (narration === "") {
+    throw new Error("Agent config requires progress narration");
+  }
   return Object.freeze({
     authSecret,
     labels: resolveProgressLabels(progress.labels),
+    narration,
   });
 };
 
@@ -193,10 +202,18 @@ export interface SlackProgressEndpoint {
   readonly handle: (request: Request) => Promise<Response>;
 }
 
+export interface SlackProgressTurn {
+  readonly binding: SlackDeliveryBinding;
+  readonly body: string;
+  readonly instanceId: string;
+}
+
 export interface SlackProgressEndpointOptions {
   readonly bearer: string;
   readonly db: D1Database;
   readonly fetcher?: Fetcher;
+  readonly narrate: (turn: SlackProgressTurn) => Promise<void>;
+  readonly teamId: string;
   readonly token: string;
 }
 
@@ -220,6 +237,30 @@ const replyOf = (milestone: SlackProgressMilestone): string =>
   milestone.url === undefined
     ? milestone.text
     : `${milestone.text}\n${milestone.url}`;
+
+// The progress route reaches a conversation without an ingress channel object,
+// so it spells the canonical id out; worker-stream.test.ts pins it to the id a
+// mention in the same thread gets.
+export const slackInstanceId = (ref: SlackThreadRef): string =>
+  `slack:v1:${encodeURIComponent(ref.teamId)}:${encodeURIComponent(ref.channelId)}:${encodeURIComponent(ref.threadTs)}`;
+
+// Only the voice comes from the operator: a narrated reply may restate the
+// milestone and the thread, never facts of its own, so the rule is core's.
+const NARRATION_RULE =
+  "Rewrite this milestone as your reply in that voice: one or two short sentences that use the earlier milestones in this thread as context and say only what this milestone and those earlier milestones say.";
+
+const narrationBody = (
+  milestone: SlackProgressMilestone,
+  narration: string,
+  labels: Readonly<Record<ProgressKind, string>>,
+): string =>
+  [
+    narration,
+    `Task: ${milestone.task}`,
+    `Status: ${labels[milestone.kind]}`,
+    `Milestone: ${replyOf(milestone)}`,
+    NARRATION_RULE,
+  ].join("\n\n");
 
 const milestoneFrom = async (
   request: Request,
@@ -291,15 +332,61 @@ export const createSlackProgressEndpoint = (
     return stored;
   };
 
+  const postReply = async (
+    channelId: string,
+    threadTs: string,
+    text: string,
+  ): Promise<void> => {
+    await callSlack(caller, "chat.postMessage", {
+      channel: channelId,
+      text,
+      thread_ts: threadTs,
+    });
+  };
+
+  const narrateMilestone = async (
+    milestone: SlackProgressMilestone,
+    admittedBy: string,
+    root: SlackProgressRoot,
+    narration: string,
+    reply: string,
+  ): Promise<void> => {
+    try {
+      await options.narrate({
+        binding: {
+          channelId: milestone.channel,
+          fallbackText: reply,
+          recipientTeamId: options.teamId,
+          recipientUserId: admittedBy,
+          surface: "channel",
+          threadTs: root.rootTs,
+        },
+        body: narrationBody(milestone, narration, config.labels),
+        instanceId: slackInstanceId({
+          channelId: milestone.channel,
+          teamId: options.teamId,
+          threadTs: root.rootTs,
+        }),
+      });
+    } catch (error: unknown) {
+      // The turn never reached the thread, so the milestone still must.
+      console.error("Slack progress narration failed", error);
+      await postReply(milestone.channel, root.rootTs, reply);
+    }
+  };
+
   const postMilestone = async (
     milestone: SlackProgressMilestone,
+    admittedBy: string,
   ): Promise<void> => {
     const root = await enterRoot(milestone, rootOf(milestone));
-    await callSlack(caller, "chat.postMessage", {
-      channel: milestone.channel,
-      text: replyOf(milestone),
-      thread_ts: root.rootTs,
-    });
+    const reply = replyOf(milestone);
+    const { narration } = config;
+    if (narration === undefined) {
+      await postReply(milestone.channel, root.rootTs, reply);
+      return;
+    }
+    await narrateMilestone(milestone, admittedBy, root, narration, reply);
   };
 
   return {
@@ -316,12 +403,13 @@ export const createSlackProgressEndpoint = (
       if (milestone === undefined) {
         return refusal(400, "invalid_request");
       }
-      if (!(await admissionStore.isAdmitted(milestone.channel))) {
+      const admittedBy = await admissionStore.admittedBy(milestone.channel);
+      if (admittedBy === undefined) {
         return refusal(403, "channel_not_admitted");
       }
       try {
         await claimAndRun(options.db, `progress:${milestone.id}`, () =>
-          postMilestone(milestone),
+          postMilestone(milestone, admittedBy),
         );
       } catch (error: unknown) {
         console.error("Slack progress milestone failed", error);

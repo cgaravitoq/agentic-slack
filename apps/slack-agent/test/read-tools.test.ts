@@ -168,6 +168,8 @@ const admittedStore = (...channels: string[]): SlackChannelAdmissionStore => {
       admitted.add(channelId);
       return Promise.resolve();
     },
+    admittedBy: (channelId) =>
+      Promise.resolve(admitted.has(channelId) ? "U1" : undefined),
     drop: (channelId) => {
       admitted.delete(channelId);
       return Promise.resolve();

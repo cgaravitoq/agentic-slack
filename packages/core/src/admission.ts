@@ -1,6 +1,7 @@
 import * as v from "valibot";
 
-const admissionRow = v.object({ channel_id: v.string() });
+const admissionRow = v.object({ admitted_by: v.string() });
+const channelRow = v.object({ channel_id: v.string() });
 
 export interface SlackChannelAdmissionStore {
   readonly admit: (
@@ -8,6 +9,7 @@ export interface SlackChannelAdmissionStore {
     inviterId: string,
     now: number,
   ) => Promise<void>;
+  readonly admittedBy: (channelId: string) => Promise<string | undefined>;
   readonly drop: (channelId: string) => Promise<void>;
   readonly isAdmitted: (channelId: string) => Promise<boolean>;
 }
@@ -25,6 +27,16 @@ export const createSqlSlackChannelAdmissionStore = (
       .bind(channelId, inviterId, now)
       .run();
   },
+  async admittedBy(channelId) {
+    const { results } = await db
+      .prepare(
+        "SELECT admitted_by FROM slack_channel_admissions WHERE channel_id = ?1",
+      )
+      .bind(channelId)
+      .all();
+    const [row] = results;
+    return v.is(admissionRow, row) ? row.admitted_by : undefined;
+  },
   async drop(channelId) {
     await db
       .prepare("DELETE FROM slack_channel_admissions WHERE channel_id = ?1")
@@ -38,6 +50,6 @@ export const createSqlSlackChannelAdmissionStore = (
       )
       .bind(channelId)
       .all();
-    return results.some((row) => v.is(admissionRow, row));
+    return results.some((row) => v.is(channelRow, row));
   },
 });

@@ -730,6 +730,8 @@ describe("slack channel admission storage", () => {
     await store.admit("C2", "U222", NOW);
     expect(await store.isAdmitted("C1")).toBe(true);
     expect(await store.isAdmitted("C2")).toBe(true);
+    expect(await store.admittedBy("C1")).toBe("U111");
+    expect(await store.admittedBy("C3")).toBeUndefined();
 
     await store.admit("C1", "U111", NOW + 60);
     await store.drop("C2");
@@ -737,6 +739,7 @@ describe("slack channel admission storage", () => {
 
     expect(await store.isAdmitted("C1")).toBe(true);
     expect(await store.isAdmitted("C2")).toBe(false);
+    expect(await store.admittedBy("C1")).toBe("U111");
 
     const rows = await db
       .prepare(

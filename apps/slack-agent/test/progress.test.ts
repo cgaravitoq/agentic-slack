@@ -8,12 +8,16 @@ import type {
   ModelBrokerBinding,
   SlackCoreBindings,
 } from "@agentic-slack/core";
-import type { ResolvedSlackProgressConfig } from "../../../packages/core/src/progress.ts";
+import type {
+  ResolvedSlackProgressConfig,
+  SlackProgressTurn,
+} from "../../../packages/core/src/progress.ts";
 import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
 import * as v from "valibot";
 import { createApp } from "../src/app.ts";
 
 const BEARER = "progress-bearer-for-tests";
+const ADMITTED_BY = "U0ADMITSU";
 const trusted = {
   appId: "A123",
   botToken: "xoxb-test",
@@ -22,7 +26,7 @@ const trusted = {
 };
 
 class FakeD1 {
-  readonly admissions = new Set<string>();
+  readonly admissions = new Map<string, string>();
   readonly roots = new Map<string, { root_text: string; root_ts: string }>();
   readonly seen = new Set<string>();
   private values: unknown[] = [];
@@ -32,10 +36,12 @@ class FakeD1 {
       all: () => {
         if (sql.includes("slack_channel_admissions")) {
           const channelId = String(this.values[0]);
+          const admittedBy = this.admissions.get(channelId);
           return Promise.resolve({
-            results: this.admissions.has(channelId)
-              ? [{ channel_id: channelId }]
-              : [],
+            results:
+              admittedBy === undefined
+                ? []
+                : [{ admitted_by: admittedBy, channel_id: channelId }],
           });
         }
         const row = this.roots.get(this.rootKey());
@@ -140,23 +146,24 @@ const slackRecorder =
     );
   };
 
-const progressConfig = (): ResolvedSlackProgressConfig => {
+const progressConfig = (narration?: string): ResolvedSlackProgressConfig => {
+  const labels = {
+    blocked: "Blocked",
+    done: "Done",
+    merged: "Merged",
+    pr: "Pull request",
+    progress: "In progress",
+    review: "In review",
+    started: "Started",
+  };
   const { progress } = defineAgentConfig({
     description: "Reports task progress.",
     name: "Progress Agent",
     ownerInstructions: "Prefer short answers.",
-    progress: {
-      authSecret: "PROGRESS_BEARER",
-      labels: {
-        blocked: "Blocked",
-        done: "Done",
-        merged: "Merged",
-        pr: "Pull request",
-        progress: "In progress",
-        review: "In review",
-        started: "Started",
-      },
-    },
+    progress:
+      narration === undefined
+        ? { authSecret: "PROGRESS_BEARER", labels }
+        : { authSecret: "PROGRESS_BEARER", labels, narration },
   });
   if (progress === undefined) {
     throw new Error("progress config is required");
@@ -166,6 +173,8 @@ const progressConfig = (): ResolvedSlackProgressConfig => {
 
 interface EndpointOverrides {
   readonly bearer?: string;
+  readonly narration?: string;
+  readonly narrate?: (turn: SlackProgressTurn) => Promise<void>;
   readonly refusals?: readonly (string | undefined)[];
 }
 
@@ -174,10 +183,12 @@ const endpointFor = (
   calls: RecordedCall[],
   overrides: EndpointOverrides = {},
 ) =>
-  createSlackProgressEndpoint(progressConfig(), {
+  createSlackProgressEndpoint(progressConfig(overrides.narration), {
     bearer: overrides.bearer ?? BEARER,
     db: testBindings(db).DB,
     fetcher: slackRecorder(calls, overrides.refusals),
+    narrate: overrides.narrate ?? (() => Promise.resolve()),
+    teamId: trusted.teamId,
     token: trusted.botToken,
   });
 
@@ -234,10 +245,21 @@ const rootCalls: RecordedCall[] = [
   },
 ];
 
+const narrations = () => {
+  const turns: SlackProgressTurn[] = [];
+  return {
+    narrate: (turn: SlackProgressTurn): Promise<void> => {
+      turns.push(turn);
+      return Promise.resolve();
+    },
+    turns,
+  };
+};
+
 describe("progress endpoint", () => {
   test("refuses a missing, wrong, or unconfigured bearer without calling Slack", async () => {
     const db = new FakeD1();
-    db.admissions.add("C1");
+    db.admissions.set("C1", ADMITTED_BY);
     const calls: RecordedCall[] = [];
     const endpoint = endpointFor(db, calls);
 
@@ -268,7 +290,7 @@ describe("progress endpoint", () => {
 
   test("refuses a body that is not a milestone without calling Slack", async () => {
     const db = new FakeD1();
-    db.admissions.add("C1");
+    db.admissions.set("C1", ADMITTED_BY);
     const calls: RecordedCall[] = [];
     const endpoint = endpointFor(db, calls);
 
@@ -323,7 +345,7 @@ describe("progress endpoint", () => {
 
   test("posts the root and the reply for the first milestone of a task", async () => {
     const db = new FakeD1();
-    db.admissions.add("C1");
+    db.admissions.set("C1", ADMITTED_BY);
     const calls: RecordedCall[] = [];
     const endpoint = endpointFor(db, calls);
 
@@ -340,7 +362,7 @@ describe("progress endpoint", () => {
 
   test("edits the root when the title or the label changes and replies to every milestone", async () => {
     const db = new FakeD1();
-    db.admissions.add("C1");
+    db.admissions.set("C1", ADMITTED_BY);
     const calls: RecordedCall[] = [];
     const endpoint = endpointFor(db, calls);
 
@@ -409,7 +431,7 @@ describe("progress endpoint", () => {
 
   test("posts once when the same milestone id arrives twice", async () => {
     const db = new FakeD1();
-    db.admissions.add("C1");
+    db.admissions.set("C1", ADMITTED_BY);
     const calls: RecordedCall[] = [];
     const endpoint = endpointFor(db, calls);
 
@@ -423,7 +445,7 @@ describe("progress endpoint", () => {
 
   test("answers non-2xx when Slack refuses the root, and lets the retry through", async () => {
     const db = new FakeD1();
-    db.admissions.add("C1");
+    db.admissions.set("C1", ADMITTED_BY);
     const refusedCalls: RecordedCall[] = [];
 
     const refused = await endpointFor(db, refusedCalls, {
@@ -444,7 +466,7 @@ describe("progress endpoint", () => {
 
   test("replies to a stored root when Slack refuses the reply", async () => {
     const db = new FakeD1();
-    db.admissions.add("C1");
+    db.admissions.set("C1", ADMITTED_BY);
     const refusedCalls: RecordedCall[] = [];
 
     const refused = await endpointFor(db, refusedCalls, {
@@ -464,7 +486,7 @@ describe("progress endpoint", () => {
 
   test("still replies when Slack refuses to edit the root", async () => {
     const db = new FakeD1();
-    db.admissions.add("C1");
+    db.admissions.set("C1", ADMITTED_BY);
     const calls: RecordedCall[] = [];
     const endpoint = endpointFor(db, calls, {
       refusals: [undefined, undefined, "edit_window_closed"],
@@ -499,7 +521,7 @@ describe("progress endpoint", () => {
 
   test("starts a new root when the stored one is gone", async () => {
     const db = new FakeD1();
-    db.admissions.add("C1");
+    db.admissions.set("C1", ADMITTED_BY);
     const calls: RecordedCall[] = [];
     const endpoint = endpointFor(db, calls, {
       refusals: [undefined, undefined, "message_not_found"],
@@ -536,6 +558,90 @@ describe("progress endpoint", () => {
   });
 });
 
+describe("narrated progress endpoint", () => {
+  test("keeps posting the curated reply when no narration is configured", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const { narrate, turns } = narrations();
+
+    const response = await endpointFor(db, calls, { narrate }).handle(
+      postMilestone(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(calls).toEqual(rootCalls);
+    expect(turns).toEqual([]);
+  });
+
+  test("narrates a milestone as one turn in its thread and posts no reply itself", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const { narrate, turns } = narrations();
+
+    const response = await endpointFor(db, calls, {
+      narrate,
+      narration: "Write in Spanish, warm and brief.",
+    }).handle(postMilestone());
+
+    expect(response.status).toBe(200);
+    expect(calls).toEqual([rootCalls[0]]);
+    expect(turns).toEqual([
+      {
+        binding: {
+          channelId: "C1",
+          fallbackText: "Kicked off\nhttps://example.com/run",
+          recipientTeamId: "T123",
+          recipientUserId: ADMITTED_BY,
+          surface: "channel",
+          threadTs: "171.1",
+        },
+        body: [
+          "Write in Spanish, warm and brief.",
+          "Task: release-42",
+          "Status: Started",
+          "Milestone: Kicked off\nhttps://example.com/run",
+          "Rewrite this milestone as your reply in that voice: one or two short sentences that use the earlier milestones in this thread as context and say only what this milestone and those earlier milestones say.",
+        ].join("\n\n"),
+        instanceId: "slack:v1:T123:C1:171.1",
+      },
+    ]);
+  });
+
+  test("posts the curated reply when the narration turn cannot start", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+
+    const response = await endpointFor(db, calls, {
+      narrate: () => Promise.reject(new Error("agent unavailable")),
+      narration: "Write in Spanish, warm and brief.",
+    }).handle(postMilestone());
+
+    expect(response.status).toBe(200);
+    expect(calls).toEqual(rootCalls);
+  });
+
+  test("narrates once when the same milestone id arrives twice", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const { narrate, turns } = narrations();
+    const endpoint = endpointFor(db, calls, {
+      narrate,
+      narration: "Write in Spanish, warm and brief.",
+    });
+
+    const first = await endpoint.handle(postMilestone());
+    const retried = await endpoint.handle(postMilestone());
+
+    expect([first.status, retried.status]).toEqual([200, 200]);
+    expect(calls).toEqual([rootCalls[0]]);
+    expect(turns).toHaveLength(1);
+  });
+});
+
 describe("progress route", () => {
   test("serves no progress route when no endpoint is configured", async () => {
     const app = createApp(trusted, MODEL_PROVIDER_CLOUDFLARE, async () => {});
@@ -551,7 +657,7 @@ describe("progress route", () => {
 
   test("serves the configured endpoint and reports its missing secret", async () => {
     const db = new FakeD1();
-    db.admissions.add("C1");
+    db.admissions.set("C1", ADMITTED_BY);
     const calls: RecordedCall[] = [];
     const app = createApp(
       trusted,

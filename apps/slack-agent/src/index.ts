@@ -8,6 +8,7 @@ import {
   streamTargetFor,
   workerSecretValue,
 } from "@agentic-slack/core";
+import type { SlackProgressTurn } from "@agentic-slack/core";
 import { init, instrument, setProvider } from "@flue/runtime";
 import { createCloudflareTracing } from "@flue/runtime/cloudflare";
 import config from "../agent.config.ts";
@@ -27,12 +28,33 @@ const trusted = {
   signingSecret: bindings.SLACK_SIGNING_SECRET,
   teamId: bindings.SLACK_TEAM_ID,
 };
+
+export const narrateProgressTurn = async (
+  turn: SlackProgressTurn,
+): Promise<void> => {
+  await refreshRetention(
+    bindings.FLUE_SLACK_AGENT_AGENT,
+    turn.instanceId,
+    "channel",
+  );
+  await init(SlackAgent, { id: turn.instanceId }).dispatch({
+    message: {
+      attributes: turn.binding,
+      body: turn.body,
+      kind: "signal",
+      type: "slack.progress",
+    },
+  });
+};
+
 const progress =
   config.progress === undefined
     ? undefined
     : createSlackProgressEndpoint(config.progress, {
         bearer: workerSecretValue(bindings, config.progress.authSecret) ?? "",
         db: bindings.DB,
+        narrate: narrateProgressTurn,
+        teamId: trusted.teamId,
         token: trusted.botToken,
       });
 
