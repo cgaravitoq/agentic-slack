@@ -14,6 +14,7 @@ import { createApp } from "./app.ts";
 import type { WorkerBindings } from "./app.ts";
 import { createApprovalHandler } from "./approval.ts";
 import { createLifecycleHandler } from "./lifecycle.ts";
+import { createMembershipHandler } from "./membership.ts";
 import { selectProvider } from "./provider.ts";
 
 const bindings: WorkerBindings = env;
@@ -78,4 +79,5 @@ export default createApp(
   requiresApproval(config)
     ? createApprovalHandler(trusted.botToken)
     : undefined,
+  createMembershipHandler(config, trusted.botToken),
 );

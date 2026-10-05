@@ -629,6 +629,45 @@ test("refuses a direct-message read without a channel or without admission", asy
   ).toEqual([]);
 });
 
+test("refuses the delivered channel from a mention when no allowed user admitted it", async () => {
+  const harness = readHarness({
+    binding: channelBinding("C1", at(-100)),
+    fixture: {
+      admitted: [],
+      channels: { C1: [{ text: "private plans", ts: at(-50), user: "U111" }] },
+      pageSize: 50,
+      threads: {},
+      users: {},
+    },
+    lookbackSeconds: 3600,
+    maxMessages: 100,
+  });
+
+  expect(
+    await failureOf(
+      Promise.resolve(
+        harness.channelTool.run({
+          data: {},
+          log: silentLog,
+          toolCallId: "read-call",
+        }),
+      ),
+    ),
+  ).toBe("no allowed user invited the bot to C1, so it cannot read it");
+  expect(
+    await failureOf(
+      Promise.resolve(
+        harness.threadTool.run({
+          data: {},
+          log: silentLog,
+          toolCallId: "read-call",
+        }),
+      ),
+    ),
+  ).toBe("no allowed user invited the bot to C1, so it cannot read it");
+  expect(harness.calls).toEqual([]);
+});
+
 test("calls an injected fetcher with no receiver on both read tools", async () => {
   const parentTs = at(-300);
   const api = fakeSlack({

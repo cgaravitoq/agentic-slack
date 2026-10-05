@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
   createSlackIngress,
+  createSlackReadTools,
+  createSqlSlackChannelAdmissionStore,
   defineAgentConfig,
   MODEL_PROVIDER_CLOUDFLARE,
   setSuggestedPrompts,
@@ -26,36 +28,57 @@ const trusted = {
 // the runtime module has to stand in for `cloudflare:workers` before it loads.
 await mockCloudflareWorkers({ SLACK_BOT_TOKEN: trusted.botToken });
 const { createLifecycleHandler } = await import("../src/lifecycle.ts");
+const { createMembershipHandler } = await import("../src/membership.ts");
 
 beforeEach(() => {
   workerWaitUntil.length = 0;
 });
 
 class FakeD1 {
+  readonly admissions = new Set<string>();
   readonly seen = new Set<string>();
   rejectClaim = false;
   private values: unknown[] = [];
 
   prepare(sql: string) {
     return {
+      all: () => {
+        const channelId = String(this.values[0]);
+        return Promise.resolve({
+          results:
+            sql.includes("slack_channel_admissions") &&
+            this.admissions.has(channelId)
+              ? [{ channel_id: channelId }]
+              : [],
+        });
+      },
       bind: (...values: unknown[]) => {
         this.values = values;
         return this.prepare(sql);
       },
       run: () => {
-        const eventId = String(this.values[0]);
+        const value = String(this.values[0]);
+        if (sql.includes("slack_channel_admissions")) {
+          if (sql.startsWith("INSERT")) {
+            this.admissions.add(value);
+          }
+          if (sql.startsWith("DELETE")) {
+            this.admissions.delete(value);
+          }
+          return Promise.resolve({ meta: { changes: 1 } });
+        }
         if (sql.startsWith("INSERT")) {
           if (this.rejectClaim) {
             return Promise.reject(new Error("claim failed"));
           }
-          if (this.seen.has(eventId)) {
+          if (this.seen.has(value)) {
             return Promise.resolve({ meta: { changes: 0 } });
           }
-          this.seen.add(eventId);
+          this.seen.add(value);
           return Promise.resolve({ meta: { changes: 1 } });
         }
         if (sql.startsWith("DELETE FROM seen_events WHERE event_id")) {
-          this.seen.delete(eventId);
+          this.seen.delete(value);
         }
         return Promise.resolve({ meta: { changes: 1 } });
       },
@@ -139,6 +162,22 @@ const assistantEnvelope = v.object({
 });
 type AssistantEnvelope = v.InferOutput<typeof assistantEnvelope>;
 
+const membershipEnvelope = v.object({
+  api_app_id: v.string(),
+  event: v.object({
+    channel: v.string(),
+    channel_type: v.optional(v.string()),
+    inviter: v.optional(v.string()),
+    team: v.optional(v.string()),
+    type: v.string(),
+    user: v.string(),
+  }),
+  event_id: v.string(),
+  team_id: v.string(),
+  type: v.string(),
+});
+type MembershipEnvelope = v.InferOutput<typeof membershipEnvelope>;
+
 const blockActions: SlackBlockActionsPayload = {
   actions: [
     {
@@ -190,7 +229,7 @@ const signedBody = async (
 };
 
 const signedRequest = (
-  payload: AssistantEnvelope | EventEnvelope,
+  payload: AssistantEnvelope | EventEnvelope | MembershipEnvelope,
   url = "https://example.com/events",
 ): Promise<Request> =>
   signedBody(JSON.stringify(payload), "application/json", url);
@@ -237,6 +276,91 @@ const event = (overrides: EventOverrides = {}) => ({
   team_id: "T123",
   type: "event_callback",
 });
+
+const silentLog = { error: () => {}, info: () => {}, warn: () => {} };
+
+const refusalOf = async (operation: Promise<unknown>): Promise<string> => {
+  try {
+    await operation;
+    return "resolved";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+};
+
+interface RecordedCall {
+  readonly body: Record<string, string>;
+  readonly method: string;
+}
+
+// The read tools post form bodies and ask for one thread; this answers with one
+// message so a read that was admitted completes and one that was not never gets
+// the chance to.
+const readSlack =
+  (calls: RecordedCall[]) =>
+  (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = v.parse(v.string(), input);
+    const method = url.slice(url.lastIndexOf("/") + 1);
+    calls.push({
+      body: Object.fromEntries(
+        v.parse(v.instance(URLSearchParams), init?.body),
+      ),
+      method,
+    });
+    if (method === "auth.test") {
+      return Promise.resolve(
+        Response.json({ ok: true, url: "https://workspace.slack.com/" }),
+      );
+    }
+    return Promise.resolve(
+      Response.json({
+        messages: [{ text: "hello", ts: "1800000000.000100", user: "U111" }],
+        ok: true,
+      }),
+    );
+  };
+
+interface GuardReply {
+  readonly error?: string;
+  readonly ok?: boolean;
+  readonly user_id?: string;
+}
+
+const guardNotice = (channelId: string, inviterId: string): string =>
+  `I left ${channelId} after ${inviterId} added me there. I only act in channels an allowed user invited me to.`;
+
+const joined = (
+  eventId: string,
+  overrides: Partial<MembershipEnvelope["event"]> = {},
+): MembershipEnvelope => ({
+  api_app_id: "A123",
+  event: {
+    channel: "CFOREIGN",
+    channel_type: "C",
+    team: "T123",
+    type: "member_joined_channel",
+    user: "UBOT",
+    ...overrides,
+  },
+  event_id: eventId,
+  team_id: "T123",
+  type: "event_callback",
+});
+
+const guardSlackFetcher =
+  (calls: RecordedCall[], replies: Record<string, GuardReply> = {}) =>
+  (input: string, init: RequestInit): Promise<Response> => {
+    const method = input.slice(input.lastIndexOf("/") + 1);
+    const raw = v.parse(v.string(), init.body);
+    const parsed: unknown = raw === "" ? {} : JSON.parse(raw);
+    calls.push({
+      body: v.parse(v.record(v.string(), v.string()), parsed),
+      method,
+    });
+    return Promise.resolve(
+      Response.json({ ok: true, user_id: "UBOT", ...replies[method] }),
+    );
+  };
 
 describe("signed Slack ingress", () => {
   test("claims and dispatches before acknowledging, and deduplicates all side effects by event_id", async () => {
@@ -913,5 +1037,239 @@ describe("assistant thread lifecycle", () => {
         url: "https://slack.com/api/assistant.threads.setSuggestedPrompts",
       },
     ]);
+  });
+});
+
+describe("channel guard", () => {
+  const guardConfig = defineAgentConfig({
+    allowedUserIds: ["U111", "U222"],
+    description: "Guards every channel it was invited to.",
+    name: "Guard Agent",
+    ownerInstructions: "Prefer short answers.",
+  });
+  const guardTrusted = { ...trusted, allowedUserIds: ["U111", "U222"] };
+
+  const guardChannel = (
+    db: FakeD1,
+    calls: RecordedCall[],
+    replies: Record<string, GuardReply> = {},
+  ) =>
+    createSlackIngress(
+      guardTrusted,
+      () => Promise.resolve(),
+      undefined,
+      undefined,
+      createMembershipHandler(
+        guardConfig,
+        guardTrusted.botToken,
+        guardSlackFetcher(calls, replies),
+      ),
+    );
+
+  const readThreadOfForeignChannel = (
+    db: FakeD1,
+    calls: RecordedCall[],
+    channelId: string,
+  ) => {
+    let cursor: string | undefined;
+    const [threadTool] = createSlackReadTools(
+      {
+        channelId: "D777",
+        readsMemberChannels: true,
+        surface: "private",
+        threadTs: "1800000000.000100",
+      },
+      {
+        admissionStore: createSqlSlackChannelAdmissionStore(
+          testBindings(db).DB,
+        ),
+        cursorStore: {
+          load: () => Promise.resolve(cursor),
+          save: (_channelId, value) => {
+            cursor = value;
+            return Promise.resolve();
+          },
+        },
+        fetcher: readSlack(calls),
+        lookbackSeconds: 3600,
+        maxMessages: 50,
+        token: guardTrusted.botToken,
+      },
+    );
+    return threadTool.run({
+      data: { channel: channelId, threadTs: "1800000000.000100" },
+      log: silentLog,
+      toolCallId: "read-call",
+    });
+  };
+
+  test("leaves a channel a foreign user invited the bot to, tells the owners, and reads nothing", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const readCalls: RecordedCall[] = [];
+    const channel = guardChannel(db, guardCalls);
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-foreign", { inviter: "U999" })),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(200);
+    expect(db.seen.has("Ev-foreign")).toBe(true);
+    expect(db.admissions.size).toBe(0);
+    expect(guardCalls.map((call) => call.method)).toEqual([
+      "auth.test",
+      "conversations.leave",
+      "chat.postMessage",
+      "chat.postMessage",
+    ]);
+    expect(guardCalls[1].body).toEqual({ channel: "CFOREIGN" });
+    expect(guardCalls[2].body).toEqual({
+      channel: "U111",
+      text: guardNotice("CFOREIGN", "U999"),
+    });
+    expect(guardCalls[3].body).toEqual({
+      channel: "U222",
+      text: guardNotice("CFOREIGN", "U999"),
+    });
+
+    expect(
+      await refusalOf(
+        Promise.resolve(readThreadOfForeignChannel(db, readCalls, "CFOREIGN")),
+      ),
+    ).toBe("no allowed user invited the bot to CFOREIGN, so it cannot read it");
+    expect(readCalls).toEqual([]);
+  });
+
+  test("admits a channel an allowlisted user invited the bot to, and reads it", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const channel = guardChannel(db, guardCalls);
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-allowed", { inviter: "U111" })),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(200);
+    expect(guardCalls.map((call) => call.method)).toEqual(["auth.test"]);
+    expect([...db.admissions]).toEqual(["CFOREIGN"]);
+
+    const readCalls: RecordedCall[] = [];
+    const { output } = await readThreadOfForeignChannel(
+      db,
+      readCalls,
+      "CFOREIGN",
+    );
+    expect(
+      readCalls
+        .filter((call) => call.method === "conversations.replies")
+        .map((call) => call.body.channel),
+    ).toEqual(["CFOREIGN"]);
+    expect(output.messages.map((message) => message.text)).toEqual(["hello"]);
+  });
+
+  test("ignores a join by any other member", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const channel = guardChannel(db, guardCalls);
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(
+          joined("Ev-member", { inviter: "U999", user: "U999" }),
+        ),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(200);
+    expect(guardCalls.map((call) => call.method)).toEqual(["auth.test"]);
+    expect(db.admissions.size).toBe(0);
+  });
+
+  test("leaves a channel the bot joined with no inviter at all", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const channel = guardChannel(db, guardCalls);
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-nobody")),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(200);
+    expect(guardCalls.map((call) => call.method)).toEqual([
+      "auth.test",
+      "conversations.leave",
+      "chat.postMessage",
+      "chat.postMessage",
+    ]);
+    expect(db.admissions.size).toBe(0);
+  });
+
+  test("keeps the leave when Slack refuses an owner's direct message", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const reported: unknown[][] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      reported.push(args);
+    };
+    try {
+      const channel = guardChannel(db, guardCalls, {
+        "chat.postMessage": { error: "channel_not_found", ok: false },
+      });
+
+      const response = await channel
+        .route()
+        .request(
+          await signedRequest(joined("Ev-refused-dm", { inviter: "U999" })),
+          undefined,
+          testBindings(db),
+        );
+
+      expect(response.status).toBe(200);
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(
+      guardCalls.filter((call) => call.method === "conversations.leave"),
+    ).toHaveLength(1);
+    expect(
+      guardCalls.filter((call) => call.method === "chat.postMessage"),
+    ).toHaveLength(2);
+    expect(reported).toHaveLength(2);
+  });
+
+  test("answers non-2xx when Slack cannot say who the bot is, so Slack retries", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const channel = guardChannel(db, guardCalls, {
+      "auth.test": { user_id: "" },
+    });
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-no-identity", { inviter: "U999" })),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(500);
+    expect(guardCalls.map((call) => call.method)).toEqual(["auth.test"]);
+    expect(db.seen.has("Ev-no-identity")).toBe(false);
   });
 });

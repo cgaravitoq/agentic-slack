@@ -53,6 +53,7 @@ export { createSlackIngress, missingReadiness } from "./slack.ts";
 export type {
   ModelBrokerBinding,
   RoutedSlackLifecycle,
+  RoutedSlackMembership,
   RoutedSlackTurn,
   SlackCoreBindings,
   TrustedSlackConfig,
