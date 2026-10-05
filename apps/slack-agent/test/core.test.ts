@@ -432,7 +432,12 @@ describe("readiness and manifest", () => {
       agent_description: "Answers Slack conversations.",
     });
     expect(manifest.settings.event_subscriptions).toEqual({
-      bot_events: ["app_mention", "assistant_thread_started", "message.im"],
+      bot_events: [
+        "app_mention",
+        "assistant_thread_started",
+        "member_joined_channel",
+        "message.im",
+      ],
       request_url: "https://agent.example.com/channels/slack/events",
     });
     expect(JSON.stringify(manifest)).not.toMatch(/xox[a-z]-|[UA][A-Z0-9]{8,}/u);
@@ -454,7 +459,11 @@ describe("readiness and manifest", () => {
     expect(manifest.oauth_config.scopes.bot).toEqual([
       "app_mentions:read",
       "assistant:write",
+      "channels:manage",
+      "channels:read",
       "chat:write",
+      "groups:read",
+      "groups:write",
       "im:history",
       "reactions:write",
     ]);

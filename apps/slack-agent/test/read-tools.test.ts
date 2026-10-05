@@ -1,6 +1,7 @@
 import { expect, mock, spyOn, test } from "bun:test";
 import type { DeliveredMessage, ToolDefinition } from "@flue/runtime";
 import { defineAgentConfig, generateSlackManifest } from "@agentic-slack/core";
+import type { SlackChannelAdmissionStore } from "@agentic-slack/core";
 import * as v from "valibot";
 import { createSlackReadTools } from "../../../packages/core/src/read.ts";
 import type { SlackReadBinding } from "../../../packages/core/src/read.ts";
@@ -22,8 +23,8 @@ interface FakeSlackMessage {
 }
 
 interface FakeSlackFixture {
+  readonly admitted: readonly string[];
   readonly channels: Record<string, FakeSlackMessage[]>;
-  readonly members: readonly string[];
   readonly pageSize: number;
   readonly threads: Record<string, FakeSlackMessage[]>;
   readonly users: Record<string, string>;
@@ -89,13 +90,6 @@ const respond = (
         name: userId,
         profile: { display_name: fixture.users[userId] ?? "" },
       },
-    };
-  }
-  if (method === "conversations.info") {
-    const channel = params.get("channel") ?? "";
-    return {
-      channel: { is_member: fixture.members.includes(channel) },
-      ok: true,
     };
   }
   if (method === "conversations.history") {
@@ -167,11 +161,27 @@ interface ReadHarnessFixture {
   readonly watermark?: string;
 }
 
+const admittedStore = (...channels: string[]): SlackChannelAdmissionStore => {
+  const admitted = new Set(channels);
+  return {
+    admit: (channelId) => {
+      admitted.add(channelId);
+      return Promise.resolve();
+    },
+    drop: (channelId) => {
+      admitted.delete(channelId);
+      return Promise.resolve();
+    },
+    isAdmitted: (channelId) => Promise.resolve(admitted.has(channelId)),
+  };
+};
+
 const readHarness = (options: ReadHarnessFixture): ReadHarness => {
   const api = fakeSlack(options.fixture);
   const cursors: { channelId: string; cursor: string }[] = [];
   const state = { cursor: options.watermark };
   const [threadTool, channelTool] = createSlackReadTools(options.binding, {
+    admissionStore: admittedStore(...options.fixture.admitted),
     cursorStore: {
       load: () => Promise.resolve(state.cursor),
       save: (channelId, cursor) => {
@@ -191,7 +201,12 @@ const readHarness = (options: ReadHarnessFixture): ReadHarness => {
 const channelBinding = (
   channelId: string,
   threadTs: string,
-): SlackReadBinding => ({ channelId, readsMemberChannels: false, threadTs });
+): SlackReadBinding => ({
+  channelId,
+  readsMemberChannels: false,
+  surface: "channel",
+  threadTs,
+});
 
 const withFixedClock = async <TResult>(
   run: () => Promise<TResult>,
@@ -222,8 +237,8 @@ test("returns every message of a thread that spans two pages", async () => {
   const harness = readHarness({
     binding: channelBinding("C1", parentTs),
     fixture: {
+      admitted: ["C1"],
       channels: {},
-      members: [],
       pageSize: 20,
       threads: { [`C1:${parentTs}`]: messages },
       users: { U111: "Ada", U222: "Grace" },
@@ -272,8 +287,8 @@ test("bounds a thread read across a page boundary and resumes it to the end", as
   const harness = readHarness({
     binding: channelBinding("C1", parentTs),
     fixture: {
+      admitted: ["C1"],
       channels: {},
-      members: [],
       pageSize: 20,
       threads: { [`C1:${parentTs}`]: messages },
       users: { U111: "Ada", U222: "Grace" },
@@ -312,13 +327,13 @@ test("expands a parent older than the cursor when its reply is not", async () =>
   const harness = readHarness({
     binding: channelBinding("C1", parentTs),
     fixture: {
+      admitted: ["C1"],
       channels: {
         C1: [
           { latest_reply: replyTs, text: "parent", ts: parentTs },
           { text: "later top-level", ts: at(-100) },
         ],
       },
-      members: [],
       pageSize: 50,
       threads: {
         [`C1:${parentTs}`]: [
@@ -353,10 +368,10 @@ test("reports a reply older than the lookback in coverage instead of dropping it
   const harness = readHarness({
     binding: channelBinding("C1", parentTs),
     fixture: {
+      admitted: ["C1"],
       channels: {
         C1: [{ latest_reply: at(-300), text: "old parent", ts: parentTs }],
       },
-      members: [],
       pageSize: 50,
       threads: {
         [`C1:${parentTs}`]: [
@@ -394,6 +409,7 @@ test("bounds a read, resumes it, and moves the watermark only as far as it cover
   const harness = readHarness({
     binding: channelBinding("C1", at(-100)),
     fixture: {
+      admitted: ["C1"],
       channels: {
         C1: offsets.map((offset) => ({
           text: `message ${offset}`,
@@ -401,7 +417,6 @@ test("bounds a read, resumes it, and moves the watermark only as far as it cover
           user: "U111",
         })),
       },
-      members: [],
       pageSize: 50,
       threads: {},
       users: { U111: "Ada" },
@@ -447,8 +462,8 @@ test("leaves the watermark alone when an explicit oldest skips ahead of it", asy
   const harness = readHarness({
     binding: channelBinding("C1", at(-100)),
     fixture: {
+      admitted: ["C1"],
       channels: { C1: [{ text: "message", ts: at(-50), user: "U111" }] },
-      members: [],
       pageSize: 50,
       threads: {},
       users: { U111: "Ada" },
@@ -474,8 +489,8 @@ test("refuses to read another channel from a channel conversation", async () => 
   const harness = readHarness({
     binding: channelBinding("C1", at(-100)),
     fixture: {
+      admitted: ["C1"],
       channels: { C2: [{ text: "elsewhere", ts: at(-50) }] },
-      members: [],
       pageSize: 50,
       threads: {},
       users: {},
@@ -515,11 +530,12 @@ test("reads a channel the bot joined only from a direct message", async () => {
     binding: {
       channelId: "D777",
       readsMemberChannels: true,
+      surface: "private",
       threadTs: at(-100),
     },
     fixture: {
+      admitted: ["CJOINED"],
       channels: { CJOINED: [{ text: "hello", ts: at(-50), user: "U111" }] },
-      members: ["CJOINED"],
       pageSize: 50,
       threads: {
         [`CJOINED:${parentTs}`]: [{ text: "root", ts: parentTs, user: "U111" }],
@@ -556,16 +572,17 @@ test("reads a channel the bot joined only from a direct message", async () => {
   });
 });
 
-test("refuses a direct-message read without a channel or without membership", async () => {
+test("refuses a direct-message read without a channel or without admission", async () => {
   const harness = readHarness({
     binding: {
       channelId: "D777",
       readsMemberChannels: true,
+      surface: "private",
       threadTs: at(-100),
     },
     fixture: {
+      admitted: [],
       channels: { CFOREIGN: [{ text: "elsewhere", ts: at(-50) }] },
-      members: [],
       pageSize: 50,
       threads: {},
       users: {},
@@ -595,7 +612,7 @@ test("refuses a direct-message read without a channel or without membership", as
         }),
       ),
     ),
-  ).toBe("the bot is not a member of CFOREIGN, so it cannot read it");
+  ).toBe("no allowed user invited the bot to CFOREIGN, so it cannot read it");
   expect(
     await failureOf(
       Promise.resolve(
@@ -606,7 +623,7 @@ test("refuses a direct-message read without a channel or without membership", as
         }),
       ),
     ),
-  ).toBe("the bot is not a member of CFOREIGN, so it cannot read it");
+  ).toBe("no allowed user invited the bot to CFOREIGN, so it cannot read it");
   expect(
     harness.calls.filter((call) => call.method === "conversations.history"),
   ).toEqual([]);
@@ -615,8 +632,8 @@ test("refuses a direct-message read without a channel or without membership", as
 test("calls an injected fetcher with no receiver on both read tools", async () => {
   const parentTs = at(-300);
   const api = fakeSlack({
+    admitted: ["C1"],
     channels: { C1: [{ text: "hello", ts: at(-50), user: "U111" }] },
-    members: [],
     pageSize: 50,
     threads: { [`C1:${parentTs}`]: threadMessages(parentTs, 2) },
     users: { U111: "Ada" },
@@ -625,6 +642,7 @@ test("calls an injected fetcher with no receiver on both read tools", async () =
   const [threadTool, channelTool] = createSlackReadTools(
     channelBinding("C1", parentTs),
     {
+      admissionStore: admittedStore("C1"),
       cursorStore: {
         load: (channelId) => Promise.resolve(cursors.get(channelId)),
         save: (channelId, cursor) => {
@@ -676,17 +694,25 @@ const neutralConfig = defineAgentConfig({
   ownerInstructions: "Prefer short answers.",
 });
 
-const manifestScopes = (config: typeof readConfig): string[] => {
-  const manifest = v.parse(
+const manifestScopes = (config: typeof readConfig): string[] =>
+  v.parse(
     v.object({
       oauth_config: v.object({
         scopes: v.object({ bot: v.array(v.string()) }),
       }),
     }),
     JSON.parse(generateSlackManifest(config, "https://agent.example.com")),
-  );
-  return manifest.oauth_config.scopes.bot;
-};
+  ).oauth_config.scopes.bot;
+
+const manifestEvents = (config: typeof readConfig): string[] =>
+  v.parse(
+    v.object({
+      settings: v.object({
+        event_subscriptions: v.object({ bot_events: v.array(v.string()) }),
+      }),
+    }),
+    JSON.parse(generateSlackManifest(config, "https://agent.example.com")),
+  ).settings.event_subscriptions.bot_events;
 
 test("resolves the read option with defaults and rejects invalid bounds", () => {
   expect(neutralConfig.read).toBeUndefined();
@@ -720,7 +746,11 @@ test("adds the read scopes only when the option is set", () => {
   expect(manifestScopes(neutralConfig)).toEqual([
     "app_mentions:read",
     "assistant:write",
+    "channels:manage",
+    "channels:read",
     "chat:write",
+    "groups:read",
+    "groups:write",
     "im:history",
     "reactions:write",
   ]);
@@ -728,11 +758,24 @@ test("adds the read scopes only when the option is set", () => {
     "app_mentions:read",
     "assistant:write",
     "channels:history",
+    "channels:manage",
+    "channels:read",
     "chat:write",
     "groups:history",
+    "groups:read",
+    "groups:write",
     "im:history",
     "reactions:write",
     "users:read",
+  ]);
+});
+
+test("subscribes to the bot's own joins and to nothing else new", () => {
+  expect(manifestEvents(neutralConfig)).toEqual([
+    "app_mention",
+    "assistant_thread_started",
+    "member_joined_channel",
+    "message.im",
   ]);
 });
 
@@ -766,18 +809,29 @@ await mock.module("@flue/runtime/cloudflare", () => ({
 const readBindings = v.array(v.union([v.number(), v.string()]));
 
 const fakeReadDb = () => {
+  const admissions = new Set<string>();
   const rows = new Map<string, string>();
   return {
+    admissions,
     db: {
-      prepare: () => ({
+      prepare: (sql: string) => ({
         bind: (...values: unknown[]) => {
           const bindings = v.parse(readBindings, values);
           const key = String(bindings[0]);
           return {
-            all: () =>
-              Promise.resolve({
-                results: rows.has(key) ? [{ cursor_ts: rows.get(key) }] : [],
-              }),
+            all: () => {
+              const results: { channel_id?: string; cursor_ts?: string }[] = [];
+              if (
+                sql.includes("slack_channel_admissions") &&
+                admissions.has(key)
+              ) {
+                results.push({ channel_id: key });
+              }
+              if (sql.includes("slack_read_cursors") && rows.has(key)) {
+                results.push({ cursor_ts: String(rows.get(key)) });
+              }
+              return Promise.resolve({ results });
+            },
             run: () => {
               rows.set(key, String(bindings[1]));
               return Promise.resolve({ meta: { changes: 1 } });
@@ -839,8 +893,8 @@ test("mounts no read tool while the option is unset", async () => {
 test("mounts the read tools bound to the channel of the delivered message", async () => {
   const { default: shipped } = await import("../agent.config.ts");
   const fixture: FakeSlackFixture = {
+    admitted: ["C1"],
     channels: { C1: [{ text: "hello", ts: at(-50), user: "U111" }] },
-    members: [],
     pageSize: 50,
     threads: {},
     users: { U111: "Ada" },
@@ -854,6 +908,7 @@ test("mounts the read tools bound to the channel of the delivered message", asyn
     ),
   );
   const db = fakeReadDb();
+  db.admissions.add("C1");
   workerEnv.DB = db.db;
   await mock.module("../agent.config.ts", () => ({ default: readConfig }));
   try {
@@ -901,8 +956,8 @@ test("mounts the read tools bound to the channel of the delivered message", asyn
 test("lets the owner's direct message name the channel it reads", async () => {
   const { default: shipped } = await import("../agent.config.ts");
   const fixture: FakeSlackFixture = {
+    admitted: ["CJOINED"],
     channels: { CJOINED: [{ text: "hello", ts: at(-50), user: "U111" }] },
-    members: ["CJOINED"],
     pageSize: 50,
     threads: {},
     users: { U111: "Ada" },
@@ -916,6 +971,7 @@ test("lets the owner's direct message name the channel it reads", async () => {
     ),
   );
   const db = fakeReadDb();
+  db.admissions.add("CJOINED");
   workerEnv.DB = db.db;
   await mock.module("../agent.config.ts", () => ({ default: readConfig }));
   try {
@@ -959,8 +1015,8 @@ test("reads through the tools agent.ts mounts when the global fetch rejects a re
   const { default: shipped } = await import("../agent.config.ts");
   const parentTs = at(-300);
   const api = fakeSlack({
+    admitted: ["C1"],
     channels: { C1: [{ text: "hello", ts: at(-50), user: "U111" }] },
-    members: [],
     pageSize: 50,
     threads: { [`C1:${parentTs}`]: threadMessages(parentTs, 2) },
     users: { U111: "Ada" },
@@ -969,6 +1025,7 @@ test("reads through the tools agent.ts mounts when the global fetch rejects a re
     Object.assign(strictFetch(api.fetcher), { preconnect: fetch.preconnect }),
   );
   const db = fakeReadDb();
+  db.admissions.add("C1");
   workerEnv.DB = db.db;
   await mock.module("../agent.config.ts", () => ({ default: readConfig }));
   try {
@@ -1023,11 +1080,11 @@ test("reads through the tools agent.ts mounts when the global fetch rejects a re
 test("binds a direct message from a user who is not an owner to its own conversation", async () => {
   const { default: shipped } = await import("../agent.config.ts");
   const fixture: FakeSlackFixture = {
+    admitted: ["CJOINED"],
     channels: {
       CJOINED: [{ text: "private plans", ts: at(-50), user: "U111" }],
       D888: [{ text: "hi", ts: at(-40), user: "U333" }],
     },
-    members: ["CJOINED"],
     pageSize: 50,
     threads: {},
     users: { U333: "Grace" },

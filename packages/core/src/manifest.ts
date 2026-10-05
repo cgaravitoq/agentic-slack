@@ -10,7 +10,11 @@ export const generateSlackManifest = (
   const botScopes = [
     "app_mentions:read",
     "assistant:write",
+    "channels:manage",
+    "channels:read",
     "chat:write",
+    "groups:read",
+    "groups:write",
     "im:history",
     "reactions:write",
     ...(config.read === undefined
@@ -38,7 +42,12 @@ export const generateSlackManifest = (
       },
       settings: {
         event_subscriptions: {
-          bot_events: ["app_mention", "assistant_thread_started", "message.im"],
+          bot_events: [
+            "app_mention",
+            "assistant_thread_started",
+            "member_joined_channel",
+            "message.im",
+          ],
           request_url: `${origin}/channels/slack/events`,
         },
         interactivity: gatesACall
