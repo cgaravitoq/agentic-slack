@@ -327,7 +327,9 @@ interface GuardReply {
 }
 
 const guardNotice = (channelId: string, inviterId: string): string =>
-  `I left ${channelId} after ${inviterId} added me there. I only act in channels an allowed user invited me to.`;
+  `I left <#${channelId}>${
+    inviterId === "" ? "" : ` after <@${inviterId}> added me there`
+  }. I only act in channels an allowed user invited me to.`;
 
 const joined = (
   eventId: string,
@@ -1215,6 +1217,14 @@ describe("channel guard", () => {
       "chat.postMessage",
       "chat.postMessage",
     ]);
+    const notices = guardCalls.filter(
+      (call) => call.method === "chat.postMessage",
+    );
+    expect(notices.map((call) => call.body.channel)).toEqual(["U111", "U222"]);
+    expect(notices.map((call) => call.body.text)).toEqual([
+      guardNotice("CFOREIGN", ""),
+      guardNotice("CFOREIGN", ""),
+    ]);
     expect(db.admissions.size).toBe(0);
   });
 
@@ -1328,7 +1338,9 @@ describe("channel guard", () => {
     );
     expect(notices.map((call) => call.body.channel)).toEqual(["U111", "U222"]);
     for (const notice of notices) {
-      expect(notice.body.text).toContain("I could not leave CFOREIGN");
+      expect(notice.body.text).toContain(
+        "I could not leave <#CFOREIGN> after <@U999> added me there",
+      );
       expect(notice.body.text).toContain("missing_scope");
     }
     expect(db.admissions.size).toBe(0);

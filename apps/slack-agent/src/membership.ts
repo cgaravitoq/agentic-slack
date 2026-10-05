@@ -64,10 +64,14 @@ const channelGuardNotice = (
   channelId: string,
   inviterId: string,
   leaveRefusal: string | undefined,
-): string =>
-  leaveRefusal === undefined
-    ? `I left ${channelId} after ${inviterId} added me there. I only act in channels an allowed user invited me to.`
-    : `I could not leave ${channelId} after ${inviterId} added me there (Slack said ${leaveRefusal}), so remove me from it. I only act in channels an allowed user invited me to.`;
+): string => {
+  const channel = `<#${channelId}>`;
+  const invited =
+    inviterId === "" ? "" : ` after <@${inviterId}> added me there`;
+  return leaveRefusal === undefined
+    ? `I left ${channel}${invited}. I only act in channels an allowed user invited me to.`
+    : `I could not leave ${channel}${invited} (Slack said ${leaveRefusal}), so remove me from it. I only act in channels an allowed user invited me to.`;
+};
 
 // A leave Slack refuses for good cannot be fixed by redelivering the event, and
 // the admission is already gone, so it is reported rather than retried; a
