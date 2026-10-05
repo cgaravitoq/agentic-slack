@@ -180,7 +180,10 @@ const callSlack = async (
   method: string,
   body: Record<string, string>,
 ): Promise<v.InferOutput<typeof slackEnvelope>> => {
-  const response = await caller.fetcher(`${SLACK_API}${method}`, {
+  // A fetcher reached through an object would run with that object as its
+  // receiver, which workerd's global fetch rejects as an illegal invocation.
+  const { fetcher } = caller;
+  const response = await fetcher(`${SLACK_API}${method}`, {
     body: JSON.stringify(body),
     headers: {
       authorization: `Bearer ${caller.token}`,

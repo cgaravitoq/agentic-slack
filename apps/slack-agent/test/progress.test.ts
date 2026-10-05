@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
   createSlackProgressEndpoint,
   defineAgentConfig,
@@ -123,6 +123,23 @@ interface RecordedCall {
   readonly method: string;
 }
 
+type Fetcher = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
+
+// workerd rejects a built-in fetch invoked with a receiver, while Bun ignores
+// the receiver, so only a strict wrapper lets a test observe the difference.
+const strictFetch = (delegate: Fetcher): Fetcher =>
+  function rejectReceiver(this: undefined, input, init) {
+    if (this !== undefined) {
+      throw new Error(
+        "Illegal invocation: function called with incorrect `this` reference",
+      );
+    }
+    return delegate(input, init);
+  };
+
 const slackRecorder =
   (calls: RecordedCall[], refusals: readonly (string | undefined)[] = []) =>
   (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
@@ -173,6 +190,7 @@ const progressConfig = (narration?: string): ResolvedSlackProgressConfig => {
 
 interface EndpointOverrides {
   readonly bearer?: string;
+  readonly fetcher?: Fetcher;
   readonly narration?: string;
   readonly narrate?: (turn: SlackProgressTurn) => Promise<void>;
   readonly refusals?: readonly (string | undefined)[];
@@ -186,7 +204,7 @@ const endpointFor = (
   createSlackProgressEndpoint(progressConfig(overrides.narration), {
     bearer: overrides.bearer ?? BEARER,
     db: testBindings(db).DB,
-    fetcher: slackRecorder(calls, overrides.refusals),
+    fetcher: overrides.fetcher ?? slackRecorder(calls, overrides.refusals),
     narrate: overrides.narrate ?? (() => Promise.resolve()),
     teamId: trusted.teamId,
     token: trusted.botToken,
@@ -358,6 +376,49 @@ describe("progress endpoint", () => {
       { root_text: "Release 42 · Started", root_ts: "171.1" },
     ]);
     expect([...db.seen]).toEqual(["progress:evt-1"]);
+  });
+
+  test("posts the root and the reply through an injected fetcher that rejects a receiver", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls, {
+      fetcher: strictFetch(slackRecorder(calls)),
+    });
+
+    const response = await endpoint.handle(postMilestone());
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(calls).toEqual(rootCalls);
+  });
+
+  test("posts the root and the reply through the default global fetch that rejects a receiver", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const network = spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign(strictFetch(slackRecorder(calls)), {
+        preconnect: fetch.preconnect,
+      }),
+    );
+    try {
+      const endpoint = createSlackProgressEndpoint(progressConfig(), {
+        bearer: BEARER,
+        db: testBindings(db).DB,
+        narrate: () => Promise.resolve(),
+        teamId: trusted.teamId,
+        token: trusted.botToken,
+      });
+
+      const response = await endpoint.handle(postMilestone());
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ ok: true });
+      expect(calls).toEqual(rootCalls);
+    } finally {
+      network.mockRestore();
+    }
   });
 
   test("edits the root when the title or the label changes and replies to every milestone", async () => {
