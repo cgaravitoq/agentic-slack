@@ -695,19 +695,20 @@ describe("slack progress root storage", () => {
     });
     expect(await store.load("C2", "task-1")).toBeUndefined();
 
+    await store.drop("C1", "task-1");
+    await store.drop("C1", "task-9");
+    expect(await store.load("C1", "task-1")).toBeUndefined();
+    expect(await store.load("C1", "task-2")).toEqual({
+      rootText: "Release 43 · Started",
+      rootTs: "171.2",
+    });
+
     const rows = await db
       .prepare(
         "SELECT channel_id, task_id, root_ts, root_text, updated_at FROM slack_progress_roots ORDER BY channel_id, task_id",
       )
       .all();
     expect(rows.results).toEqual([
-      {
-        channel_id: "C1",
-        root_text: "Release 42 · Blocked",
-        root_ts: "171.1",
-        task_id: "task-1",
-        updated_at: NOW + 60,
-      },
       {
         channel_id: "C1",
         root_text: "Release 43 · Started",

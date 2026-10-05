@@ -47,6 +47,10 @@ class FakeD1 {
       },
       run: () => {
         if (sql.includes("slack_progress_roots")) {
+          if (sql.startsWith("DELETE")) {
+            this.roots.delete(this.rootKey());
+            return Promise.resolve({ meta: { changes: 1 } });
+          }
           this.roots.set(this.rootKey(), {
             root_text: String(this.values[3]),
             root_ts: String(this.values[2]),
@@ -456,6 +460,79 @@ describe("progress endpoint", () => {
 
     expect(retried.status).toBe(200);
     expect(retriedCalls).toEqual([rootCalls[1]]);
+  });
+
+  test("still replies when Slack refuses to edit the root", async () => {
+    const db = new FakeD1();
+    db.admissions.add("C1");
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls, {
+      refusals: [undefined, undefined, "edit_window_closed"],
+    });
+
+    const started = await endpoint.handle(postMilestone());
+    const blocked = await endpoint.handle(
+      postMilestone({
+        id: "evt-2",
+        kind: "blocked",
+        text: "Waiting on review",
+      }),
+    );
+
+    expect([started.status, blocked.status]).toEqual([200, 200]);
+    expect(calls.at(-2)).toEqual({
+      body: { channel: "C1", text: "Release 42 · Blocked", ts: "171.1" },
+      method: "chat.update",
+    });
+    expect(calls.at(-1)).toEqual({
+      body: {
+        channel: "C1",
+        text: "Waiting on review\nhttps://example.com/run",
+        thread_ts: "171.1",
+      },
+      method: "chat.postMessage",
+    });
+    expect([...db.roots.values()]).toEqual([
+      { root_text: "Release 42 · Started", root_ts: "171.1" },
+    ]);
+  });
+
+  test("starts a new root when the stored one is gone", async () => {
+    const db = new FakeD1();
+    db.admissions.add("C1");
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls, {
+      refusals: [undefined, undefined, "message_not_found"],
+    });
+
+    await endpoint.handle(postMilestone());
+    const vanished = await endpoint.handle(
+      postMilestone({
+        id: "evt-2",
+        kind: "blocked",
+        text: "Waiting on review",
+      }),
+    );
+    const recovered = await endpoint.handle(
+      postMilestone({ id: "evt-3", kind: "blocked", text: "Still waiting" }),
+    );
+
+    expect([vanished.status, recovered.status]).toEqual([200, 200]);
+    expect(calls.at(-2)).toEqual({
+      body: { channel: "C1", text: "Release 42 · Blocked" },
+      method: "chat.postMessage",
+    });
+    expect(calls.at(-1)).toEqual({
+      body: {
+        channel: "C1",
+        text: "Still waiting\nhttps://example.com/run",
+        thread_ts: "171.1",
+      },
+      method: "chat.postMessage",
+    });
+    expect([...db.roots.values()]).toEqual([
+      { root_text: "Release 42 · Blocked", root_ts: "171.1" },
+    ]);
   });
 });
 

@@ -100,6 +100,7 @@ interface SlackProgressRoot {
 }
 
 interface SlackProgressRootStore {
+  readonly drop: (channelId: string, taskId: string) => Promise<void>;
   readonly load: (
     channelId: string,
     taskId: string,
@@ -115,6 +116,14 @@ interface SlackProgressRootStore {
 export const createSqlSlackProgressRootStore = (
   db: D1Database,
 ): SlackProgressRootStore => ({
+  async drop(channelId, taskId) {
+    await db
+      .prepare(
+        "DELETE FROM slack_progress_roots WHERE channel_id = ?1 AND task_id = ?2",
+      )
+      .bind(channelId, taskId)
+      .run();
+  },
   async load(channelId, taskId) {
     const { results } = await db
       .prepare(
@@ -204,6 +213,9 @@ const constantTimeEquals = (left: string, right: string): boolean => {
 const refusal = (status: number, error: string): Response =>
   Response.json({ error, ok: false }, { status });
 
+const isMissingMessage = (error: Error): boolean =>
+  error.message.includes("message_not_found");
+
 const replyOf = (milestone: SlackProgressMilestone): string =>
   milestone.url === undefined
     ? milestone.text
@@ -256,11 +268,22 @@ export const createSlackProgressEndpoint = (
       return root;
     }
     if (stored.rootText !== text) {
-      await callSlack(caller, "chat.update", {
-        channel: milestone.channel,
-        text,
-        ts: stored.rootTs,
-      });
+      try {
+        await callSlack(caller, "chat.update", {
+          channel: milestone.channel,
+          text,
+          ts: stored.rootTs,
+        });
+      } catch (error: unknown) {
+        // A root Slack refuses to edit must not swallow the milestone: the
+        // reply still goes out, and a root Slack no longer has is forgotten so
+        // the next milestone posts a fresh one instead of retrying forever.
+        console.error("Slack progress root edit failed", error);
+        if (error instanceof Error && isMissingMessage(error)) {
+          await roots.drop(milestone.channel, milestone.task);
+        }
+        return stored;
+      }
       const root = { rootText: text, rootTs: stored.rootTs };
       await roots.save(milestone.channel, milestone.task, root, Date.now());
       return root;
