@@ -1,9 +1,20 @@
-import { expect, mock, test } from "bun:test";
+import { expect, mock, spyOn, test } from "bun:test";
+import { defineSkill } from "@flue/runtime";
+import type {
+  DeliveredMessage,
+  McpConnectionDefinition,
+  Skill,
+} from "@flue/runtime";
+import * as v from "valibot";
 import { composeInstructions, defineAgentConfig } from "@agentic-slack/core";
 import type { ExpiryPayload, ExpirySchedule } from "@agentic-slack/core";
+import { evictLiveSlackDelivery } from "../../../packages/core/src/delivery.ts";
 
 import config from "../agent.config.ts";
-import type { CapturedCloudflareExtension } from "./module-mocks.ts";
+import type {
+  CapturedCloudflareExtension,
+  MockedWorkerEnv,
+} from "./module-mocks.ts";
 import {
   mockCloudflareWorkers,
   retentionExtendCapture,
@@ -23,12 +34,30 @@ const shippedPrompts = config.suggestedPrompts.map((prompt) => ({
   message: prompt.message,
   title: prompt.title,
 }));
+const shippedMcpServers = [...config.mcpServers];
+const shippedSkills = [...config.skills];
 
 // Every field differs from both the shipped values in agent.config.ts and the
 // defaults in packages/core/src/config.ts, so a runtime that ignores the
 // operator config and falls back to either cannot satisfy the runtime tests.
+const refunds = defineSkill({
+  description:
+    "Process a customer refund request. Use when a customer disputes a charge.",
+  instructions: "Confirm the order ID, then issue the refund.",
+  name: "refunds",
+});
 const operatorConfig = defineAgentConfig({
   description: "Exercises operator configuration.",
+  mcpServers: [
+    {
+      authSecret: "CRM_MCP_TOKEN",
+      name: "crm",
+      requireApproval: ["create_organization"],
+      tools: ["create_organization"],
+      url: "https://mcp.example.test/mcp",
+    },
+    { name: "docs", optional: true, url: "https://docs.example.test/mcp" },
+  ],
   model: "cloudflare/@cf/test-operator-model",
   name: "Configured Agent",
   ownerInstructions: "Keep answers short.",
@@ -36,6 +65,7 @@ const operatorConfig = defineAgentConfig({
     channelDays: 9,
     privateDays: 3,
   },
+  skills: [refunds],
 });
 
 class RecordingAgent {
@@ -86,22 +116,46 @@ interface WiredRetentionAgent extends RecordingAgent {
 }
 
 const instructions: string[] = [];
+const mcpConnections: McpConnectionDefinition[] = [];
+const mountedSkills: Skill[] = [];
 let resolvedModel = "";
+const userMessage: DeliveredMessage = { body: "", kind: "user" };
+let delivery: DeliveredMessage = userMessage;
+const agentStarts: (() => void)[] = [];
+const deliveryRows = new Map<string, string>();
+const deliverySql = {
+  exec(query: string, ...bindings: unknown[]) {
+    if (query.trimStart().startsWith("SELECT")) {
+      const payload = deliveryRows.get(String(bindings[0]));
+      return { toArray: () => (payload === undefined ? [] : [{ payload }]) };
+    }
+    if (query.trimStart().startsWith("INSERT")) {
+      deliveryRows.set(String(bindings[0]), String(bindings[1]));
+    }
+    return { toArray: () => [] };
+  },
+};
 
-await mockCloudflareWorkers({
+const workerEnv: MockedWorkerEnv = {
+  CRM_MCP_TOKEN: "crm-test-token",
+  SLACK_APP_ID: "A123",
   SLACK_BOT_TOKEN: "xoxb-test-token",
-});
+};
+await mockCloudflareWorkers(workerEnv);
 const runtime = await import("@flue/runtime");
 await mock.module("@flue/runtime", () => ({
   ...runtime,
   observe: () => () => {},
   useAgentFinish: () => {},
-  useAgentStart: () => {},
-  useInitialData: () => {},
+  useAgentStart: (start: () => void) => agentStarts.push(start),
+  useDelivery: () => delivery,
   useInstruction: (instruction: string) => instructions.push(instruction),
+  useMcpConnection: (definition: McpConnectionDefinition) =>
+    mcpConnections.push(definition),
   useModel: (model: string) => {
     resolvedModel = model;
   },
+  useSkill: (skill: Skill) => mountedSkills.push(skill),
 }));
 // The spread keeps the mocked export list as wide as the real module: Bun
 // freezes it on first use, so a narrow mock breaks whichever test file loads
@@ -113,6 +167,7 @@ await mock.module("@flue/runtime/cloudflare", () => ({
     retentionExtendCapture.extension = extension;
     return extension;
   },
+  getCloudflareContext: () => ({ storage: { sql: deliverySql } }),
 }));
 await mock.module("../agent.config.ts", () => ({ default: operatorConfig }));
 const { SlackAgent } = await import("../src/agent.ts");
@@ -159,12 +214,180 @@ test("ships the pinned model, retention, and identity literals", () => {
   );
 });
 
+test("ships no MCP servers and no skills", () => {
+  expect(shippedMcpServers).toEqual([]);
+  expect(shippedSkills).toEqual([]);
+});
+
 test("uses the model and owner instructions from the operator config", () => {
   expect(SlackAgent({ id: "test" })).toBe(
     "Configured Agent: Exercises operator configuration.",
   );
   expect(resolvedModel).toBe("cloudflare/@cf/test-operator-model");
   expect(instructions).toEqual([...composeInstructions(operatorConfig)]);
+});
+
+test("mounts each configured MCP server with its bearer read from the Worker secret", async () => {
+  mcpConnections.length = 0;
+  SlackAgent({ id: "test" });
+  const [crm, docs] = mcpConnections;
+  expect(mcpConnections).toHaveLength(2);
+  expect(crm).toMatchObject({
+    name: "crm",
+    tools: ["create_organization"],
+    url: "https://mcp.example.test/mcp",
+  });
+  const auth = v.parse(v.function(), crm?.auth);
+  expect(await auth()).toBe("crm-test-token");
+  workerEnv.CRM_MCP_TOKEN = "crm-rotated-token";
+  expect(await auth()).toBe("crm-rotated-token");
+  workerEnv.CRM_MCP_TOKEN = "crm-test-token";
+  expect(docs).toEqual({
+    name: "docs",
+    optional: true,
+    url: "https://docs.example.test/mcp",
+  });
+});
+
+test("gates only the server whose tools require approval", () => {
+  mcpConnections.length = 0;
+  SlackAgent({ id: "test" });
+  const [crm, docs] = mcpConnections;
+  expect(v.is(v.function(), crm?.fetch)).toBe(true);
+  expect(Object.hasOwn(docs ?? {}, "fetch")).toBe(false);
+});
+
+test("mounts each configured skill with its name and instructions", () => {
+  mountedSkills.length = 0;
+  SlackAgent({ id: "test" });
+  expect(mountedSkills).toEqual([refunds]);
+});
+
+const directMessage = (threadTs: string): DeliveredMessage => ({
+  attributes: {
+    channelId: "D777",
+    event_id: `Ev-${threadTs}`,
+    message_ts: threadTs,
+    recipientTeamId: "T123",
+    recipientUserId: "U777",
+    surface: "private",
+    threadTs,
+    user: "U777",
+  },
+  body: threadTs,
+  kind: "signal",
+  type: "slack.message.im",
+});
+
+test("holds a gated call for the requester of the conversation's thread", async () => {
+  const instanceId = "slack:v1:T123:D777:D777";
+  const inserted: unknown[][] = [];
+  workerEnv.DB = {
+    prepare: (query: string) => ({
+      bind: (...bindings: unknown[]) => ({
+        all: () => Promise.resolve({ results: [] }),
+        run: () => {
+          if (query.includes("INSERT INTO approval_requests")) {
+            inserted.push(bindings);
+          }
+          return Promise.resolve({ meta: { changes: 1 } });
+        },
+      }),
+    }),
+  };
+  const requested: string[] = [];
+  const network = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(
+      (input: RequestInfo | URL) => {
+        requested.push(v.parse(v.string(), input));
+        return Promise.resolve(Response.json({ ok: true, ts: "181.2" }));
+      },
+      { preconnect: fetch.preconnect },
+    ),
+  );
+  delivery = directMessage("181.1");
+  agentStarts.length = 0;
+  mcpConnections.length = 0;
+  SlackAgent({ id: instanceId });
+  for (const start of agentStarts) {
+    start();
+  }
+  const gate = v.parse(v.function(), mcpConnections[0]?.fetch);
+  const send = (body: string) =>
+    gate("https://mcp.example.test/mcp", {
+      body,
+      method: "POST",
+    });
+
+  await send(
+    JSON.stringify({
+      id: 1,
+      jsonrpc: "2.0",
+      method: "tools/call",
+      params: {
+        arguments: { domain: "acme.test" },
+        name: "create_organization",
+      },
+    }),
+  );
+  expect(requested).toEqual(["https://slack.com/api/chat.postMessage"]);
+  expect(inserted.map((row) => row.slice(1, 11))).toEqual([
+    [
+      instanceId,
+      "T123",
+      "A123",
+      "D777",
+      "181.1",
+      "private",
+      "U777",
+      "create_organization",
+      '{"domain":"acme.test"}',
+      "pending",
+    ],
+  ]);
+
+  await send(JSON.stringify({ id: 2, jsonrpc: "2.0", method: "tools/list" }));
+  expect(requested.at(-1)).toBe("https://mcp.example.test/mcp");
+
+  network.mockRestore();
+  evictLiveSlackDelivery(instanceId);
+  deliveryRows.delete(instanceId);
+  delivery = userMessage;
+});
+
+test("streams each dispatched message's reply to the thread named in its attributes", () => {
+  const instanceId = "slack:v1:T123:D777:D777";
+  const startWith = (message: DeliveredMessage) => {
+    delivery = message;
+    agentStarts.length = 0;
+    SlackAgent({ id: instanceId });
+    for (const start of agentStarts) {
+      start();
+    }
+  };
+  const recordThreads = () => {
+    const payload = deliveryRows.get(instanceId);
+    const record = v.parse(
+      v.object({
+        binding: v.object({ threadTs: v.string() }),
+        joinedBindings: v.array(v.object({ threadTs: v.string() })),
+      }),
+      JSON.parse(payload ?? "null"),
+    );
+    return [record.binding, ...record.joinedBindings].map(
+      (binding) => binding.threadTs,
+    );
+  };
+
+  startWith(userMessage);
+  expect(deliveryRows.has(instanceId)).toBe(false);
+
+  startWith(directMessage("181.1"));
+  startWith(directMessage("182.2"));
+  expect(recordThreads()).toEqual(["181.1", "182.2"]);
+
+  evictLiveSlackDelivery(instanceId);
+  delivery = userMessage;
 });
 
 test("schedules three-day private and nine-day channel expiry on the extended Durable Object", async () => {

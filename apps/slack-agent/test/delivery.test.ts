@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   applySlackDeliveryEvent,
+  failSlackDelivery,
   finishSlackDelivery,
   openSlackDelivery,
   slackEventFromObservation,
@@ -19,7 +20,7 @@ import {
   MAX_RETRY_WAIT_MS,
   MAX_SLACK_APPEND_LENGTH,
   MAX_SLACK_MESSAGE_LENGTH,
-  retryDelayMs,
+  retryWait,
   sanitizeReply,
   SLACK_DELIVERY_FALLBACK,
   slackDeliveryBinding,
@@ -27,6 +28,7 @@ import {
   STREAM_TAIL_LENGTH,
   streamTargetFor,
 } from "../../../packages/core/src/delivery.ts";
+import type { SlackDeliveryEvent } from "../../../packages/core/src/delivery.ts";
 import {
   MAX_SLACK_TASK_CHUNK_LENGTH,
   SLACK_TASK_FALLBACK_TITLE,
@@ -76,13 +78,45 @@ const markdownAppendBody = v.strictObject({
   markdown_text: v.pipe(v.string(), v.minLength(1), v.maxLength(12_000)),
   ts: v.string(),
 });
+const markdownChunk = v.strictObject({
+  text: v.pipe(v.string(), v.minLength(1), v.maxLength(12_000)),
+  type: v.literal("markdown_text"),
+});
 const taskAppendBody = v.strictObject({
   channel: v.string(),
-  chunks: v.pipe(v.array(taskChunk), v.minLength(1)),
+  chunks: v.pipe(v.array(v.union([taskChunk, markdownChunk])), v.minLength(1)),
   ts: v.string(),
 });
 const appendStreamBody = v.union([markdownAppendBody, taskAppendBody]);
-const stopStreamBody = v.strictObject({ channel: v.string(), ts: v.string() });
+const stopStreamBody = v.strictObject({
+  blocks: v.optional(
+    v.tuple([
+      v.strictObject({
+        text: v.strictObject({ text: v.string(), type: v.literal("mrkdwn") }),
+        type: v.literal("section"),
+      }),
+    ]),
+  ),
+  channel: v.string(),
+  ts: v.string(),
+});
+
+const parseSlackCall = (method: string, json: string): SlackCall => {
+  const raw: unknown = JSON.parse(json);
+  if (method === "chat.startStream") {
+    const surfaced = v.is(v.object({ recipient_user_id: v.string() }), raw)
+      ? channelStartStreamBody
+      : startStreamBody;
+    return { body: v.parse(surfaced, raw), method };
+  }
+  if (method === "chat.appendStream") {
+    return { body: v.parse(appendStreamBody, raw), method };
+  }
+  if (method === "chat.stopStream") {
+    return { body: v.parse(stopStreamBody, raw), method };
+  }
+  throw new Error(`Unexpected Slack method ${method}`);
+};
 
 interface SlackCall {
   method: string;
@@ -102,12 +136,16 @@ interface FakeSlack {
 }
 
 // `skip` occurrences of a method are answered ok before the next `limit` are
-// rejected, so a transient mid-stream failure can be staged.
+// rejected, so a transient mid-stream failure can be staged. With `windowMs`
+// the method instead stays rejected until that much simulated time has passed,
+// announcing the seconds left exactly as Slack does.
 interface FakeSlackFailures {
   limit?: number;
+  now?: () => number;
   skip?: number;
   status?: number;
   retryAfter?: string;
+  windowMs?: number;
 }
 
 // Concurrent fetches in one turn complete last-in first-out, so a uniform
@@ -137,21 +175,42 @@ const createFakeSlack = (
   failures: Partial<Record<string, string>> = {},
   {
     limit = Number.POSITIVE_INFINITY,
+    now,
     skip = 0,
     status = 200,
     retryAfter,
+    windowMs,
   }: FakeSlackFailures = {},
 ): FakeSlack => {
   const calls: SlackCall[] = [];
   const accepted: SlackCall[] = [];
   const seen = new Map<string, number>();
   const settle = createLifoSettler<Response>();
+  const clock = (): number => now?.() ?? performance.now();
+  const windowEnd = windowMs === undefined ? undefined : clock() + windowMs;
+  // Slack fixes a stream's mode on its first append: top-level markdown_text
+  // and chunks cannot be mixed, and the other form fails with
+  // streaming_mode_mismatch (observed against chat.appendStream).
+  const streamModes = new Map<string, "chunks" | "markdown">();
+  const switchesStreamMode = (
+    body: v.InferOutput<typeof appendStreamBody>,
+  ): boolean => {
+    const mode = v.is(markdownAppendBody, body) ? "markdown" : "chunks";
+    const fixed = streamModes.get(body.ts) ?? mode;
+    streamModes.set(body.ts, fixed);
+    return fixed !== mode;
+  };
   const chunksOf = (recorded: SlackCall[]) =>
     recorded
       .filter((call) => call.method === "chat.appendStream")
       .map((call) => v.parse(appendStreamBody, call.body))
-      .filter((body) => v.is(markdownAppendBody, body))
-      .map((body) => body.markdown_text);
+      .flatMap((body) =>
+        v.is(markdownAppendBody, body)
+          ? [body.markdown_text]
+          : body.chunks.flatMap((chunk) =>
+              chunk.type === "markdown_text" ? [chunk.text] : [],
+            ),
+      );
   const markdownChunks = () => chunksOf(calls);
   return {
     accepted,
@@ -178,32 +237,39 @@ const createFakeSlack = (
       if (!v.is(v.string(), init.body)) {
         throw new TypeError(`Expected a JSON body for ${method}`);
       }
-      const raw: unknown = JSON.parse(init.body);
-      let call: SlackCall;
-      if (method === "chat.startStream") {
-        const surfaced = v.is(v.object({ recipient_user_id: v.string() }), raw)
-          ? channelStartStreamBody
-          : startStreamBody;
-        call = { body: v.parse(surfaced, raw), method };
-      } else if (method === "chat.appendStream") {
-        call = { body: v.parse(appendStreamBody, raw), method };
-      } else if (method === "chat.stopStream") {
-        call = { body: v.parse(stopStreamBody, raw), method };
-      } else {
-        throw new Error(`Unexpected Slack method ${method}`);
+      const call = parseSlackCall(method, init.body);
+      if (
+        call.method === "chat.appendStream" &&
+        switchesStreamMode(v.parse(appendStreamBody, call.body))
+      ) {
+        return settle(
+          Response.json({ error: "streaming_mode_mismatch", ok: false }),
+        ).then((response) => {
+          calls.push(call);
+          return response;
+        });
       }
       const error = failures[method];
       const occurrence = (seen.get(method) ?? 0) + 1;
       seen.set(method, occurrence);
+      const remaining =
+        windowEnd === undefined ? undefined : windowEnd - clock();
       const rejected =
-        error !== undefined && occurrence > skip && occurrence <= skip + limit;
+        error !== undefined &&
+        (remaining === undefined
+          ? occurrence > skip && occurrence <= skip + limit
+          : remaining > 0);
+      const announced =
+        remaining === undefined
+          ? retryAfter
+          : String(Math.max(1, Math.ceil(remaining / 1000)));
       return settle(
         Response.json(
           rejected ? { error, ok: false } : { ok: true, ts: STREAM_TS },
           {
             headers:
-              rejected && retryAfter !== undefined
-                ? { "Retry-After": retryAfter }
+              rejected && announced !== undefined
+                ? { "Retry-After": announced }
                 : undefined,
             status: rejected ? status : 200,
           },
@@ -228,8 +294,42 @@ const createFakeSlack = (
         .filter((call) => call.method === "chat.appendStream")
         .map((call) => v.parse(appendStreamBody, call.body))
         .filter((body) => v.is(taskAppendBody, body))
-        .flatMap((body) => body.chunks),
+        .flatMap((body) =>
+          body.chunks.filter((chunk) => chunk.type === "task_update"),
+        ),
   };
+};
+
+// An injected `sleep` that settles on a later macrotask instead of resolving
+// inside the caller, and that reports any Slack call issued while a wait is
+// still outstanding: a caller that does not await its wait runs ahead and is
+// recorded in `ranAhead`. Simulated time advances when a wait settles, so a
+// caller that runs ahead also fails to see the clock move.
+const createAwaitedSleep = (
+  slackFetcher: FakeSlack["fetcher"],
+  onSettled?: (ms: number) => void,
+) => {
+  const waits: number[] = [];
+  const ranAhead: string[] = [];
+  let outstanding = 0;
+  const fetcher = (input: RequestInfo | URL, init?: RequestInit) => {
+    if (outstanding > 0 && v.is(v.string(), input)) {
+      ranAhead.push(input.replace("https://slack.com/api/", ""));
+    }
+    return slackFetcher(input, init);
+  };
+  const sleep = async (ms: number): Promise<void> => {
+    waits.push(ms);
+    outstanding += 1;
+    const deferred = Promise.withResolvers<true>();
+    setTimeout(() => {
+      outstanding -= 1;
+      onSettled?.(ms);
+      deferred.resolve(true);
+    }, 0);
+    await deferred.promise;
+  };
+  return { fetcher, ranAhead, sleep, waits };
 };
 
 const memoryStore = (): SlackDeliveryStore => {
@@ -244,6 +344,27 @@ const memoryStore = (): SlackDeliveryStore => {
     save(instanceId, record) {
       rows.set(instanceId, record);
     },
+  };
+};
+
+// `memoryStore` hands the live record back by reference, so a replay reads
+// mutations that were never saved. This one only returns what a save wrote.
+const serializingStore = (): SlackDeliveryStore & { saves: () => number } => {
+  const rows = new Map<
+    string,
+    NonNullable<ReturnType<SlackDeliveryStore["load"]>>
+  >();
+  let saves = 0;
+  return {
+    load(instanceId) {
+      const record = rows.get(instanceId);
+      return record === undefined ? undefined : structuredClone(record);
+    },
+    save(instanceId, record) {
+      saves += 1;
+      rows.set(instanceId, structuredClone(record));
+    },
+    saves: () => saves,
   };
 };
 
@@ -534,6 +655,23 @@ describe("trusted Slack streaming delivery", () => {
     }
   });
 
+  test("delivers the failure notice on a reply that already hit the content cap", async () => {
+    const slack = createFakeSlack();
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    stream.append("a".repeat(20_000));
+    await stream.fail(SLACK_STREAM_FAILURE_NOTICE);
+
+    const delivered = slack.acceptedChunks();
+    expect(delivered.slice(0, -1).join("")).toHaveLength(
+      MAX_SLACK_MESSAGE_LENGTH - 7,
+    );
+    expect(delivered.slice(0, -1).join("").endsWith("\n\n(truncated)")).toBe(
+      true,
+    );
+    expect(delivered.at(-1)).toBe(SLACK_STREAM_FAILURE_NOTICE);
+    expect(slack.acceptedMethods().at(-1)).toBe("chat.stopStream");
+  });
+
   test("truncation does not emit a lone surrogate when an emoji straddles the cut", async () => {
     const slack = createFakeSlack();
     const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
@@ -746,36 +884,228 @@ describe("trusted Slack streaming delivery", () => {
     expect(serverError.acceptedChunks()).toEqual(["hello"]);
   });
 
-  test("pins Retry-After to 2000ms per attempt and 4000ms across attempts", () => {
-    expect(MAX_RETRY_AFTER_MS).toBe(2000);
-    expect(MAX_RETRY_WAIT_MS).toBe(4000);
+  test("pins the honoured wait to one Slack window", () => {
+    expect(MAX_RETRY_AFTER_MS).toBe(60_000);
+    expect(MAX_RETRY_WAIT_MS).toBe(60_000);
   });
 
   test("honours Retry-After below the cap", () => {
     const response = new Response(null, { headers: { "Retry-After": "1" } });
-    expect(retryDelayMs(response, 0, 0)).toBe(1000);
+    expect(retryWait(response, 0, 0)).toEqual({ delayMs: 1000, last: false });
   });
 
-  test("caps Retry-After per attempt and across the retry budget", () => {
-    const response = new Response(null, { headers: { "Retry-After": "60" } });
-    expect(retryDelayMs(response, 0, 0)).toBe(2000);
-    expect(retryDelayMs(response, 1, 2000)).toBe(2000);
-    expect(retryDelayMs(response, 2, 4000)).toBe(0);
+  test("backs off exponentially when Slack announces no window", () => {
+    const response = new Response(null);
+    expect(retryWait(response, 0, 0)).toEqual({ delayMs: 250, last: false });
+    expect(retryWait(response, 1, 0).delayMs).toBe(500);
+    expect(retryWait(response, 2, 0).delayMs).toBe(1000);
+    expect(retryWait(response, 5, 0).delayMs).toBe(4000);
   });
 
-  test("caps the wait call actually spends across Retry-After retries", async () => {
-    const started = performance.now();
+  test("treats Retry-After: 0 as the zero-second window it announces", () => {
+    const response = new Response(null, { headers: { "Retry-After": "0" } });
+    expect(retryWait(response, 2, 0)).toEqual({ delayMs: 0, last: false });
+  });
+
+  test("backs off between attempts on a 5xx that carries no Retry-After", async () => {
     const slack = createFakeSlack(
-      { "chat.appendStream": "rate_limited" },
-      { limit: 3, retryAfter: "2", status: 429 },
+      { "chat.appendStream": "internal_error" },
+      { limit: 3, status: 503 },
     );
-    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    const sleeper = createAwaitedSleep(slack.fetcher);
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      sleeper.fetcher,
+      sleeper.sleep,
+    );
     stream.append("hello");
     await stream.finish(SLACK_DELIVERY_FALLBACK);
 
     expect(slack.acceptedChunks()).toEqual(["hello"]);
-    expect(performance.now() - started).toBeLessThan(5500);
-  }, 15_000);
+    expect(sleeper.waits).toEqual([250, 500, 1000]);
+    expect(sleeper.ranAhead).toEqual([]);
+  });
+
+  test("spends what the phase can fund and marks that wait its last", () => {
+    const response = new Response(null, { headers: { "Retry-After": "90" } });
+    expect(retryWait(response, 0, 0)).toEqual({ delayMs: 60_000, last: true });
+    expect(retryWait(response, 1, 45_000)).toEqual({
+      delayMs: 15_000,
+      last: true,
+    });
+    expect(retryWait(response, 2, 60_000)).toEqual({ delayMs: 0, last: true });
+  });
+
+  test("keeps waiting through each announced window within the phase budget", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { limit: 3, retryAfter: "2", status: 429 },
+    );
+    const sleeper = createAwaitedSleep(slack.fetcher);
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      sleeper.fetcher,
+      sleeper.sleep,
+    );
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(sleeper.waits).toEqual([2000, 2000, 2000]);
+    expect(sleeper.ranAhead).toEqual([]);
+    expect(sleeper.waits.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(
+      MAX_RETRY_WAIT_MS,
+    );
+  });
+
+  test("waits for every retry it requests, including a zero-second one", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { limit: 1, retryAfter: "0", status: 429 },
+    );
+    const sleeper = createAwaitedSleep(slack.fetcher);
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      sleeper.fetcher,
+      sleeper.sleep,
+    );
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(sleeper.waits).toEqual([0]);
+    expect(sleeper.ranAhead).toEqual([]);
+  });
+
+  test("gives chat.stopStream the closing window, not the spent content one", async () => {
+    const slack = createFakeSlack(
+      {
+        "chat.appendStream": "rate_limited",
+        "chat.stopStream": "rate_limited",
+      },
+      { limit: 2, retryAfter: "30", status: 429 },
+    );
+    const sleeper = createAwaitedSleep(slack.fetcher);
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      sleeper.fetcher,
+      sleeper.sleep,
+    );
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(slack.acceptedMethods().at(-1)).toBe("chat.stopStream");
+    expect(sleeper.waits).toEqual([30_000, 30_000, 30_000, 30_000]);
+    expect(sleeper.ranAhead).toEqual([]);
+  });
+
+  test("waits out the window that blocked the append instead of giving up inside it", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { status: 429, windowMs: 7000 },
+    );
+    const stream = createSlackStream(channelTarget, BOT_TOKEN, slack.fetcher);
+    const started = performance.now();
+    stream.append("hello");
+    await stream.finish(SLACK_DELIVERY_FALLBACK);
+    const elapsed = performance.now() - started;
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(elapsed).toBeGreaterThanOrEqual(6500);
+    expect(elapsed).toBeLessThan(11_000);
+  }, 20_000);
+
+  test("stops the phase once Slack asks for more than its budget can fund", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { retryAfter: "90", status: 429 },
+    );
+    const sleeper = createAwaitedSleep(slack.fetcher);
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      sleeper.fetcher,
+      sleeper.sleep,
+    );
+    stream.append("hello");
+    let failure: unknown;
+    try {
+      await stream.finish(SLACK_DELIVERY_FALLBACK);
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(failure).toEqual(new Error("Slack chat.appendStream failed: 429"));
+    expect(sleeper.waits).toEqual([MAX_RETRY_AFTER_MS, MAX_RETRY_AFTER_MS]);
+    expect(
+      slack.methods().filter((method) => method === "chat.appendStream"),
+    ).toHaveLength(2);
+    expect(sleeper.ranAhead).toEqual([]);
+  });
+
+  test("honours the announced window up to the phase budget and no further", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "rate_limited" },
+      { limit: 3, retryAfter: "60", status: 429 },
+    );
+    const sleeper = createAwaitedSleep(slack.fetcher);
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      sleeper.fetcher,
+      sleeper.sleep,
+    );
+    stream.append("hello");
+    let failure: unknown;
+    try {
+      await stream.finish(SLACK_DELIVERY_FALLBACK);
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(failure).toEqual(new Error("Slack chat.appendStream failed: 429"));
+    expect(slack.acceptedChunks()).toEqual([SLACK_STREAM_FAILURE_NOTICE]);
+    expect(sleeper.waits).toEqual([MAX_RETRY_AFTER_MS, 0, MAX_RETRY_AFTER_MS]);
+    expect(sleeper.ranAhead).toEqual([]);
+  });
+
+  test("gives the failure notice its own window after the stream spends the content budget", async () => {
+    const clock = { now: 0 };
+    const slack = createFakeSlack(
+      { "chat.startStream": "rate_limited" },
+      { now: () => clock.now, status: 429, windowMs: 65_000 },
+    );
+    const sleeper = createAwaitedSleep(slack.fetcher, (ms) => {
+      clock.now += ms;
+    });
+    const stream = createSlackStream(
+      channelTarget,
+      BOT_TOKEN,
+      sleeper.fetcher,
+      sleeper.sleep,
+    );
+    stream.append("hello");
+    let failure: unknown;
+    try {
+      await stream.finish(SLACK_DELIVERY_FALLBACK);
+    } catch (error: unknown) {
+      failure = error;
+    }
+
+    expect(failure).toEqual(new Error("Slack chat.startStream failed: 429"));
+    expect(slack.acceptedChunks()).toEqual([SLACK_STREAM_FAILURE_NOTICE]);
+    expect(slack.acceptedMethods().at(-1)).toBe("chat.stopStream");
+    expect(sleeper.waits).toEqual([60_000, 5000]);
+    expect(sleeper.ranAhead).toEqual([]);
+    expect(sleeper.waits.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(
+      MAX_RETRY_WAIT_MS * 2,
+    );
+  });
 
   test("stops retrying a retryable Slack error after four attempts", async () => {
     const slack = createFakeSlack(
@@ -904,7 +1234,9 @@ describe("Slack task updates", () => {
       }),
       JSON.stringify({
         channel: "C123",
-        markdown_text: "Looking it up. Found three.",
+        chunks: [
+          { text: "Looking it up. Found three.", type: "markdown_text" },
+        ],
         ts: STREAM_TS,
       }),
     ]);
@@ -1264,6 +1596,26 @@ describe("stream sanitizer cutter", () => {
     expect(emissions).toEqual([text.slice(0, 1024), text.slice(1024)]);
   });
 
+  test("rewrites a Slack link the model copied into the markdown Slack renders", () => {
+    expect(
+      sanitizeReply(
+        "See <https://x.dev/pull/1|the PR> and <https://x.dev/run>, ask <@U0ANA>",
+      ),
+    ).toBe(
+      "See [the PR](https://x.dev/pull/1) and https://x.dev/run, ask &lt;@U0ANA>",
+    );
+  });
+
+  test("holds back a Slack link the tail cut would split until it closes", () => {
+    const link = "<https://x.dev/pull/1|the PR>";
+    const text = `${"x".repeat(500)}${link}${"y".repeat(600)}`;
+    const sanitizer = createStreamSanitizer();
+    const output = sanitizer.push(text) + sanitizer.flush();
+    expect(output).toBe(
+      `${"x".repeat(500)}[the PR](https://x.dev/pull/1)${"y".repeat(600)}`,
+    );
+  });
+
   test("redacts an accidental configuration echo on the full emitted payload", () => {
     const sanitizer = createStreamSanitizer();
     const output = sanitizer.push('PASSWORD = "hunter2"') + sanitizer.flush();
@@ -1381,7 +1733,220 @@ describe("observation delivery mapping", () => {
   });
 });
 
+const LONE_SURROGATE =
+  /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u;
+
+// A marked head, a marked tail and filler that never repeats: a clip taken
+// from the wrong end of this answer cannot match the clip taken from the head.
+const markedAnswer = (length: number): string => {
+  let text = "HEAD>";
+  for (let index = 0; text.length < length; index += 1) {
+    text += `${index.toString(36)}-`;
+  }
+  return `${text.slice(0, length - 5)}<TAIL`;
+};
+
+const closings = (slack: FakeSlack): string[] =>
+  slack.calls
+    .filter((call) => call.method === "chat.stopStream")
+    .flatMap(
+      (call) =>
+        v
+          .parse(stopStreamBody, call.body)
+          .blocks?.map((block) => block.text.text) ?? [],
+    );
+
+const tagMembers = (store: SlackDeliveryStore, id: string) => {
+  for (const userId of ["U0BEN", "U0ANA", "U0BEN"]) {
+    applySlackDeliveryEvent(store, id, { type: "mention", userId });
+  }
+  applySlackDeliveryEvent(store, id, { text: "Tagged.", type: "text" });
+};
+
+const streamToolStep = (store: SlackDeliveryStore, id: string) => {
+  applySlackDeliveryEvent(store, id, {
+    id: "call-1",
+    name: "read_thread",
+    type: "tool-start",
+  });
+  applySlackDeliveryEvent(store, id, {
+    error: false,
+    id: "call-1",
+    output: '{"coverage":{}}',
+    type: "tool-result",
+  });
+  applySlackDeliveryEvent(store, id, { text: "Done.", type: "text" });
+};
+
 describe("durable Slack delivery", () => {
+  const startStreamThreads = (slack: FakeSlack): string[] =>
+    slack.calls
+      .filter((call) => call.method === "chat.startStream")
+      .map((call) => v.parse(startStreamBody, call.body).thread_ts);
+  const privateBindings = () => {
+    const first = slackDeliveryBinding(privateTarget);
+    return { first, second: { ...first, threadTs: "182.2" } };
+  };
+
+  // Flue joins a dispatch to a busy instance into the live response, so one
+  // response carries several `useAgentStart()` runs — one per requesting
+  // thread. Every one of those threads is owed the reply.
+  test("replies in every thread whose delivery joined the same response", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const { first, second } = privateBindings();
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    applySlackDeliveryEvent(store, "dm", { text: "xray1xray2", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
+
+    expect(startStreamThreads(slack)).toEqual(["171.2", "182.2"]);
+    expect(
+      slack.methods().filter((method) => method === "chat.stopStream"),
+    ).toHaveLength(2);
+    expect(slack.markdown()).toBe("xray1xray2xray1xray2");
+  });
+
+  test("does not repeat a thread that joins the same response twice", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const { first, second } = privateBindings();
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    applySlackDeliveryEvent(store, "dm", { text: "xray1xray2", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
+
+    expect(startStreamThreads(slack)).toEqual(["171.2", "182.2"]);
+  });
+
+  // A record left open by an interrupted turn belongs to the thread that
+  // opened it; the next turn's thread must not inherit it. The threads that
+  // record still owes an outcome are told when the turn that replaced it
+  // finishes, not while its model is still waiting to start.
+  test("tells the interrupted turn's threads when the turn that replaced them finishes", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const { first, second } = privateBindings();
+    const third = { ...first, threadTs: "183.3" };
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", second, BOT_TOKEN, slack.fetcher);
+    evictLiveSlackDelivery("dm");
+    openSlackDelivery(store, "dm", third, BOT_TOKEN, slack.fetcher);
+    applySlackDeliveryEvent(store, "dm", { text: "third only", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
+
+    expect(startStreamThreads(slack).toSorted()).toEqual([
+      "171.2",
+      "182.2",
+      "183.3",
+    ]);
+    expect(slack.markdown()).toBe(
+      `${SLACK_STREAM_FAILURE_NOTICE}${SLACK_STREAM_FAILURE_NOTICE}third only`,
+    );
+    expect(store.load("dm")?.binding.threadTs).toBe("183.3");
+  });
+
+  // The runtime starts a response's `useAgentStart()` hooks together, so two
+  // deliveries can open the same instance before either has settled the
+  // interrupted record. Opening is synchronous, so the fresh record takes the
+  // instance's slot before the second open can see it; the second joins rather
+  // than replacing it, and its thread is not the one left out.
+  test("settles an interrupted record once when two turns open together", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const first = slackDeliveryBinding(privateTarget);
+    const third = { ...first, threadTs: "183.3" };
+    const fourth = { ...first, threadTs: "184.4" };
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    evictLiveSlackDelivery("dm");
+    openSlackDelivery(store, "dm", third, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "dm", fourth, BOT_TOKEN, slack.fetcher);
+    applySlackDeliveryEvent(store, "dm", { text: "reply", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
+
+    expect(startStreamThreads(slack).toSorted()).toEqual([
+      "171.2",
+      "183.3",
+      "184.4",
+    ]);
+    expect(slack.markdown()).toBe(`${SLACK_STREAM_FAILURE_NOTICE}replyreply`);
+    const record = store.load("dm");
+    expect([
+      record?.binding.threadTs,
+      ...(record?.joinedBindings ?? []).map((binding) => binding.threadTs),
+    ]).toEqual(["183.3", "184.4"]);
+  });
+
+  // The turn that abandons a record must reach its model without waiting on a
+  // Slack round-trip, retries included: opening the fresh record touches Slack
+  // not at all, and the interrupted threads are settled when this turn ends.
+  test("opens the fresh record without settling the interrupted one", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const { first } = privateBindings();
+    const third = { ...first, threadTs: "183.3" };
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, slack.fetcher);
+    evictLiveSlackDelivery("dm");
+
+    openSlackDelivery(store, "dm", third, BOT_TOKEN, slack.fetcher);
+
+    expect(slack.calls).toEqual([]);
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, slack.fetcher);
+    expect(startStreamThreads(slack).toSorted()).toEqual(["171.2", "183.3"]);
+  });
+
+  // The record that replaced an interrupted one carries that record durably, so
+  // a notice Slack refuses to accept is retried by a later finish instead of
+  // being lost with the isolate that attempted it.
+  test("retries an interrupted thread's notice from the durable record", async () => {
+    const failing = createFakeSlack({
+      "chat.startStream": "channel_not_found",
+    });
+    const store = serializingStore();
+    const { first } = privateBindings();
+    const third = { ...first, threadTs: "183.3" };
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, failing.fetcher);
+    evictLiveSlackDelivery("dm");
+    openSlackDelivery(store, "dm", third, BOT_TOKEN, failing.fetcher);
+    applySlackDeliveryEvent(store, "dm", { text: "reply", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, failing.fetcher);
+    expect(store.load("dm")?.abandoned).toHaveLength(1);
+
+    const healthy = createFakeSlack();
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, healthy.fetcher);
+
+    expect(startStreamThreads(healthy)).toEqual(["171.2"]);
+    expect(healthy.markdown()).toBe(SLACK_STREAM_FAILURE_NOTICE);
+  });
+
+  // A notice still refused when its carrier closes outlives that record: the
+  // next turn's fresh record inherits it, so its finish retries the notice
+  // instead of the slot's replacement discarding it.
+  test("keeps a refused interrupted-thread notice across the next turn's open", async () => {
+    const failing = createFakeSlack({
+      "chat.startStream": "channel_not_found",
+    });
+    const store = serializingStore();
+    const { first } = privateBindings();
+    const third = { ...first, threadTs: "183.3" };
+    const fourth = { ...first, threadTs: "184.4" };
+    openSlackDelivery(store, "dm", first, BOT_TOKEN, failing.fetcher);
+    evictLiveSlackDelivery("dm");
+    openSlackDelivery(store, "dm", third, BOT_TOKEN, failing.fetcher);
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, failing.fetcher);
+    expect(store.load("dm")?.closed).toBe(true);
+
+    const healthy = createFakeSlack();
+    openSlackDelivery(store, "dm", fourth, BOT_TOKEN, healthy.fetcher);
+    applySlackDeliveryEvent(store, "dm", { text: "fourth", type: "text" });
+    await finishSlackDelivery(store, "dm", BOT_TOKEN, healthy.fetcher);
+
+    expect(startStreamThreads(healthy)).toEqual(["171.2", "184.4"]);
+    expect(healthy.markdown()).toBe(`${SLACK_STREAM_FAILURE_NOTICE}fourth`);
+    expect(store.load("dm")?.abandoned).toEqual([]);
+  });
+
   test("replays durable tool events in record order and the reply text exactly once", async () => {
     const slack = createFakeSlack();
     const store = memoryStore();
@@ -1419,7 +1984,6 @@ describe("durable Slack delivery", () => {
       },
       {
         id: "call-1",
-        output: "found three",
         status: "complete",
         title: "search_docs",
         type: "task_update",
@@ -1432,6 +1996,170 @@ describe("durable Slack delivery", () => {
     expect(
       slack.methods().filter((method) => method === "chat.stopStream"),
     ).toHaveLength(1);
+  });
+
+  test("streams no tool step for a binding that hides them, live or replayed", async () => {
+    const binding = {
+      ...slackDeliveryBinding(channelTarget),
+      taskUpdates: "hidden" as const,
+    };
+    const live = createFakeSlack();
+    const liveStore = memoryStore();
+    openSlackDelivery(liveStore, "live", binding, BOT_TOKEN, live.fetcher);
+    streamToolStep(liveStore, "live");
+    await finishSlackDelivery(liveStore, "live", BOT_TOKEN, live.fetcher);
+    const replayed = createFakeSlack();
+    const replayStore = memoryStore();
+    openSlackDelivery(
+      replayStore,
+      "replay",
+      binding,
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+    evictLiveSlackDelivery("replay");
+    streamToolStep(replayStore, "replay");
+    await finishSlackDelivery(
+      replayStore,
+      "replay",
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+
+    for (const slack of [live, replayed]) {
+      expect(slack.taskChunks()).toEqual([]);
+      expect(slack.markdownChunks()).toEqual(["Done."]);
+    }
+  });
+
+  test("closes the reply with the tags and links its binding carries, live or replayed", async () => {
+    const binding = {
+      ...slackDeliveryBinding(channelTarget),
+      links: "https://github.com/o/r/pull/1?a=1&b=2",
+      mentions: "U0ANA U0BEN",
+    };
+    const live = createFakeSlack();
+    const liveStore = memoryStore();
+    openSlackDelivery(liveStore, "live", binding, BOT_TOKEN, live.fetcher);
+    applySlackDeliveryEvent(liveStore, "live", { text: "Done.", type: "text" });
+    await finishSlackDelivery(liveStore, "live", BOT_TOKEN, live.fetcher);
+    const replayed = createFakeSlack();
+    const replayStore = memoryStore();
+    openSlackDelivery(
+      replayStore,
+      "replay",
+      binding,
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+    evictLiveSlackDelivery("replay");
+    applySlackDeliveryEvent(replayStore, "replay", {
+      text: "Done.",
+      type: "text",
+    });
+    await finishSlackDelivery(
+      replayStore,
+      "replay",
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+
+    for (const slack of [live, replayed]) {
+      expect(slack.markdownChunks()).toEqual(["Done."]);
+      expect(closings(slack)).toEqual([
+        "<@U0ANA> <@U0BEN> <https://github.com/o/r/pull/1?a=1&amp;b=2>",
+      ]);
+    }
+  });
+
+  test("closes the reply with each member the turn tagged once, live or replayed", async () => {
+    const binding = {
+      ...slackDeliveryBinding(channelTarget),
+      mentions: "U0ANA",
+    };
+    const live = createFakeSlack();
+    const liveStore = memoryStore();
+    openSlackDelivery(liveStore, "live", binding, BOT_TOKEN, live.fetcher);
+    tagMembers(liveStore, "live");
+    await finishSlackDelivery(liveStore, "live", BOT_TOKEN, live.fetcher);
+    const replayed = createFakeSlack();
+    const replayStore = memoryStore();
+    openSlackDelivery(
+      replayStore,
+      "replay",
+      binding,
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+    evictLiveSlackDelivery("replay");
+    tagMembers(replayStore, "replay");
+    await finishSlackDelivery(
+      replayStore,
+      "replay",
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+
+    for (const slack of [live, replayed]) {
+      expect(slack.markdownChunks()).toEqual(["Tagged."]);
+      expect(closings(slack)).toEqual(["<@U0ANA> <@U0BEN>"]);
+    }
+  });
+
+  test("still closes a failed turn's milestone with its tags and link", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "i1",
+      {
+        ...slackDeliveryBinding(channelTarget),
+        fallbackText: "PR ready",
+        links: "https://github.com/o/r/pull/1",
+        mentions: "U0ANA",
+      },
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("i1");
+
+    await failSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.markdownChunks()).toEqual(["PR ready"]);
+    expect(closings(slack)).toEqual([
+      "<@U0ANA> <https://github.com/o/r/pull/1>",
+    ]);
+  });
+
+  test("a milestone joining the live thread adds its tags and link to the close", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const first = {
+      ...slackDeliveryBinding(channelTarget),
+      fallbackText: "Started",
+      links: "https://example.com/run",
+      mentions: "U0ANA",
+    };
+    openSlackDelivery(store, "i1", first, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(
+      store,
+      "i1",
+      {
+        ...first,
+        fallbackText: "PR ready",
+        links: "https://github.com/o/r/pull/1",
+        mentions: "U0ANA U0BEN",
+      },
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+
+    await finishSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.markdownChunks()).toEqual(["Started\n\nPR ready"]);
+    expect(closings(slack)).toEqual([
+      "<@U0ANA> <@U0BEN> <https://example.com/run> <https://github.com/o/r/pull/1>",
+    ]);
   });
 
   test("tells the user and closes the record when the durable replay fails", async () => {
@@ -1470,6 +2198,414 @@ describe("durable Slack delivery", () => {
     expect(slack.calls).toHaveLength(calls);
   });
 
+  test("appends the failure notice from the durable record once the live stream is evicted", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "i1",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("i1");
+    applySlackDeliveryEvent(store, "i1", {
+      id: "call-1",
+      name: "search_docs",
+      type: "tool-start",
+    });
+    applySlackDeliveryEvent(store, "i1", {
+      text: "partial answer",
+      type: "text",
+    });
+
+    await failSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "partial answer",
+      SLACK_STREAM_FAILURE_NOTICE,
+    ]);
+    expect(
+      slack.methods().filter((method) => method === "chat.stopStream"),
+    ).toHaveLength(1);
+    expect(store.load("i1")?.closed).toBe(true);
+  });
+
+  test("does not grow the durable record when an event arrives after finish", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "i1",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    applySlackDeliveryEvent(store, "i1", { text: "hello", type: "text" });
+
+    await finishSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+    const closed = JSON.stringify(store.load("i1"));
+
+    applySlackDeliveryEvent(store, "i1", { text: " and more", type: "text" });
+    applySlackDeliveryEvent(store, "i1", {
+      id: "call-2",
+      name: "later",
+      type: "tool-start",
+    });
+
+    expect(JSON.stringify(store.load("i1"))).toBe(closed);
+    expect(store.load("i1")?.closed).toBe(true);
+  });
+
+  test("keeps the durable record bounded and merged while a long reply streams", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "i1",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    for (let index = 0; index < 2500; index += 1) {
+      applySlackDeliveryEvent(store, "i1", { text: "abcd", type: "text" });
+    }
+    await finishSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+
+    const record = store.load("i1");
+    expect(record?.replyText).toHaveLength(
+      MAX_SLACK_MESSAGE_LENGTH + STREAM_TAIL_LENGTH,
+    );
+    expect(
+      record?.events.filter((event) => event.type === "text"),
+    ).toHaveLength(1);
+  });
+
+  test("replays a long reply as the same text the live stream sends", async () => {
+    const answer = markedAnswer(6007);
+    const expected = `${answer.slice(0, MAX_SLACK_MESSAGE_LENGTH - 20)}\n\n(truncated)`;
+    const deltas = Array.from(
+      { length: Math.ceil(answer.length / 997) },
+      (_unused, index) => answer.slice(index * 997, index * 997 + 997),
+    );
+    const liveSlack = createFakeSlack();
+    const liveStore = serializingStore();
+    openSlackDelivery(
+      liveStore,
+      "live",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      liveSlack.fetcher,
+    );
+    for (const text of deltas) {
+      applySlackDeliveryEvent(liveStore, "live", { text, type: "text" });
+    }
+    await finishSlackDelivery(liveStore, "live", BOT_TOKEN, liveSlack.fetcher);
+
+    const replaySlack = createFakeSlack();
+    const replayStore = serializingStore();
+    openSlackDelivery(
+      replayStore,
+      "replay",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      replaySlack.fetcher,
+    );
+    evictLiveSlackDelivery("replay");
+    for (const text of deltas) {
+      applySlackDeliveryEvent(replayStore, "replay", { text, type: "text" });
+    }
+    await finishSlackDelivery(
+      replayStore,
+      "replay",
+      BOT_TOKEN,
+      replaySlack.fetcher,
+    );
+
+    expect(expected).toContain("HEAD>");
+    expect(expected).not.toContain("<TAIL");
+    expect(liveSlack.markdown()).toBe(expected);
+    expect(replaySlack.markdown()).toBe(expected);
+    expect(replayStore.load("replay")?.replyText).toBe(
+      answer.slice(0, MAX_SLACK_MESSAGE_LENGTH + STREAM_TAIL_LENGTH),
+    );
+  });
+
+  test("does not leave a lone surrogate when a pair straddles the durable cap", async () => {
+    const cap = MAX_SLACK_MESSAGE_LENGTH + STREAM_TAIL_LENGTH;
+    const head = "a".repeat(cap - 1);
+    const slack = createFakeSlack();
+    const store = serializingStore();
+    openSlackDelivery(
+      store,
+      "surrogate",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    applySlackDeliveryEvent(store, "surrogate", {
+      text: `${head}\uD83D`,
+      type: "text",
+    });
+    applySlackDeliveryEvent(store, "surrogate", {
+      text: "\uDE00 and the rest of the answer",
+      type: "text",
+    });
+    await finishSlackDelivery(store, "surrogate", BOT_TOKEN, slack.fetcher);
+
+    const record = store.load("surrogate");
+    expect(record?.replyText).toBe(head);
+    expect(record?.replyText).not.toMatch(LONE_SURROGATE);
+    expect(record?.events.find((event) => event.type === "text")?.text).toBe(
+      head,
+    );
+  });
+
+  test("delivers the buffered text after an eviction instead of the fallback", async () => {
+    const answer = "a".repeat(50);
+    const slack = createFakeSlack();
+    const store = serializingStore();
+    openSlackDelivery(
+      store,
+      "evicted",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    applySlackDeliveryEvent(store, "evicted", { text: answer, type: "text" });
+    evictLiveSlackDelivery("evicted");
+    await finishSlackDelivery(store, "evicted", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.markdown()).toBe(answer);
+    expect(slack.markdown()).not.toContain(SLACK_DELIVERY_FALLBACK);
+  });
+
+  test("waits out a window that blocks the alarm replay's startStream", async () => {
+    const slack = createFakeSlack(
+      { "chat.startStream": "rate_limited" },
+      { status: 429, windowMs: 1500 },
+    );
+    const store = serializingStore();
+    openSlackDelivery(
+      store,
+      "blocked-replay",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("blocked-replay");
+    applySlackDeliveryEvent(store, "blocked-replay", {
+      text: "hello",
+      type: "text",
+    });
+    const started = performance.now();
+    await finishSlackDelivery(
+      store,
+      "blocked-replay",
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    const elapsed = performance.now() - started;
+
+    expect(slack.acceptedChunks()).toEqual(["hello"]);
+    expect(slack.acceptedMethods().at(-1)).toBe("chat.stopStream");
+    expect(elapsed).toBeGreaterThanOrEqual(1200);
+    expect(elapsed).toBeLessThan(6000);
+  }, 20_000);
+
+  test("saves the coalesced text when the flush timer fires", async () => {
+    const answer = "b".repeat(50);
+    const slack = createFakeSlack();
+    const store = serializingStore();
+    openSlackDelivery(
+      store,
+      "timer",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    const saves = store.saves();
+    applySlackDeliveryEvent(store, "timer", { text: answer, type: "text" });
+
+    expect(store.load("timer")?.replyText).toBe("");
+    await Bun.sleep(COALESCE_MS + 100);
+    expect(store.saves()).toBe(saves + 1);
+    expect(store.load("timer")?.replyText).toBe(answer);
+
+    evictLiveSlackDelivery("timer");
+    await finishSlackDelivery(store, "timer", BOT_TOKEN, slack.fetcher);
+    expect(slack.markdown()).toBe(answer);
+  });
+
+  test("anchors the flush timer to the first pending delta, not the last", async () => {
+    const slack = createFakeSlack();
+    const store = serializingStore();
+    openSlackDelivery(
+      store,
+      "anchor",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    applySlackDeliveryEvent(store, "anchor", { text: "one ", type: "text" });
+    await Bun.sleep(120);
+    applySlackDeliveryEvent(store, "anchor", { text: "two ", type: "text" });
+    await Bun.sleep(120);
+    applySlackDeliveryEvent(store, "anchor", { text: "three", type: "text" });
+    await Bun.sleep(COALESCE_MS - 120);
+
+    expect(store.load("anchor")?.replyText).toBe("one two three");
+
+    evictLiveSlackDelivery("anchor");
+    await finishSlackDelivery(store, "anchor", BOT_TOKEN, slack.fetcher);
+  });
+
+  test("delivers the same reply text on the durable finish and fail paths", async () => {
+    const events: SlackDeliveryEvent[] = [
+      { text: "partial ", type: "text" },
+      { id: "call-1", name: "search_docs", type: "tool-start" },
+      { text: "answer", type: "text" },
+    ];
+    const finishSlack = createFakeSlack();
+    const finishStore = serializingStore();
+    openSlackDelivery(
+      finishStore,
+      "finished",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      finishSlack.fetcher,
+    );
+    evictLiveSlackDelivery("finished");
+    const failSlack = createFakeSlack();
+    const failStore = serializingStore();
+    openSlackDelivery(
+      failStore,
+      "failed",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      failSlack.fetcher,
+    );
+    evictLiveSlackDelivery("failed");
+    for (const event of events) {
+      applySlackDeliveryEvent(finishStore, "finished", event);
+      applySlackDeliveryEvent(failStore, "failed", event);
+    }
+
+    await finishSlackDelivery(
+      finishStore,
+      "finished",
+      BOT_TOKEN,
+      finishSlack.fetcher,
+    );
+    await failSlackDelivery(failStore, "failed", BOT_TOKEN, failSlack.fetcher);
+
+    expect(finishSlack.acceptedChunks()).toEqual(["partial answer"]);
+    expect(failSlack.acceptedChunks()).toEqual([
+      "partial answer",
+      SLACK_STREAM_FAILURE_NOTICE,
+    ]);
+  });
+
+  // The durable record keeps the reply text twice: merged for the finish path
+  // and as text events for the fail path. Both must be the same capped text,
+  // or the two paths only agree while the stream clips them the same.
+  test("caps the events' text to the merged reply text past the durable cap", () => {
+    const answer = markedAnswer(6007);
+    const slack = createFakeSlack();
+    const store = serializingStore();
+    openSlackDelivery(
+      store,
+      "cap",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("cap");
+    applySlackDeliveryEvent(store, "cap", {
+      text: answer.slice(0, 4000),
+      type: "text",
+    });
+    applySlackDeliveryEvent(store, "cap", {
+      id: "call-1",
+      name: "search_docs",
+      type: "tool-start",
+    });
+    applySlackDeliveryEvent(store, "cap", {
+      text: answer.slice(4000),
+      type: "text",
+    });
+
+    const record = store.load("cap");
+    const eventsText = (record?.events ?? [])
+      .filter((event) => event.type === "text")
+      .map((event) => event.text)
+      .join("");
+    const replyText = record?.replyText ?? "";
+    expect(replyText).toHaveLength(
+      MAX_SLACK_MESSAGE_LENGTH + STREAM_TAIL_LENGTH,
+    );
+    expect(eventsText).toBe(replyText);
+  });
+
+  // The fail path replays the record's text events in record order and the
+  // finish path posts the merged reply text, so the two sources stop agreeing
+  // past the durable cap: the concatenated events keep growing while the
+  // merged text is clipped. What the user reads must not depend on which path
+  // closed the record.
+  test("replays the same reply text on both durable paths past the durable cap", async () => {
+    const answer = markedAnswer(6007);
+    const events: SlackDeliveryEvent[] = [
+      { text: answer.slice(0, 4000), type: "text" },
+      { id: "call-1", name: "search_docs", type: "tool-start" },
+      { text: answer.slice(4000), type: "text" },
+    ];
+    const expected = `${answer.slice(0, MAX_SLACK_MESSAGE_LENGTH - 20)}\n\n(truncated)`;
+    const finishSlack = createFakeSlack();
+    const finishStore = serializingStore();
+    openSlackDelivery(
+      finishStore,
+      "finished",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      finishSlack.fetcher,
+    );
+    evictLiveSlackDelivery("finished");
+    const failSlack = createFakeSlack();
+    const failStore = serializingStore();
+    openSlackDelivery(
+      failStore,
+      "failed",
+      slackDeliveryBinding(channelTarget),
+      BOT_TOKEN,
+      failSlack.fetcher,
+    );
+    evictLiveSlackDelivery("failed");
+    for (const event of events) {
+      applySlackDeliveryEvent(finishStore, "finished", event);
+      applySlackDeliveryEvent(failStore, "failed", event);
+    }
+    const finished = finishStore.load("finished");
+    const failed = failStore.load("failed");
+    expect(finished).toEqual(failed);
+    expect(finished?.replyText.length).toBe(
+      MAX_SLACK_MESSAGE_LENGTH + STREAM_TAIL_LENGTH,
+    );
+
+    await finishSlackDelivery(
+      finishStore,
+      "finished",
+      BOT_TOKEN,
+      finishSlack.fetcher,
+    );
+    await failSlackDelivery(failStore, "failed", BOT_TOKEN, failSlack.fetcher);
+
+    expect(finished?.replyText).not.toContain("<TAIL");
+    expect(finishSlack.markdown()).toBe(expected);
+    expect(failSlack.markdown()).toBe(
+      `${expected}${SLACK_STREAM_FAILURE_NOTICE}`,
+    );
+  });
+
   test("does not throw or double-post when finish hits a Slack error and is retried", async () => {
     const slack = createFakeSlack({ "chat.stopStream": "channel_not_found" });
     const store = memoryStore();
@@ -1490,5 +2626,121 @@ describe("durable Slack delivery", () => {
     expect(
       slack.methods().filter((method) => method === "chat.startStream"),
     ).toHaveLength(1);
+  });
+
+  const fallbackBinding = () => ({
+    ...slackDeliveryBinding(channelTarget),
+    fallbackText: "Kicked off\nhttps://example.com/run",
+  });
+
+  test("posts the delivery's fallback text in place of the failure notice", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "narration",
+      fallbackBinding(),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    applySlackDeliveryEvent(store, "narration", {
+      text: "partial narration",
+      type: "text",
+    });
+    await failSlackDelivery(store, "narration", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "partial narration",
+      "Kicked off\nhttps://example.com/run",
+    ]);
+  });
+
+  test("posts the delivery's fallback text when the turn produced no reply", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "empty",
+      fallbackBinding(),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    await finishSlackDelivery(store, "empty", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "Kicked off\nhttps://example.com/run",
+    ]);
+    expect(slack.markdown()).not.toContain(SLACK_DELIVERY_FALLBACK);
+  });
+
+  test("replays the delivery's fallback text from the durable record", async () => {
+    const slack = createFakeSlack();
+    const store = serializingStore();
+    openSlackDelivery(
+      store,
+      "durable",
+      fallbackBinding(),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("durable");
+    applySlackDeliveryEvent(store, "durable", {
+      text: "partial narration",
+      type: "text",
+    });
+
+    await failSlackDelivery(store, "durable", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "partial narration",
+      "Kicked off\nhttps://example.com/run",
+    ]);
+    expect(slack.markdown()).not.toContain(SLACK_STREAM_FAILURE_NOTICE);
+  });
+
+  test("owes the thread every fallback text that joined its response", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const later = { ...fallbackBinding(), fallbackText: "Opened the PR" };
+    openSlackDelivery(
+      store,
+      "joined",
+      fallbackBinding(),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    openSlackDelivery(store, "joined", later, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(store, "joined", later, BOT_TOKEN, slack.fetcher);
+    await failSlackDelivery(store, "joined", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "Kicked off\nhttps://example.com/run\n\nOpened the PR",
+    ]);
+  });
+
+  test("answers a Slack call that broke with the delivery's fallback text", async () => {
+    const slack = createFakeSlack(
+      { "chat.appendStream": "invalid_chunks" },
+      { limit: 1, skip: 1 },
+    );
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "broke",
+      fallbackBinding(),
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    applySlackDeliveryEvent(store, "broke", {
+      text: "a".repeat(COALESCE_CHARS),
+      type: "text",
+    });
+    await finishSlackDelivery(store, "broke", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.acceptedChunks()).toEqual([
+      "a".repeat(STREAM_TAIL_LENGTH),
+      "Kicked off\nhttps://example.com/run",
+    ]);
+    expect(slack.markdown()).not.toContain(SLACK_STREAM_FAILURE_NOTICE);
   });
 });

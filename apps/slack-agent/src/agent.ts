@@ -4,47 +4,110 @@ import { env } from "cloudflare:workers";
 import {
   applySlackDeliveryEvent,
   composeInstructions,
+  createApprovalFetch,
+  createApprovalNotifier,
+  createApprovalStore,
+  createSlackMentionTool,
+  createSlackReadTools,
+  createSqlSlackChannelAdmissionStore,
   createSqlSlackDeliveryStore,
+  createSqlSlackReadCursorStore,
   expireLatest,
   failSlackDelivery,
   finishSlackDelivery,
   openSlackDelivery,
+  readChannelBeforeMention,
   replaceRetention,
   slackDeliveryBindingSchema,
   slackEventFromObservation,
 } from "@agentic-slack/core";
 import type {
+  ApprovalGateContext,
   ExpiryPayload,
   ExpirySchedule,
   SlackDeliveryBinding,
   SlackDeliveryStore,
+  SlackReadOptions,
 } from "@agentic-slack/core";
 import {
   observe,
   useAgentFinish,
   useAgentStart,
-  useInitialData,
+  useDelivery,
   useInstruction,
+  useMcpConnection,
   useModel,
+  useSkill,
+  useTool,
 } from "@flue/runtime";
-import type { AgentProps, FlueObservation } from "@flue/runtime";
+import type {
+  AgentProps,
+  FlueObservation,
+  McpConnectionDefinition,
+} from "@flue/runtime";
 import { extend, getCloudflareContext } from "@flue/runtime/cloudflare";
 import * as v from "valibot";
 import config from "../agent.config.ts";
 
-const deliveryStore = (): SlackDeliveryStore =>
-  createSqlSlackDeliveryStore(getCloudflareContext().storage.sql);
+// Rebuilding the store re-runs its CREATE TABLE on every observation, and one
+// isolate can host several Durable Objects, so the cache is keyed by storage.
+const deliveryStores = new WeakMap<object, SlackDeliveryStore>();
+
+const deliveryStore = (): SlackDeliveryStore => {
+  const { sql } = getCloudflareContext().storage;
+  const cached = deliveryStores.get(sql);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const store = createSqlSlackDeliveryStore(sql);
+  deliveryStores.set(sql, store);
+  return store;
+};
 
 const botToken = (): string => env.SLACK_BOT_TOKEN;
 
-export const startSlackTurnDelivery = (
+const workerSecret = (name: string): string =>
+  v.parse(v.object({ [name]: v.pipe(v.string(), v.nonEmpty()) }), env)[name];
+
+// Flue mounts an MCP server's tools whole, and a gated call has to be stopped
+// on its way to the server, so the approval sits in the connection's transport
+// instead of in the tool set: the gate sees the exact call, refuses it before
+// anything leaves the Worker, and forwards it once a person approves that call.
+const approvalFetch = (
+  requireApproval: readonly string[],
+  instanceId: string,
+) => {
+  const context = (): ApprovalGateContext | undefined => {
+    const record = deliveryStore().load(instanceId);
+    if (record === undefined) {
+      return undefined;
+    }
+    return {
+      appId: env.SLACK_APP_ID,
+      channelId: record.binding.channelId,
+      conversationId: instanceId,
+      requesterId: record.binding.recipientUserId,
+      surface: record.binding.surface,
+      teamId: record.binding.recipientTeamId,
+      threadTs: record.binding.threadTs,
+    };
+  };
+  return createApprovalFetch({
+    context,
+    gated: (tool) => requireApproval.includes(tool),
+    notifier: createApprovalNotifier(botToken()),
+    store: createApprovalStore(env.DB),
+  });
+};
+
+const startSlackTurnDelivery = (
   instanceId: string,
   binding: SlackDeliveryBinding,
 ): void => {
   openSlackDelivery(deliveryStore(), instanceId, binding, botToken());
 };
 
-export const observeSlackTurnDelivery = (
+const observeSlackTurnDelivery = (
   event: FlueObservation,
 ): void | Promise<void> => {
   const instanceId = event.instanceId ?? "";
@@ -57,7 +120,7 @@ export const observeSlackTurnDelivery = (
   }
 };
 
-export const finishSlackTurnDelivery = (instanceId: string): Promise<void> =>
+const finishSlackTurnDelivery = (instanceId: string): Promise<void> =>
   finishSlackDelivery(deliveryStore(), instanceId, botToken());
 
 observe(observeSlackTurnDelivery);
@@ -67,14 +130,93 @@ export const SlackAgent = (props: AgentProps) => {
   for (const instruction of composeInstructions(config)) {
     useInstruction(instruction);
   }
-  const bound = useInitialData<SlackDeliveryBinding | undefined>();
+  for (const skill of config.skills) {
+    useSkill(skill);
+  }
+  for (const { authSecret, requireApproval, ...server } of config.mcpServers) {
+    const connection: McpConnectionDefinition = { ...server };
+    if (authSecret !== undefined) {
+      connection.auth = () => workerSecret(authSecret);
+    }
+    if (requireApproval !== undefined && requireApproval.length > 0) {
+      // Flue types the transport's fetch as the global one, which also carries
+      // the runtime's `preconnect` hint; forwarding it keeps the wrapper
+      // indistinguishable from the fetch it replaces.
+      connection.fetch = Object.assign(
+        approvalFetch(requireApproval, props.id),
+        { preconnect: fetch.preconnect },
+      );
+    }
+    useMcpConnection(connection);
+  }
+  const delivery = useDelivery();
+  if (config.read !== undefined && delivery.kind === "signal") {
+    const slack = v.safeParse(slackDeliveryBindingSchema, delivery.attributes);
+    if (slack.success) {
+      const readOptions: SlackReadOptions = {
+        admissionStore: createSqlSlackChannelAdmissionStore(env.DB),
+        cursorStore: createSqlSlackReadCursorStore(env.DB),
+        lookbackSeconds: config.read.lookbackSeconds,
+        maxMessages: config.read.maxMessages,
+        token: botToken(),
+      };
+      const tools = createSlackReadTools(
+        {
+          channelId: slack.output.channelId,
+          readsMemberChannels:
+            slack.output.surface === "private" &&
+            config.allowedUserIds.includes(slack.output.recipientUserId),
+          surface: slack.output.surface,
+          threadTs: slack.output.threadTs,
+        },
+        readOptions,
+      );
+      for (const tool of tools) {
+        useTool(tool);
+      }
+      if (slack.output.surface === "channel") {
+        useTool(
+          createSlackMentionTool(
+            slack.output.channelId,
+            { token: botToken() },
+            (userId) => {
+              applySlackDeliveryEvent(deliveryStore(), props.id, {
+                type: "mention",
+                userId,
+              });
+            },
+          ),
+        );
+      }
+      if (
+        slack.output.surface === "channel" &&
+        delivery.attributes?.message_ts === slack.output.threadTs
+      ) {
+        const mention = {
+          channelId: slack.output.channelId,
+          ts: slack.output.threadTs,
+        };
+        const { attributes } = delivery;
+        // Flue's delivery cursor moves onto an appended signal, and every
+        // later render mounts its tools from that signal's attributes.
+        useAgentStart(async ({ append, signal }) => {
+          append({
+            attributes,
+            body: await readChannelBeforeMention(mention, readOptions, signal),
+            kind: "signal",
+            type: "slack.channel_context",
+          });
+        });
+      }
+    }
+  }
   useAgentStart(() => {
-    if (bound === undefined) {
+    if (delivery.kind !== "signal") {
       return;
     }
     startSlackTurnDelivery(
       props.id,
-      v.parse(slackDeliveryBindingSchema, bound),
+      v.parse(slackDeliveryBindingSchema, delivery.attributes),
     );
   });
   useAgentFinish(async () => {
@@ -82,7 +224,6 @@ export const SlackAgent = (props: AgentProps) => {
   });
   return `${config.name}: ${config.description}`;
 };
-SlackAgent.initialData = slackDeliveryBindingSchema;
 
 interface RetentionAgent {
   listSchedules: () => Promise<readonly ExpirySchedule[]>;

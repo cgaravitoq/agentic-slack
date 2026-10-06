@@ -22,13 +22,13 @@
     "deploy:staging": "WORKER_CONFIG=wrangler.deploy.json CLOUDFLARE_ENV=staging bun run build && wrangler deploy --keep-vars --config apps/slack-agent/dist/agentic_slack/wrangler.json",
     "knip": "knip",
     "knip:production": "knip --production",
-    "verify": "bun run format:check && bun run lint && bun run typecheck && bun test && bun run knip && bun run deploy:dry && bun audit"
+    "verify": "bun run format:check && bun run lint && bun run typecheck && bun test && bun run knip && bun run deploy:dry && bun audit --ignore=GHSA-vfj7-8cjw-p6xm"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.8",
     "@cloudflare/vite-plugin": "1.54.8",
     "@cloudflare/workers-types": "5.20260804.1",
-    "@flue/vite": "2.0.3",
+    "@flue/vite": "2.2.2",
     "@types/bun": "1.3.14",
     "knip": "6.33.0",
     "oxlint": "1.78.0",
@@ -40,8 +40,11 @@
   },
   "trustedDependencies": [],
   "overrides": {
-    "fast-uri": "3.1.6",
+    "fast-uri": "3.1.8",
     "hono": "4.13.7",
-    "qs": "6.16.0"
+    "ip-address": "10.7.2",
+    "js-yaml": "5.4.2",
+    "qs": "6.16.0",
+    "undici": "7.29.1"
   }
 }

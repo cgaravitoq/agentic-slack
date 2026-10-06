@@ -1,22 +1,33 @@
 const SEEN_EVENT_RETENTION_SECONDS = 7 * 24 * 60 * 60;
+const SWEEP_BATCH_LIMIT = 1000;
+
+const currentUnixSeconds = (): number => Math.floor(Date.now() / 1000);
 
 export const claimEvent = async (
   db: D1Database,
   eventId: string,
+  now: number = currentUnixSeconds(),
 ): Promise<boolean> => {
   const result = await db
     .prepare(
-      "INSERT INTO seen_events (event_id, created_at) VALUES (?1, unixepoch()) ON CONFLICT DO NOTHING",
+      "INSERT INTO seen_events (event_id, created_at) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
     )
-    .bind(eventId)
+    .bind(eventId, now)
     .run();
   if (result.meta.changes === 0) {
     return false;
   }
-  await db
-    .prepare("DELETE FROM seen_events WHERE created_at < unixepoch() - ?1")
-    .bind(SEEN_EVENT_RETENTION_SECONDS)
-    .run();
+  try {
+    await db
+      .prepare(
+        "DELETE FROM seen_events WHERE rowid IN (SELECT rowid FROM seen_events WHERE created_at < ?1 LIMIT ?2)",
+      )
+      .bind(now - SEEN_EVENT_RETENTION_SECONDS, SWEEP_BATCH_LIMIT)
+      .run();
+  } catch (error) {
+    // The claim already committed; propagating would fail the claim, so Slack's retry would deduplicate to changes === 0 and drop the event.
+    console.error("seen_events retention sweep failed", error);
+  }
   return true;
 };
 
@@ -33,7 +44,7 @@ export const releaseEvent = async (
 export const claimAndRun = async (
   db: D1Database,
   eventId: string,
-  run: () => Promise<void>,
+  run: () => Promise<void> | void,
 ): Promise<void> => {
   if (!(await claimEvent(db, eventId))) {
     return;

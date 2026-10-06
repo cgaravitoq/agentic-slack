@@ -1,8 +1,13 @@
 import { createSlackChannel } from "@flue/slack";
 import type {
+  SlackBlockActionsPayload,
+  SlackEvent,
   SlackEventCallbackPayload,
   SlackEventsApiPayload,
 } from "@flue/slack";
+import * as v from "valibot";
+import { MODEL_PROVIDER_CLOUDFLARE } from "./config.ts";
+import type { ModelProvider } from "./config.ts";
 import { claimAndRun } from "./dedup.ts";
 import type {
   ConversationLifecycleAgent,
@@ -25,10 +30,15 @@ const isEventCallbackEnvelope = (
   payload.api_app_id !== "" &&
   payload.event_id !== "";
 
+export interface ModelBrokerBinding {
+  fetch: (request: Request) => Promise<Response>;
+}
+
 export interface SlackCoreBindings {
   DB: D1Database;
   FLUE_SLACK_AGENT_AGENT: DurableObjectNamespace<ConversationLifecycleAgent>;
   AI: Ai;
+  MODEL_BROKER: ModelBrokerBinding;
 }
 
 export interface TrustedSlackConfig {
@@ -36,6 +46,7 @@ export interface TrustedSlackConfig {
   botToken: string;
   teamId: string;
   appId: string;
+  allowedUserIds?: readonly string[];
 }
 
 export interface RoutedSlackTurn {
@@ -58,9 +69,23 @@ export interface RoutedSlackLifecycle {
   appId: string;
   channelId: string;
   threadTs: string;
+  userId: string;
 }
 
-export type RoutedSlackEvent = RoutedSlackTurn | RoutedSlackLifecycle;
+export interface RoutedSlackMembership {
+  kind: "membership";
+  eventId: string;
+  teamId: string;
+  appId: string;
+  channelId: string;
+  userId: string;
+  inviterId: string;
+}
+
+export type RoutedSlackEvent =
+  | RoutedSlackTurn
+  | RoutedSlackLifecycle
+  | RoutedSlackMembership;
 
 const conversationInstanceRef = (turn: RoutedSlackTurn) => ({
   channelId: turn.channelId,
@@ -72,48 +97,43 @@ export interface SlackCoreEnv {
   Bindings: SlackCoreBindings;
 }
 
-const routeSlackEvent = (
-  payload: SlackEventsApiPayload,
-): RoutedSlackEvent | null => {
-  if (!isEventCallbackEnvelope(payload)) {
+interface SlackMessageEvent {
+  readonly bot_id?: string;
+  readonly bot_profile?: unknown;
+  readonly channel: string;
+  readonly text?: string;
+  readonly thread_ts?: string;
+  readonly ts: string;
+  readonly user?: string;
+}
+
+const mentionTurn = (
+  payload: SlackEventCallbackPayload,
+  event: Extract<SlackEvent, { type: "app_mention" }>,
+): RoutedSlackTurn | null => {
+  const text = event.text?.replace(LEADING_MENTION_RE, "").trim();
+  const { user } = event;
+  if (isBotEvent(event) || user === undefined || user === "" || !text) {
     return null;
   }
-  const { event } = payload;
-  if (event.type === "assistant_thread_started") {
-    return {
-      appId: payload.api_app_id,
-      channelId: event.assistant_thread.channel_id,
-      eventId: payload.event_id,
-      kind: "lifecycle",
-      teamId: payload.team_id,
-      threadTs: event.assistant_thread.thread_ts,
-    };
-  }
-  if (event.type === "app_mention") {
-    const text = event.text?.replace(LEADING_MENTION_RE, "").trim();
-    const { user } = event;
-    if (isBotEvent(event) || user === undefined || user === "" || !text) {
-      return null;
-    }
-    return {
-      appId: payload.api_app_id,
-      channelId: event.channel,
-      eventId: payload.event_id,
-      kind: "turn",
-      messageTs: event.ts,
-      surface: "channel",
-      teamId: payload.team_id,
-      text,
-      threadTs: event.thread_ts ?? event.ts,
-      userId: user,
-    };
-  }
-  if (event.type !== "message") {
-    return null;
-  }
-  if (event.subtype !== undefined || event.channel_type !== "im") {
-    return null;
-  }
+  return {
+    appId: payload.api_app_id,
+    channelId: event.channel,
+    eventId: payload.event_id,
+    kind: "turn",
+    messageTs: event.ts,
+    surface: "channel",
+    teamId: payload.team_id,
+    text,
+    threadTs: event.thread_ts ?? event.ts,
+    userId: user,
+  };
+};
+
+const directMessageTurn = (
+  payload: SlackEventCallbackPayload,
+  event: SlackMessageEvent,
+): RoutedSlackTurn | null => {
   const text = event.text?.trim() ?? "";
   const { user } = event;
   if (isBotEvent(event) || user === undefined || user === "" || text === "") {
@@ -133,9 +153,83 @@ const routeSlackEvent = (
   };
 };
 
+const routeSlackEvent = (
+  payload: SlackEventsApiPayload,
+): RoutedSlackEvent | null => {
+  if (!isEventCallbackEnvelope(payload)) {
+    return null;
+  }
+  const { event } = payload;
+  if (event.type === "assistant_thread_started") {
+    return {
+      appId: payload.api_app_id,
+      channelId: event.assistant_thread.channel_id,
+      eventId: payload.event_id,
+      kind: "lifecycle",
+      teamId: payload.team_id,
+      threadTs: event.assistant_thread.thread_ts,
+      userId: event.assistant_thread.user_id,
+    };
+  }
+  if (event.type === "member_joined_channel") {
+    const { user } = event;
+    if (user === undefined || user === "") {
+      return null;
+    }
+    return {
+      appId: payload.api_app_id,
+      channelId: event.channel,
+      eventId: payload.event_id,
+      inviterId: event.inviter ?? "",
+      kind: "membership",
+      teamId: payload.team_id,
+      userId: user,
+    };
+  }
+  if (event.type === "app_mention") {
+    return mentionTurn(payload, event);
+  }
+  if (event.type !== "message") {
+    return null;
+  }
+  if (event.subtype !== undefined || event.channel_type !== "im") {
+    return null;
+  }
+  return directMessageTurn(payload, event);
+};
+
+const ack = (status: number): Response => new Response(null, { status });
+
+const claimThenAcknowledge = async (
+  db: D1Database,
+  eventId: string,
+  run: () => Promise<void> | void,
+): Promise<Response> => {
+  try {
+    await claimAndRun(db, eventId, run);
+    return ack(200);
+  } catch (error: unknown) {
+    console.error("Slack event handling failed", error);
+    return ack(500);
+  }
+};
+
+export const workerSecretValue = (
+  bindings: Partial<SlackCoreBindings>,
+  name: string,
+): string | undefined => {
+  const parsed = v.safeParse(
+    v.object({ [name]: v.pipe(v.string(), v.nonEmpty()) }),
+    bindings,
+  );
+  return parsed.success ? parsed.output[name] : undefined;
+};
+
 export const missingReadiness = (
   trusted: TrustedSlackConfig,
   bindings: Partial<SlackCoreBindings>,
+  modelProvider: ModelProvider,
+  progressSecret?: string,
 ): string[] => {
   const missing: string[] = [];
   if (!trusted.signingSecret) {
@@ -156,8 +250,18 @@ export const missingReadiness = (
   if (!bindings.FLUE_SLACK_AGENT_AGENT) {
     missing.push("FLUE_SLACK_AGENT_AGENT");
   }
-  if (!bindings.AI) {
-    missing.push("AI");
+  if (modelProvider === MODEL_PROVIDER_CLOUDFLARE) {
+    if (!bindings.AI) {
+      missing.push("AI");
+    }
+  } else if (!bindings.MODEL_BROKER) {
+    missing.push("MODEL_BROKER");
+  }
+  if (
+    progressSecret !== undefined &&
+    workerSecretValue(bindings, progressSecret) === undefined
+  ) {
+    missing.push(progressSecret);
   }
   return missing;
 };
@@ -172,7 +276,15 @@ export const createSlackIngress = (
   handleLifecycle?: (
     lifecycle: RoutedSlackLifecycle,
     env: SlackCoreBindings,
+  ) => Promise<void> | void,
+  handleInteraction?: (
+    payload: SlackBlockActionsPayload,
+    env: SlackCoreBindings,
   ) => Promise<void>,
+  handleMembership?: (
+    membership: RoutedSlackMembership,
+    env: SlackCoreBindings,
+  ) => Promise<void> | void,
 ) => {
   const identityComplete = Boolean(
     trusted.signingSecret &&
@@ -180,10 +292,14 @@ export const createSlackIngress = (
       trusted.teamId &&
       trusted.appId,
   );
+  const allowedUserIds = trusted.allowedUserIds ?? [];
+  // `createSlackChannel` mounts `/interactions` only for a handler it is given,
+  // so a deployment with no decision handler exposes no endpoint whose only
+  // answer is 200.
   const channel = createSlackChannel<SlackCoreEnv>({
-    events({ c, payload }) {
+    async events({ c, payload }): Promise<Response> {
       if (!identityComplete) {
-        return;
+        return ack(200);
       }
       const routed = routeSlackEvent(payload);
       if (
@@ -191,30 +307,59 @@ export const createSlackIngress = (
         routed.teamId !== trusted.teamId ||
         routed.appId !== trusted.appId
       ) {
-        return;
+        return ack(200);
       }
-      const run =
-        routed.kind === "turn"
-          ? () =>
-              handleTurn(
-                routed,
-                channel.instanceId(conversationInstanceRef(routed)),
-                c.env,
-              )
-          : handleLifecycle && (() => handleLifecycle(routed, c.env));
-      if (!run) {
-        return;
+      // A refused user is answered like a foreign workspace: before the claim,
+      // so no row, reaction, reply or model call can ever follow the event. A
+      // membership event names the member that joined rather than the inviter
+      // it is judged by, so its decision belongs to the membership handler.
+      if (
+        routed.kind !== "membership" &&
+        allowedUserIds.length > 0 &&
+        !allowedUserIds.includes(routed.userId)
+      ) {
+        return ack(200);
       }
-      c.executionCtx.waitUntil(
-        (async () => {
-          try {
-            await claimAndRun(c.env.DB, routed.eventId, run);
-          } catch (error: unknown) {
-            console.error("Slack event handling failed", error);
-          }
-        })(),
-      );
+      const claim = (work: () => Promise<void> | void): Promise<Response> =>
+        claimThenAcknowledge(c.env.DB, routed.eventId, work);
+      if (routed.kind === "turn") {
+        return await claim(() =>
+          handleTurn(
+            routed,
+            channel.instanceId(conversationInstanceRef(routed)),
+            c.env,
+          ),
+        );
+      }
+      if (routed.kind === "membership") {
+        return handleMembership === undefined
+          ? ack(200)
+          : await claim(() => handleMembership(routed, c.env));
+      }
+      return handleLifecycle === undefined
+        ? ack(200)
+        : await claim(() => handleLifecycle(routed, c.env));
     },
+    interactions:
+      handleInteraction === undefined
+        ? undefined
+        : async ({ c, payload }): Promise<Response> => {
+            if (
+              !identityComplete ||
+              payload.type !== "block_actions" ||
+              payload.team?.id !== trusted.teamId ||
+              payload.api_app_id !== trusted.appId
+            ) {
+              return ack(200);
+            }
+            try {
+              await handleInteraction(payload, c.env);
+              return ack(200);
+            } catch (error: unknown) {
+              console.error("Slack interaction handling failed", error);
+              return ack(500);
+            }
+          },
     signingSecret: identityComplete
       ? trusted.signingSecret
       : DISABLED_SIGNING_SECRET,

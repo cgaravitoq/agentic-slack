@@ -1,18 +1,30 @@
 import { afterAll, beforeEach, expect, mock, test } from "bun:test";
-import { slackDeliveryBindingSchema } from "@agentic-slack/core";
+import {
+  defineAgentConfig,
+  slackDeliveryBindingSchema,
+} from "@agentic-slack/core";
+import type { ModelBrokerBinding } from "@agentic-slack/core";
 import {
   evictLiveSlackDelivery,
   SLACK_DELIVERY_FALLBACK,
 } from "../../../packages/core/src/delivery.ts";
+import { slackInstanceId } from "../../../packages/core/src/progress.ts";
 import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
 import type {
   Agent,
   ConversationStreamChunk,
+  DeliveredMessage,
   DispatchReceipt,
+  FlueEventContext,
   FlueObservation,
+  FlueObservationSubscriber,
 } from "@flue/runtime";
 import * as v from "valibot";
-import { mockCloudflareWorkers, mockWorkersAi } from "./module-mocks.ts";
+import {
+  mockCloudflareWorkers,
+  mockWorkersAi,
+  workerWaitUntil,
+} from "./module-mocks.ts";
 
 const BOT_TOKEN = "xoxb-worker-token";
 const SIGNING_SECRET = "signing-secret-for-tests-1234567890";
@@ -41,6 +53,7 @@ interface HandleDispatchRequest {
 
 const slackCalls: SlackCall[] = [];
 const dispatched: { instanceId: string; request: HandleDispatchRequest }[] = [];
+const retentionRefreshes: { id: string; surface: string }[] = [];
 let reactionError: string | undefined;
 let reactionHang = false;
 let reactionStatus = 200;
@@ -109,12 +122,33 @@ const toolOutputError = (
 
 await mockCloudflareWorkers({
   AI: {},
+  FLUE_SLACK_AGENT_AGENT: {
+    getByName: (id: string) => ({
+      refreshRetention: (surface: string) => {
+        retentionRefreshes.push({ id, surface });
+        return Promise.resolve();
+      },
+    }),
+  },
   SLACK_APP_ID: "A123",
   SLACK_BOT_TOKEN: BOT_TOKEN,
   SLACK_SIGNING_SECRET: SIGNING_SECRET,
   SLACK_TEAM_ID: "T123",
 });
 const runtime = await import("@flue/runtime");
+// The alarm path is the agent's own wiring, so these tests drive it through
+// SlackAgent and the hooks it registers rather than reimplementing the seam.
+const agentStarts: (() => void | Promise<void>)[] = [];
+const agentFinishes: (() => void | Promise<void>)[] = [];
+const eventContext: FlueEventContext = {
+  agentName: undefined,
+  env: {},
+  id: "test",
+  log: { error: () => {}, info: () => {}, warn: () => {} },
+  req: undefined,
+};
+let delivered: DeliveredMessage = { body: "", kind: "user" };
+let observed: FlueObservationSubscriber | undefined;
 await mock.module("@flue/runtime", () => ({
   ...runtime,
   init: (_agent: Agent, options: { id: string }) => ({
@@ -140,24 +174,47 @@ await mock.module("@flue/runtime", () => ({
     },
   }),
   instrument: () => {},
-  setProvider: () => {},
-}));
-const sqlRows = new Map<string, string>();
-const fakeSql = {
-  exec(query: string, ...bindings: unknown[]) {
-    if (query.includes("CREATE TABLE")) {
-      return { toArray: () => [] };
-    }
-    if (query.trimStart().startsWith("SELECT")) {
-      const payload = sqlRows.get(String(bindings[0]));
-      return {
-        toArray: () => (payload === undefined ? [] : [{ payload }]),
-      };
-    }
-    sqlRows.set(String(bindings[0]), String(bindings[1]));
-    return { toArray: () => [] };
+  observe: (subscriber: FlueObservationSubscriber) => {
+    observed = subscriber;
+    return () => {};
   },
+  setProvider: () => {},
+  useAgentFinish: (run: () => void | Promise<void>) => {
+    agentFinishes.push(run);
+  },
+  useAgentStart: (run: () => void | Promise<void>) => {
+    agentStarts.push(run);
+  },
+  useDelivery: () => delivered,
+  useInstruction: () => {},
+  useMcpConnection: () => {},
+  useModel: () => {},
+  useSkill: () => {},
+}));
+const createFakeSql = () => {
+  const rows = new Map<string, string>();
+  const counts = { createTable: 0, save: 0 };
+  const sql = {
+    exec(query: string, ...bindings: unknown[]) {
+      if (query.includes("CREATE TABLE")) {
+        counts.createTable += 1;
+        return { toArray: () => [] };
+      }
+      if (query.trimStart().startsWith("SELECT")) {
+        const payload = rows.get(String(bindings[0]));
+        return {
+          toArray: () => (payload === undefined ? [] : [{ payload }]),
+        };
+      }
+      counts.save += 1;
+      rows.set(String(bindings[0]), String(bindings[1]));
+      return { toArray: () => [] };
+    },
+  };
+  return { counts, rows, sql };
 };
+const firstObjectSql = createFakeSql();
+let activeSql = firstObjectSql;
 const cloudflare = await import("@flue/runtime/cloudflare");
 await mock.module("@flue/runtime/cloudflare", () => ({
   ...cloudflare,
@@ -165,7 +222,7 @@ await mock.module("@flue/runtime/cloudflare", () => ({
   extend: () => ({ base: undefined }),
   getCloudflareContext: () => ({
     env: {},
-    storage: { sql: fakeSql },
+    storage: { sql: activeSql.sql },
   }),
 }));
 await mockWorkersAi();
@@ -232,14 +289,17 @@ globalThis.fetch = capturingFetch;
 
 const workerModule = await import("../src/index.ts");
 const app = workerModule.default;
-const {
-  finishSlackTurnDelivery,
-  observeSlackTurnDelivery,
-  startSlackTurnDelivery,
-} = await import("../src/agent.ts");
+// agent.ts registers its observer once, when first evaluated, and another test
+// file may have evaluated it under its own runtime mock; the query gives this
+// file an instance that registers against the mock above.
+const agentSpecifier = "../src/agent.ts?worker-stream";
+const { SlackAgent } = v.parse(
+  v.object({ SlackAgent: v.function() }),
+  await import(agentSpecifier),
+);
 
 class FakeD1 {
-  private readonly seen = new Set<string>();
+  readonly seen = new Set<string>();
   private values: unknown[] = [];
 
   prepare(sql: string) {
@@ -279,19 +339,24 @@ const workerBindings = v.object({
     (value): value is DurableObjectNamespace<ConversationLifecycleAgent> =>
       value !== null && typeof value === "object",
   ),
+  MODEL_BROKER: v.custom<ModelBrokerBinding>(
+    (value): value is ModelBrokerBinding =>
+      value !== null && typeof value === "object",
+  ),
   SLACK_APP_ID: v.string(),
   SLACK_BOT_TOKEN: v.string(),
   SLACK_SIGNING_SECRET: v.string(),
   SLACK_TEAM_ID: v.string(),
 });
 
-const testBindings = (): Cloudflare.Env => {
+const testBindings = (db: FakeD1 = new FakeD1()): Cloudflare.Env => {
   const value = {
     AI: {},
-    DB: new FakeD1(),
+    DB: db,
     FLUE_SLACK_AGENT_AGENT: {
       getByName: () => ({ refreshRetention: () => Promise.resolve() }),
     },
+    MODEL_BROKER: { fetch: () => Promise.resolve(new Response(null)) },
     SLACK_APP_ID: "A123",
     SLACK_BOT_TOKEN: BOT_TOKEN,
     SLACK_SIGNING_SECRET: SIGNING_SECRET,
@@ -303,25 +368,7 @@ const testBindings = (): Cloudflare.Env => {
   return value;
 };
 
-const signedMention = async (
-  eventId: string,
-  text = "<@UAPP> hello",
-  threadTs = "171.0",
-): Promise<Request> => {
-  const body = JSON.stringify({
-    api_app_id: "A123",
-    event: {
-      channel: "C777",
-      text,
-      thread_ts: threadTs,
-      ts: "171.1",
-      type: "app_mention",
-      user: "U777",
-    },
-    event_id: eventId,
-    team_id: "T123",
-    type: "event_callback",
-  });
+const signedEventsRequest = async (body: string): Promise<Request> => {
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const key = await crypto.subtle.importKey(
     "raw",
@@ -347,64 +394,91 @@ const signedMention = async (
     method: "POST",
   });
 };
+
+const signedMention = async (
+  eventId: string,
+  text = "<@UAPP> hello",
+  threadTs = "171.0",
+  user = "U777",
+): Promise<Request> =>
+  await signedEventsRequest(
+    JSON.stringify({
+      api_app_id: "A123",
+      event: {
+        channel: "C777",
+        text,
+        thread_ts: threadTs,
+        ts: "171.1",
+        type: "app_mention",
+        user,
+      },
+      event_id: eventId,
+      team_id: "T123",
+      type: "event_callback",
+    }),
+  );
 
 const signedDirectMessage = async (
   eventId: string,
   ts: string,
   text = "hello",
-): Promise<Request> => {
-  const body = JSON.stringify({
-    api_app_id: "A123",
-    event: {
-      channel: "D777",
-      channel_type: "im",
-      text,
-      ts,
-      type: "message",
-      user: "U777",
-    },
-    event_id: eventId,
-    team_id: "T123",
-    type: "event_callback",
-  });
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(SIGNING_SECRET),
-    { hash: "SHA-256", name: "HMAC" },
-    false,
-    ["sign"],
+  user = "U777",
+): Promise<Request> =>
+  await signedEventsRequest(
+    JSON.stringify({
+      api_app_id: "A123",
+      event: {
+        channel: "D777",
+        channel_type: "im",
+        text,
+        ts,
+        type: "message",
+        user,
+      },
+      event_id: eventId,
+      team_id: "T123",
+      type: "event_callback",
+    }),
   );
-  const bytes = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    new TextEncoder().encode(`v0:${timestamp}:${body}`),
-  );
-  return new Request("https://example.com/channels/slack/events", {
-    body,
-    headers: {
-      "content-type": "application/json",
-      "x-slack-request-timestamp": timestamp,
-      "x-slack-signature": `v0=${Array.from(new Uint8Array(bytes), (byte) =>
-        byte.toString(16).padStart(2, "0"),
-      ).join("")}`,
-    },
-    method: "POST",
-  });
-};
 
+const signedAssistantThreadStarted = async (
+  eventId: string,
+  userId: string,
+): Promise<Request> =>
+  await signedEventsRequest(
+    JSON.stringify({
+      api_app_id: "A123",
+      event: {
+        assistant_thread: {
+          channel_id: "D888",
+          context: {},
+          thread_ts: "190.1",
+          user_id: userId,
+        },
+        event_ts: "190.2",
+        type: "assistant_thread_started",
+      },
+      event_id: eventId,
+      team_id: "T123",
+      type: "event_callback",
+    }),
+  );
+
+// The ingress awaits the claim and the dispatch, so it defers nothing to the
+// request's context; the worker's own `waitUntil` is where the reaction lives.
+// `deferred` is collected so a test can assert the ingress left nothing behind.
 const admitTurn = async (
   request: Request,
-): Promise<{ pending: Promise<unknown>[]; status: number }> => {
-  const pending: Promise<unknown>[] = [];
+): Promise<{ deferred: Promise<unknown>[]; status: number }> => {
+  const deferred: Promise<unknown>[] = [];
   const response = await app.request(request, undefined, testBindings(), {
     passThroughOnException() {},
     props: {},
     waitUntil(promise: Promise<unknown>) {
-      pending.push(promise);
+      deferred.push(promise);
     },
   });
-  return { pending, status: response.status };
+  return { deferred, status: response.status };
 };
 
 const observationEnvelope = (
@@ -462,11 +536,24 @@ const observationFromChunk = (
 const deliverFromAlarm = async (evictLive = false): Promise<void> => {
   const last = dispatched.at(-1);
   const instanceId = last?.instanceId ?? "";
-  const binding = v.parse(
-    slackDeliveryBindingSchema,
-    last?.request.initialData,
-  );
-  startSlackTurnDelivery(instanceId, binding);
+  const message = last?.request.message;
+  delivered = {
+    attributes: message?.attributes,
+    body: message?.body ?? "",
+    kind: "signal",
+    type: message?.type ?? "",
+  };
+  agentStarts.length = 0;
+  agentFinishes.length = 0;
+  SlackAgent({ id: instanceId });
+  const observer = observed;
+  if (observer === undefined) {
+    throw new Error("SlackAgent registered no event observer");
+  }
+  for (const start of agentStarts) {
+    // oxlint-disable-next-line no-await-in-loop
+    await start();
+  }
   if (evictLive) {
     evictLiveSlackDelivery(instanceId);
   }
@@ -480,26 +567,35 @@ const deliverFromAlarm = async (evictLive = false): Promise<void> => {
   for (const chunk of chunks) {
     const observation = observationFromChunk(chunk, instanceId);
     if (observation !== undefined) {
-      void observeSlackTurnDelivery(observation);
+      // Events reach the observer in the order the run produced them.
+      // oxlint-disable-next-line no-await-in-loop
+      await observer(observation, eventContext);
     }
   }
   if (runFailure !== undefined) {
-    await observeSlackTurnDelivery({
-      ...observationEnvelope(instanceId),
-      outcome: "failed",
-      submissionId: "sub-1",
-      type: "submission_settled",
-    });
+    await observer(
+      {
+        ...observationEnvelope(instanceId),
+        outcome: "failed",
+        submissionId: "sub-1",
+        type: "submission_settled",
+      },
+      eventContext,
+    );
     return;
   }
-  await finishSlackTurnDelivery(instanceId);
+  for (const finish of agentFinishes) {
+    // oxlint-disable-next-line no-await-in-loop
+    await finish();
+  }
 };
 
 const runTurn = async (eventId: string, text?: string): Promise<number> => {
-  const { pending, status } = await admitTurn(
+  const { deferred, status } = await admitTurn(
     await signedMention(eventId, text),
   );
-  await Promise.all(pending);
+  expect(deferred).toEqual([]);
+  await Promise.all(workerWaitUntil);
   await deliverFromAlarm();
   return status;
 };
@@ -515,17 +611,23 @@ const streamAuthorizations = () => [
   ),
 ];
 
+const streamChunk = v.object({
+  text: v.optional(v.string()),
+  type: v.string(),
+});
+
+const streamChunks = () =>
+  bodiesFor("chat.appendStream").flatMap((body) =>
+    v.is(v.array(streamChunk), body.chunks) ? body.chunks : [],
+  );
+
 const streamedMarkdown = () =>
-  bodiesFor("chat.appendStream")
-    .map((body) =>
-      v.is(v.string(), body.markdown_text) ? body.markdown_text : "",
-    )
+  streamChunks()
+    .map((chunk) => (chunk.type === "markdown_text" ? (chunk.text ?? "") : ""))
     .join("");
 
-const taskChunks = () =>
-  bodiesFor("chat.appendStream").flatMap((body) =>
-    v.is(v.array(v.unknown()), body.chunks) ? body.chunks : [],
-  );
+const taskChunks = (): unknown[] =>
+  streamChunks().filter((chunk) => chunk.type === "task_update");
 
 beforeEach(() => {
   slackCalls.length = 0;
@@ -533,16 +635,59 @@ beforeEach(() => {
   reactionError = undefined;
   reactionHang = false;
   reactionStatus = 200;
+  workerWaitUntil.length = 0;
+  retentionRefreshes.length = 0;
   deltas = [];
   toolChunks = [];
   replyText = "";
   runFailure = undefined;
-  sqlRows.clear();
+  firstObjectSql.rows.clear();
   evictLiveSlackDelivery();
 });
 
 afterAll(() => {
   globalThis.fetch = originalFetch;
+});
+
+test("builds the durable delivery store once and flushes it on the coalesce boundary", async () => {
+  deltas = ["warm"];
+  replyText = "warm";
+  expect(await runTurn("Ev-store-warm")).toBe(200);
+  expect(firstObjectSql.counts.createTable).toBe(1);
+
+  deltas = Array.from({ length: 300 }, () => repeatingAlphabet(4));
+  replyText = deltas.join("");
+  const saves = firstObjectSql.counts.save;
+  slackCalls.length = 0;
+  expect(await runTurn("Ev-store-batch")).toBe(200);
+
+  expect(firstObjectSql.counts.createTable).toBe(1);
+  // Bounded from below too: a policy that stops flushing saves only the open
+  // and the close, and an upper bound alone cannot see that.
+  expect(firstObjectSql.counts.save - saves).toBeGreaterThanOrEqual(3);
+  expect(firstObjectSql.counts.save - saves).toBeLessThanOrEqual(4);
+  expect(streamedMarkdown()).toBe(replyText);
+});
+
+test("keeps each Durable Object's delivery store on its own storage", async () => {
+  deltas = ["first"];
+  replyText = "first";
+  expect(await runTurn("Ev-store-first-object")).toBe(200);
+  const firstSaves = firstObjectSql.counts.save;
+
+  const secondObjectSql = createFakeSql();
+  activeSql = secondObjectSql;
+  try {
+    deltas = ["second"];
+    replyText = "second";
+    expect(await runTurn("Ev-store-second-object")).toBe(200);
+  } finally {
+    activeSql = firstObjectSql;
+  }
+
+  expect(secondObjectSql.counts.createTable).toBe(1);
+  expect(secondObjectSql.counts.save).toBeGreaterThan(0);
+  expect(firstObjectSql.counts.save).toBe(firstSaves);
 });
 
 test("streams the turn into the routed thread, never a model-chosen one", async () => {
@@ -555,7 +700,10 @@ test("streams the turn into the routed thread, never a model-chosen one", async 
   expect(dispatched[0]?.instanceId).toBe("slack:v1:T123:C777:171.0");
   expect(dispatched[0]?.request.message.body).toBe("hello");
   expect(
-    v.parse(slackDeliveryBindingSchema, dispatched[0]?.request.initialData),
+    v.parse(
+      slackDeliveryBindingSchema,
+      dispatched[0]?.request.message.attributes,
+    ),
   ).toEqual({
     channelId: "C777",
     recipientTeamId: "T123",
@@ -563,10 +711,8 @@ test("streams the turn into the routed thread, never a model-chosen one", async 
     surface: "channel",
     threadTs: "171.0",
   });
-  expect(JSON.stringify(dispatched[0]?.request.initialData)).not.toContain(
-    "xoxb",
-  );
-  expect([...sqlRows.values()].join("")).not.toContain(BOT_TOKEN);
+  expect(JSON.stringify(dispatched[0]?.request)).not.toContain("xoxb");
+  expect([...firstObjectSql.rows.values()].join("")).not.toContain(BOT_TOKEN);
   expect(slackCalls.at(0)?.method).toBe("reactions.add");
   expect(bodiesFor("chat.startStream")).toEqual([
     {
@@ -604,12 +750,12 @@ test("keeps the wire destination on the routed channel, not one named in the tur
   expect(bodiesFor("chat.appendStream")).toEqual([
     {
       channel: "C777",
-      markdown_text: payload.slice(0, 1024),
+      chunks: [{ text: payload.slice(0, 1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
     {
       channel: "C777",
-      markdown_text: payload.slice(1024),
+      chunks: [{ text: payload.slice(1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
   ]);
@@ -660,7 +806,6 @@ test("streams a tool call as a named, sanitized task update", async () => {
       chunks: [
         {
           id: "call-1",
-          output: "found three matches",
           status: "complete",
           title: "search_docs",
           type: "task_update",
@@ -670,12 +815,12 @@ test("streams a tool call as a named, sanitized task update", async () => {
     },
     {
       channel: "C777",
-      markdown_text: payload.slice(0, 1024),
+      chunks: [{ text: payload.slice(0, 1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
     {
       channel: "C777",
-      markdown_text: payload.slice(1024),
+      chunks: [{ text: payload.slice(1024), type: "markdown_text" }],
       ts: STREAM_TS,
     },
   ]);
@@ -700,7 +845,6 @@ test("does not reuse a tool-call id title from an earlier turn", async () => {
   expect(taskChunks()).toEqual([
     {
       id: "call-shared",
-      output: "two",
       status: "complete",
       title: "Step",
       type: "task_update",
@@ -718,7 +862,6 @@ test("names an orphan tool result as a fallback step", async () => {
   expect(taskChunks()).toEqual([
     {
       id: "call-orphan",
-      output: "found three",
       status: "complete",
       title: "Step",
       type: "task_update",
@@ -758,7 +901,11 @@ test("omits the output of a void tool result", async () => {
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
 });
 
@@ -781,7 +928,6 @@ test("marks a failed tool as an error and still finishes the reply", async () =>
     },
     {
       id: "call-2",
-      output: "upstream refused the request",
       status: "error",
       title: "search_docs",
       type: "task_update",
@@ -793,7 +939,7 @@ test("marks a failed tool as an error and still finishes the reply", async () =>
   ]);
 });
 
-test("redacts credentials carried in a tool result before the wire", async () => {
+test("keeps a tool result and its credentials off the wire", async () => {
   toolChunks = [
     toolInput("call-3", "read_env"),
     toolOutput("call-3", {
@@ -826,8 +972,6 @@ test("redacts credentials carried in a tool result before the wire", async () =>
       chunks: [
         {
           id: "call-3",
-          output:
-            '{[internal configuration],"auth":"[secret]","note":[internal configuration]",[internal configuration]}',
           status: "complete",
           title: "read_env",
           type: "task_update",
@@ -835,11 +979,18 @@ test("redacts credentials carried in a tool result before the wire", async () =>
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
+  expect(JSON.stringify(slackCalls)).not.toContain("AKIA-live-1");
+  expect(JSON.stringify(slackCalls)).not.toContain("hunter2");
+  expect(JSON.stringify(slackCalls)).not.toContain("xoxb-1234567890");
 });
 
-test("redacts credentials escaped by JSON.stringify before the wire", async () => {
+test("keeps a JSON-escaped tool result and its credentials off the wire", async () => {
   toolChunks = [
     toolInput("call-http", "http_get"),
     toolOutput("call-http", {
@@ -874,8 +1025,6 @@ test("redacts credentials escaped by JSON.stringify before the wire", async () =
       chunks: [
         {
           id: "call-http",
-          output:
-            '{"body":"{[internal configuration],[internal configuration]}","status":200}',
           status: "complete",
           title: "http_get",
           type: "task_update",
@@ -900,7 +1049,6 @@ test("redacts credentials escaped by JSON.stringify before the wire", async () =
       chunks: [
         {
           id: "call-err",
-          output: '{"stderr":"auth failed for [internal configuration]"}',
           status: "complete",
           title: "run_cmd",
           type: "task_update",
@@ -908,17 +1056,24 @@ test("redacts credentials escaped by JSON.stringify before the wire", async () =
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
+  expect(JSON.stringify(slackCalls)).not.toContain("AKIA-live-1");
+  expect(JSON.stringify(slackCalls)).not.toContain("hunter2");
 });
 
 test("returns 200 without awaiting delivery, and the DO alarm path streams the reply", async () => {
   deltas = ["Hello ", "there, done."];
   replyText = "Hello there, done.";
 
-  const { pending, status } = await admitTurn(await signedMention("Ev-ack"));
+  const { deferred, status } = await admitTurn(await signedMention("Ev-ack"));
   expect(status).toBe(200);
-  await Promise.all(pending);
+  expect(deferred).toEqual([]);
+  await Promise.all(workerWaitUntil);
 
   expect(bodiesFor("chat.startStream")).toEqual([]);
   expect(bodiesFor("chat.appendStream")).toEqual([]);
@@ -949,9 +1104,10 @@ test("delivers the durable reply after the isolate drops its live stream handle"
   deltas = ["Hello ", "there, done."];
   replyText = "Hello there, done.";
 
-  const { pending, status } = await admitTurn(await signedMention("Ev-evict"));
+  const { deferred, status } = await admitTurn(await signedMention("Ev-evict"));
   expect(status).toBe(200);
-  await Promise.all(pending);
+  expect(deferred).toEqual([]);
+  await Promise.all(workerWaitUntil);
   await deliverFromAlarm(true);
 
   expect(bodiesFor("chat.appendStream")).toEqual([
@@ -972,7 +1128,6 @@ test("delivers the durable reply after the isolate drops its live stream handle"
       chunks: [
         {
           id: "call-1",
-          output: "found three matches",
           status: "complete",
           title: "search_docs",
           type: "task_update",
@@ -980,7 +1135,11 @@ test("delivers the durable reply after the isolate drops its live stream handle"
       ],
       ts: STREAM_TS,
     },
-    { channel: "C777", markdown_text: "Hello there, done.", ts: STREAM_TS },
+    {
+      channel: "C777",
+      chunks: [{ text: "Hello there, done.", type: "markdown_text" }],
+      ts: STREAM_TS,
+    },
   ]);
   expect(streamedMarkdown()).toBe("Hello there, done.");
   expect(bodiesFor("chat.stopStream")).toEqual([
@@ -994,7 +1153,12 @@ test("a retried finish does not post a second Slack stream", async () => {
 
   expect(await runTurn("Ev-once")).toBe(200);
   const calls = slackCalls.length;
-  await finishSlackTurnDelivery(dispatched.at(-1)?.instanceId ?? "");
+  agentFinishes.length = 0;
+  SlackAgent({ id: dispatched.at(-1)?.instanceId ?? "" });
+  for (const finish of agentFinishes) {
+    // oxlint-disable-next-line no-await-in-loop
+    await finish();
+  }
 
   expect(slackCalls).toHaveLength(calls);
   expect(bodiesFor("chat.startStream")).toHaveLength(1);
@@ -1004,11 +1168,12 @@ test("finishes with the reply text accumulated in durable state", async () => {
   deltas = ["The complete answer."];
   replyText = "The complete answer.";
 
-  const { pending, status } = await admitTurn(
+  const { deferred, status } = await admitTurn(
     await signedMention("Ev-reply-text"),
   );
   expect(status).toBe(200);
-  await Promise.all(pending);
+  expect(deferred).toEqual([]);
+  await Promise.all(workerWaitUntil);
   await deliverFromAlarm(true);
 
   expect(streamedMarkdown()).toBe("The complete answer.");
@@ -1022,19 +1187,20 @@ test("routes successive top-level DMs to one instance and keeps channel threads 
   const first = await admitTurn(
     await signedDirectMessage("Ev-dm-1", "181.1", "first"),
   );
-  await Promise.all(first.pending);
   const second = await admitTurn(
     await signedDirectMessage("Ev-dm-2", "182.2", "second"),
   );
-  await Promise.all(second.pending);
   const mentionA = await admitTurn(
     await signedMention("Ev-mention-a", "<@UAPP> one", "191.0"),
   );
-  await Promise.all(mentionA.pending);
   const mentionB = await admitTurn(
     await signedMention("Ev-mention-b", "<@UAPP> two", "192.0"),
   );
-  await Promise.all(mentionB.pending);
+  for (const turn of [first, second, mentionA, mentionB]) {
+    expect(turn.status).toBe(200);
+    expect(turn.deferred).toEqual([]);
+  }
+  await Promise.all(workerWaitUntil);
 
   expect(dispatched.map((entry) => entry.instanceId)).toEqual([
     "slack:v1:T123:D777:D777",
@@ -1042,6 +1208,17 @@ test("routes successive top-level DMs to one instance and keeps channel threads 
     "slack:v1:T123:C777:191.0",
     "slack:v1:T123:C777:192.0",
   ]);
+  // Flue records initialData once per instance and ignores it afterwards, so a
+  // destination sent there would pin every later DM reply to the first thread.
+  expect(dispatched.map((entry) => entry.request.initialData)).toEqual([
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+  ]);
+  expect(
+    dispatched.map((entry) => entry.request.message.attributes?.threadTs),
+  ).toEqual(["181.1", "182.2", "191.0", "192.0"]);
 });
 
 test("a failed eyes reaction still dispatches the turn", async () => {
@@ -1072,8 +1249,227 @@ test("a hanging eyes reaction still dispatches the turn", async () => {
   deltas = ["Hello."];
   replyText = "Hello.";
 
-  expect(await runTurn("Ev-react-hang")).toBe(200);
+  // Not `runTurn`: draining the worker's deferred promises would wait on the
+  // reaction that never resolves, and the ack must not.
+  const { deferred, status } = await admitTurn(
+    await signedMention("Ev-react-hang"),
+  );
+
+  expect(status).toBe(200);
+  expect(deferred).toEqual([]);
+  expect(workerWaitUntil).toHaveLength(1);
   expect(dispatched).toHaveLength(1);
+  await deliverFromAlarm();
   expect(streamedMarkdown()).toBe("Hello.");
   expect(slackCalls[0]?.method).toBe("reactions.add");
 }, 500);
+
+test("keeps the eyes reaction alive past the ack", async () => {
+  reactionHang = true;
+
+  const { status } = await admitTurn(await signedMention("Ev-react-alive"));
+
+  expect(status).toBe(200);
+  expect(slackCalls[0]?.method).toBe("reactions.add");
+  expect(workerWaitUntil).toHaveLength(1);
+});
+
+const signedInteraction = async (): Promise<Request> => {
+  const body = new URLSearchParams({
+    payload: JSON.stringify({
+      actions: [],
+      api_app_id: "A999",
+      team: { id: "T999" },
+      type: "block_actions",
+      user: { id: "U777" },
+    }),
+  }).toString();
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(SIGNING_SECRET),
+    { hash: "SHA-256", name: "HMAC" },
+    false,
+    ["sign"],
+  );
+  const bytes = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(`v0:${timestamp}:${body}`),
+  );
+  return new Request("https://example.com/channels/slack/interactions", {
+    body,
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+      "x-slack-request-timestamp": timestamp,
+      "x-slack-signature": `v0=${Array.from(new Uint8Array(bytes), (byte) =>
+        byte.toString(16).padStart(2, "0"),
+      ).join("")}`,
+    },
+    method: "POST",
+  });
+};
+
+// The worker reads its config once, when evaluated, so each config gets its own
+// instance of the entry module; the config module is restored afterwards for
+// whichever test file loads next.
+const interactionStatusFor = async (
+  requireApproval: string[],
+  specifier: string,
+): Promise<number> => {
+  const { default: shipped } = await import("../agent.config.ts");
+  await mock.module("../agent.config.ts", () => ({
+    default: defineAgentConfig({
+      description: "Answers Slack conversations.",
+      mcpServers: [
+        { name: "crm", requireApproval, url: "https://mcp.example.com/mcp" },
+      ],
+      name: "Operator Agent",
+      ownerInstructions: "Prefer short answers.",
+    }),
+  }));
+  let entry: unknown;
+  try {
+    entry = await import(specifier);
+  } finally {
+    await mock.module("../agent.config.ts", () => ({ default: shipped }));
+  }
+  const worker = v.parse(
+    v.object({ default: v.object({ request: v.function() }) }),
+    entry,
+  ).default;
+  const response: unknown = await worker.request(
+    await signedInteraction(),
+    undefined,
+    testBindings(),
+  );
+  return v.parse(v.instance(Response), response).status;
+};
+
+test("mounts the interactions route only when the config gates a call", async () => {
+  expect(
+    await interactionStatusFor(
+      ["create_organization"],
+      "../src/index.ts?gated",
+    ),
+  ).toBe(200);
+  expect(await interactionStatusFor([], "../src/index.ts?ungated")).toBe(404);
+});
+
+// The allowlist has to hold on the real entry point, where the reaction and the
+// model dispatch live, not only inside the ingress: an event from anyone the
+// config does not name must leave no Slack call, no D1 row and no dispatch.
+test("admits the allowlisted user and drops every other user before any side effect", async () => {
+  const { default: shipped } = await import("../agent.config.ts");
+  await mock.module("../agent.config.ts", () => ({
+    default: defineAgentConfig({
+      allowedUserIds: ["U777"],
+      description: "Answers Slack conversations.",
+      name: "Owner Agent",
+      ownerInstructions: "Prefer short answers.",
+    }),
+  }));
+  const db = new FakeD1();
+  const bindings = testBindings(db);
+  const specifier = `../src/index.ts?owner-allowlist`;
+  try {
+    const entry: unknown = await import(specifier);
+    const worker = v.parse(
+      v.object({ default: v.object({ request: v.function() }) }),
+      entry,
+    ).default;
+    const deferred: Promise<unknown>[] = [];
+    const deliver = async (request: Request): Promise<number> => {
+      const response: unknown = await worker.request(
+        request,
+        undefined,
+        bindings,
+        {
+          passThroughOnException() {},
+          props: {},
+          waitUntil(promise: Promise<unknown>) {
+            deferred.push(promise);
+          },
+        },
+      );
+      return v.parse(v.instance(Response), response).status;
+    };
+
+    const refused = [
+      await signedMention(
+        "Ev-stranger-mention",
+        "<@UAPP> hello",
+        "171.0",
+        "U888",
+      ),
+      await signedDirectMessage("Ev-stranger-dm", "172.1", "hello", "U888"),
+      await signedAssistantThreadStarted("Ev-stranger-assistant", "U888"),
+    ];
+    for (const request of refused) {
+      // oxlint-disable-next-line no-await-in-loop
+      expect(await deliver(request)).toBe(200);
+    }
+    await Promise.all(workerWaitUntil);
+
+    expect(deferred).toEqual([]);
+    expect(workerWaitUntil).toEqual([]);
+    expect(db.seen.size).toBe(0);
+    expect(dispatched).toEqual([]);
+    expect(slackCalls).toEqual([]);
+
+    expect(await deliver(await signedMention("Ev-owner-mention"))).toBe(200);
+    await Promise.all(workerWaitUntil);
+
+    expect(db.seen.has("Ev-owner-mention")).toBe(true);
+    expect(dispatched).toHaveLength(1);
+    expect(slackCalls.map((call) => call.method)).toEqual(["reactions.add"]);
+  } finally {
+    await mock.module("../agent.config.ts", () => ({ default: shipped }));
+  }
+});
+
+test("a narrated milestone turns in the thread its conversation already holds", async () => {
+  deltas = ["Hello."];
+  replyText = "Hello.";
+  expect(await runTurn("Ev-narration-thread")).toBe(200);
+  const [mention] = dispatched;
+  if (mention === undefined) {
+    throw new Error("the mention dispatched no turn");
+  }
+  const binding = {
+    channelId: "C777",
+    fallbackText: "Kicked off\nhttps://example.com/run",
+    recipientTeamId: "T123",
+    recipientUserId: "U777",
+    surface: "channel" as const,
+    threadTs: "171.0",
+  };
+  dispatched.length = 0;
+
+  await workerModule.narrateProgressTurn({
+    binding,
+    body: "Rewrite this milestone in that voice.",
+    instanceId: slackInstanceId({
+      channelId: binding.channelId,
+      teamId: binding.recipientTeamId,
+      threadTs: binding.threadTs,
+    }),
+  });
+
+  expect(dispatched).toEqual([
+    {
+      instanceId: mention.instanceId,
+      request: {
+        message: {
+          attributes: binding,
+          body: "Rewrite this milestone in that voice.",
+          kind: "signal",
+          type: "slack.progress",
+        },
+      },
+    },
+  ]);
+  expect(retentionRefreshes).toEqual([
+    { id: mention.instanceId, surface: "channel" },
+  ]);
+});

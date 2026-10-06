@@ -1,14 +1,21 @@
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import {
   createSlackIngress,
+  createSlackReadTools,
+  createSqlSlackChannelAdmissionStore,
   defineAgentConfig,
+  MODEL_PROVIDER_CLOUDFLARE,
   setSuggestedPrompts,
 } from "@agentic-slack/core";
-import type { SlackCoreBindings } from "@agentic-slack/core";
+import type {
+  ModelBrokerBinding,
+  SlackBlockActionsPayload,
+  SlackCoreBindings,
+} from "@agentic-slack/core";
 import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
 import * as v from "valibot";
 import { createApp } from "../src/app.ts";
-import { createLifecycleHandler } from "../src/lifecycle.ts";
+import { mockCloudflareWorkers, workerWaitUntil } from "./module-mocks.ts";
 
 const trusted = {
   appId: "A123",
@@ -17,27 +24,61 @@ const trusted = {
   teamId: "T123",
 };
 
+// The lifecycle handler defers its Slack call to the worker's `waitUntil`, so
+// the runtime module has to stand in for `cloudflare:workers` before it loads.
+await mockCloudflareWorkers({ SLACK_BOT_TOKEN: trusted.botToken });
+const { createLifecycleHandler } = await import("../src/lifecycle.ts");
+const { createMembershipHandler } = await import("../src/membership.ts");
+
+beforeEach(() => {
+  workerWaitUntil.length = 0;
+});
+
 class FakeD1 {
+  readonly admissions = new Set<string>();
   readonly seen = new Set<string>();
+  rejectClaim = false;
   private values: unknown[] = [];
 
   prepare(sql: string) {
     return {
+      all: () => {
+        const channelId = String(this.values[0]);
+        return Promise.resolve({
+          results:
+            sql.includes("slack_channel_admissions") &&
+            this.admissions.has(channelId)
+              ? [{ channel_id: channelId }]
+              : [],
+        });
+      },
       bind: (...values: unknown[]) => {
         this.values = values;
         return this.prepare(sql);
       },
       run: () => {
-        const eventId = String(this.values[0]);
+        const value = String(this.values[0]);
+        if (sql.includes("slack_channel_admissions")) {
+          if (sql.startsWith("INSERT")) {
+            this.admissions.add(value);
+          }
+          if (sql.startsWith("DELETE")) {
+            this.admissions.delete(value);
+          }
+          return Promise.resolve({ meta: { changes: 1 } });
+        }
         if (sql.startsWith("INSERT")) {
-          if (this.seen.has(eventId)) {
+          if (this.rejectClaim) {
+            return Promise.reject(new Error("claim failed"));
+          }
+          if (this.seen.has(value)) {
             return Promise.resolve({ meta: { changes: 0 } });
           }
-          this.seen.add(eventId);
+          this.seen.add(value);
           return Promise.resolve({ meta: { changes: 1 } });
         }
         if (sql.startsWith("DELETE FROM seen_events WHERE event_id")) {
-          this.seen.delete(eventId);
+          this.seen.delete(value);
         }
         return Promise.resolve({ meta: { changes: 1 } });
       },
@@ -58,6 +99,10 @@ const workerBindings = v.object({
     (value): value is DurableObjectNamespace<ConversationLifecycleAgent> =>
       value !== null && typeof value === "object",
   ),
+  MODEL_BROKER: v.custom<ModelBrokerBinding>(
+    (value): value is ModelBrokerBinding =>
+      value !== null && typeof value === "object",
+  ),
 });
 
 const testBindings = (db: FakeD1): SlackCoreBindings => {
@@ -65,6 +110,7 @@ const testBindings = (db: FakeD1): SlackCoreBindings => {
     AI: {},
     DB: db,
     FLUE_SLACK_AGENT_AGENT: {},
+    MODEL_BROKER: { fetch: () => Promise.resolve(new Response(null)) },
   };
   if (!v.is(workerBindings, value)) {
     throw new Error("Invalid test bindings");
@@ -76,6 +122,7 @@ interface EventOverrides {
   readonly bot_id?: string;
   readonly text?: string;
   readonly thread_ts?: string;
+  readonly user?: string;
 }
 
 const eventEnvelope = v.object({
@@ -115,11 +162,45 @@ const assistantEnvelope = v.object({
 });
 type AssistantEnvelope = v.InferOutput<typeof assistantEnvelope>;
 
-const signedRequest = async (
-  payload: AssistantEnvelope | EventEnvelope,
-  url = "https://example.com/events",
+const membershipEnvelope = v.object({
+  api_app_id: v.string(),
+  event: v.object({
+    channel: v.string(),
+    channel_type: v.optional(v.string()),
+    inviter: v.optional(v.string()),
+    team: v.optional(v.string()),
+    type: v.string(),
+    user: v.string(),
+  }),
+  event_id: v.string(),
+  team_id: v.string(),
+  type: v.string(),
+});
+type MembershipEnvelope = v.InferOutput<typeof membershipEnvelope>;
+
+const blockActions: SlackBlockActionsPayload = {
+  actions: [
+    {
+      action_id: "approval_approve",
+      block_id: "approval",
+      type: "button",
+      value: "req-1",
+    },
+  ],
+  api_app_id: "A123",
+  channel: { id: "D1" },
+  container: { thread_ts: "171.1", type: "message" },
+  message: { thread_ts: "171.1", ts: "171.2" },
+  team: { id: "T123" },
+  type: "block_actions",
+  user: { id: "U1" },
+};
+
+const signedBody = async (
+  body: string,
+  contentType: string,
+  url: string,
 ): Promise<Request> => {
-  const body = JSON.stringify(payload);
   const timestamp = Math.floor(Date.now() / 1000).toString();
   const key = await crypto.subtle.importKey(
     "raw",
@@ -139,13 +220,47 @@ const signedRequest = async (
   return new Request(url, {
     body,
     headers: {
-      "content-type": "application/json",
+      "content-type": contentType,
       "x-slack-request-timestamp": timestamp,
       "x-slack-signature": signature,
     },
     method: "POST",
   });
 };
+
+const signedRequest = (
+  payload: AssistantEnvelope | EventEnvelope | MembershipEnvelope,
+  url = "https://example.com/events",
+): Promise<Request> =>
+  signedBody(JSON.stringify(payload), "application/json", url);
+
+const assistantStarted = (userId: string): AssistantEnvelope => ({
+  api_app_id: "A123",
+  event: {
+    assistant_thread: {
+      channel_id: "D999",
+      context: {},
+      thread_ts: "180.1",
+      user_id: userId,
+    },
+    event_ts: "181.9",
+    type: "assistant_thread_started",
+  },
+  event_id: "Ev-assistant-allowlist",
+  team_id: "T123",
+  type: "event_callback",
+});
+
+// Slack posts interactivity as a form field holding the JSON payload.
+const signedInteraction = (
+  payload: typeof blockActions,
+  url = "https://example.com/interactions",
+): Promise<Request> =>
+  signedBody(
+    new URLSearchParams({ payload: JSON.stringify(payload) }).toString(),
+    "application/x-www-form-urlencoded",
+    url,
+  );
 
 const event = (overrides: EventOverrides = {}) => ({
   api_app_id: "A123",
@@ -162,51 +277,115 @@ const event = (overrides: EventOverrides = {}) => ({
   type: "event_callback",
 });
 
+const silentLog = { error: () => {}, info: () => {}, warn: () => {} };
+
+const refusalOf = async (operation: Promise<unknown>): Promise<string> => {
+  try {
+    await operation;
+    return "resolved";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+};
+
+interface RecordedCall {
+  readonly body: Record<string, string>;
+  readonly method: string;
+}
+
+// The read tools post form bodies and ask for one thread; this answers with one
+// message so a read that was admitted completes and one that was not never gets
+// the chance to.
+const readSlack =
+  (calls: RecordedCall[]) =>
+  (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = v.parse(v.string(), input);
+    const method = url.slice(url.lastIndexOf("/") + 1);
+    calls.push({
+      body: Object.fromEntries(
+        v.parse(v.instance(URLSearchParams), init?.body),
+      ),
+      method,
+    });
+    if (method === "auth.test") {
+      return Promise.resolve(
+        Response.json({ ok: true, url: "https://workspace.slack.com/" }),
+      );
+    }
+    return Promise.resolve(
+      Response.json({
+        messages: [{ text: "hello", ts: "1800000000.000100", user: "U111" }],
+        ok: true,
+      }),
+    );
+  };
+
+interface GuardReply {
+  readonly error?: string;
+  readonly ok?: boolean;
+  readonly user_id?: string;
+}
+
+const guardNotice = (channelId: string, inviterId: string): string =>
+  `I left <#${channelId}>${
+    inviterId === "" ? "" : ` after <@${inviterId}> added me there`
+  }. I only act in channels an allowed user invited me to.`;
+
+const joined = (
+  eventId: string,
+  overrides: Partial<MembershipEnvelope["event"]> = {},
+): MembershipEnvelope => ({
+  api_app_id: "A123",
+  event: {
+    channel: "CFOREIGN",
+    channel_type: "C",
+    team: "T123",
+    type: "member_joined_channel",
+    user: "UBOT",
+    ...overrides,
+  },
+  event_id: eventId,
+  team_id: "T123",
+  type: "event_callback",
+});
+
+const guardSlackFetcher =
+  (calls: RecordedCall[], replies: Record<string, GuardReply> = {}) =>
+  (input: string, init: RequestInit): Promise<Response> => {
+    const method = input.slice(input.lastIndexOf("/") + 1);
+    const raw = v.parse(v.string(), init.body);
+    const parsed: unknown = raw === "" ? {} : JSON.parse(raw);
+    calls.push({
+      body: v.parse(v.record(v.string(), v.string()), parsed),
+      method,
+    });
+    return Promise.resolve(
+      Response.json({ ok: true, user_id: "UBOT", ...replies[method] }),
+    );
+  };
+
 describe("signed Slack ingress", () => {
-  test("acks before work and deduplicates all side effects by event_id", async () => {
+  test("claims and dispatches before acknowledging, and deduplicates all side effects by event_id", async () => {
     const db = new FakeD1();
     const turns: string[] = [];
-    const { promise: blocked, resolve: releaseWork } =
-      Promise.withResolvers<undefined>();
-    const channel = createSlackIngress(trusted, async (turn, instanceId) => {
+    const channel = createSlackIngress(trusted, (turn, instanceId) => {
       turns.push(`${turn.text}:${instanceId}`);
-      await blocked;
+      return Promise.resolve();
     });
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
     const bindings = testBindings(db);
 
     const threadedMention = event({ thread_ts: "170.root" });
     const first = await channel
       .route()
-      .request(
-        await signedRequest(threadedMention),
-        undefined,
-        bindings,
-        executionCtx,
-      );
+      .request(await signedRequest(threadedMention), undefined, bindings);
     expect(first.status).toBe(200);
-    expect(turns).toHaveLength(1);
-    expect(turns[0]).toBe("hello:slack:v1:T123:C123:170.root");
-    releaseWork();
-    await Promise.all(pending.splice(0));
+    expect(db.seen.has("Ev123")).toBe(true);
+    expect(turns).toEqual(["hello:slack:v1:T123:C123:170.root"]);
 
     const duplicate = await channel
       .route()
-      .request(
-        await signedRequest(threadedMention),
-        undefined,
-        bindings,
-        executionCtx,
-      );
+      .request(await signedRequest(threadedMention), undefined, bindings);
     expect(duplicate.status).toBe(200);
-    await Promise.all(pending.splice(0));
     expect(turns).toHaveLength(1);
 
     const directMessage = {
@@ -223,14 +402,8 @@ describe("signed Slack ingress", () => {
     };
     const directResponse = await channel
       .route()
-      .request(
-        await signedRequest(directMessage),
-        undefined,
-        bindings,
-        executionCtx,
-      );
+      .request(await signedRequest(directMessage), undefined, bindings);
     expect(directResponse.status).toBe(200);
-    await Promise.all(pending);
     expect(turns.at(-1)).toBe("private hello:slack:v1:T123:D123:D123");
   });
 
@@ -241,14 +414,6 @@ describe("signed Slack ingress", () => {
       admitted.push(turn.eventId);
       return Promise.resolve();
     });
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
     const bindings = testBindings(db);
 
     const invalid = await channel
@@ -295,17 +460,233 @@ describe("signed Slack ingress", () => {
       rejected.map(async (payload) => {
         const response = await channel
           .route()
-          .request(
-            await signedRequest(payload),
-            undefined,
-            bindings,
-            executionCtx,
-          );
+          .request(await signedRequest(payload), undefined, bindings);
         expect(response.status).toBe(200);
       }),
     );
-    await Promise.all(pending);
     expect(admitted).toEqual([]);
+  });
+});
+
+describe("owner allowlist", () => {
+  const owner = { ...trusted, allowedUserIds: ["U123"] };
+  const directMessage = (userId: string, eventId: string): EventEnvelope => ({
+    ...event(),
+    event: {
+      channel: "D123",
+      channel_type: "im",
+      text: "private hello",
+      ts: "172.1",
+      type: "message",
+      user: userId,
+    },
+    event_id: eventId,
+  });
+
+  test("claims and dispatches a listed user's mention and DM", async () => {
+    const db = new FakeD1();
+    const admitted: string[] = [];
+    const channel = createSlackIngress(owner, (turn) => {
+      admitted.push(`${turn.userId}:${turn.eventId}`);
+      return Promise.resolve();
+    });
+    const bindings = testBindings(db);
+
+    const mention = await channel
+      .route()
+      .request(await signedRequest(event()), undefined, bindings);
+    expect(mention.status).toBe(200);
+    expect(db.seen.has("Ev123")).toBe(true);
+
+    const dm = await channel
+      .route()
+      .request(
+        await signedRequest(directMessage("U123", "Ev-dm")),
+        undefined,
+        bindings,
+      );
+    expect(dm.status).toBe(200);
+    expect(db.seen.has("Ev-dm")).toBe(true);
+    expect(admitted).toEqual(["U123:Ev123", "U123:Ev-dm"]);
+  });
+
+  test("answers 2xx and claims nothing for a mention, a DM or an assistant start from anyone else", async () => {
+    const db = new FakeD1();
+    const turns: string[] = [];
+    const lifecycles: string[] = [];
+    const channel = createSlackIngress(
+      owner,
+      (turn) => {
+        turns.push(turn.eventId);
+        return Promise.resolve();
+      },
+      (lifecycle) => {
+        lifecycles.push(lifecycle.eventId);
+        return Promise.resolve();
+      },
+    );
+    const bindings = testBindings(db);
+
+    const refused: (AssistantEnvelope | EventEnvelope)[] = [
+      event({ user: "U999" }),
+      directMessage("U999", "Ev-dm-refused"),
+      assistantStarted("U999"),
+    ];
+    await Promise.all(
+      refused.map(async (payload) => {
+        const response = await channel
+          .route()
+          .request(await signedRequest(payload), undefined, bindings);
+        expect(response.status).toBe(200);
+      }),
+    );
+
+    expect(db.seen.size).toBe(0);
+    expect(turns).toEqual([]);
+    expect(lifecycles).toEqual([]);
+  });
+});
+
+describe("ingress acknowledgement", () => {
+  test("answers non-2xx when the claim fails, so Slack retries the delivery", async () => {
+    const db = new FakeD1();
+    db.rejectClaim = true;
+    const turns: string[] = [];
+    const channel = createSlackIngress(trusted, (turn) => {
+      turns.push(turn.eventId);
+      return Promise.resolve();
+    });
+
+    const response = await channel
+      .route()
+      .request(await signedRequest(event()), undefined, testBindings(db));
+
+    expect(response.status).toBe(500);
+    expect(turns).toEqual([]);
+  });
+
+  test("answers non-2xx when the dispatch fails, so Slack retries the delivery", async () => {
+    const db = new FakeD1();
+    let attempts = 0;
+    const channel = createSlackIngress(trusted, () => {
+      attempts += 1;
+      return attempts === 1
+        ? Promise.reject(new Error("dispatch failed"))
+        : Promise.resolve();
+    });
+    const bindings = testBindings(db);
+
+    const failed = await channel
+      .route()
+      .request(await signedRequest(event()), undefined, bindings);
+
+    expect(failed.status).toBe(500);
+
+    const retried = await channel
+      .route()
+      .request(await signedRequest(event()), undefined, bindings);
+
+    expect(retried.status).toBe(200);
+    expect(attempts).toBe(2);
+  });
+});
+
+describe("approval interactions", () => {
+  const decisions: SlackBlockActionsPayload[] = [];
+  const handler = (payload: SlackBlockActionsPayload) => {
+    decisions.push(payload);
+    return Promise.resolve();
+  };
+  const decide = async (
+    payload: typeof blockActions,
+    overrides: { apiAppId?: string; teamId?: string } = {},
+  ) => {
+    const channel = createSlackIngress(
+      trusted,
+      () => Promise.resolve(),
+      undefined,
+      handler,
+    );
+    return await channel.route().request(
+      await signedInteraction({
+        ...payload,
+        api_app_id: overrides.apiAppId ?? payload.api_app_id,
+        team: { id: overrides.teamId ?? "T123" },
+      }),
+      undefined,
+      testBindings(new FakeD1()),
+    );
+  };
+
+  test("routes a signed decision from the configured workspace to the handler", async () => {
+    decisions.length = 0;
+    const response = await decide(blockActions);
+    expect(response.status).toBe(200);
+    expect(decisions).toEqual([blockActions]);
+  });
+
+  test("rejects an unsigned decision", async () => {
+    decisions.length = 0;
+    const channel = createSlackIngress(
+      trusted,
+      () => Promise.resolve(),
+      undefined,
+      handler,
+    );
+    const response = await channel
+      .route()
+      .request("https://example.com/interactions", {
+        body: new URLSearchParams({
+          payload: JSON.stringify(blockActions),
+        }).toString(),
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        method: "POST",
+      });
+    expect(response.status).toBe(401);
+    expect(decisions).toEqual([]);
+  });
+
+  test("ignores a decision from another workspace or app", async () => {
+    decisions.length = 0;
+    for (const overrides of [{ teamId: "T999" }, { apiAppId: "A999" }]) {
+      // oxlint-disable-next-line no-await-in-loop
+      const response = await decide(blockActions, overrides);
+      expect(response.status).toBe(200);
+    }
+    expect(decisions).toEqual([]);
+  });
+
+  test("answers non-2xx when the decision handler fails, so Slack retries", async () => {
+    const channel = createSlackIngress(
+      trusted,
+      () => Promise.resolve(),
+      undefined,
+      () => Promise.reject(new Error("decision failed")),
+    );
+    const response = await channel
+      .route()
+      .request(
+        await signedInteraction(blockActions),
+        undefined,
+        testBindings(new FakeD1()),
+      );
+    expect(response.status).toBe(500);
+  });
+
+  // The route is mounted only when a decision handler exists, so a deployment
+  // with no gated tool does not expose an endpoint that can only answer 200.
+  test("does not mount the interactions route without a decision handler", async () => {
+    const channel = createSlackIngress(trusted, () => Promise.resolve());
+
+    const response = await channel
+      .route()
+      .request(
+        await signedInteraction(blockActions),
+        undefined,
+        testBindings(new FakeD1()),
+      );
+
+    expect(response.status).toBe(404);
   });
 });
 
@@ -359,14 +740,6 @@ describe("assistant thread lifecycle", () => {
           },
         ),
     );
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
     const bindings = testBindings(db);
 
     const deliver = async () => {
@@ -376,13 +749,12 @@ describe("assistant thread lifecycle", () => {
           await signedRequest(assistantThreadStarted),
           undefined,
           bindings,
-          executionCtx,
         );
       expect(response.status).toBe(200);
-      await Promise.all(pending.splice(0));
     };
     await deliver();
     await deliver();
+    await Promise.all(workerWaitUntil);
 
     expect(turns).toEqual([]);
     expect(requests).toEqual([
@@ -399,6 +771,97 @@ describe("assistant thread lifecycle", () => {
     ]);
   });
 
+  // A permanent Slack refusal is not a transient failure: retrying it three
+  // times only burns Slack's redeliveries, so the ack must not turn it into a
+  // 500. The claim stays, which also dedupes the redelivery.
+  test("answers 200 and reports when Slack refuses the assistant prompts for good", async () => {
+    const db = new FakeD1();
+    let attempts = 0;
+    const reported: unknown[][] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      reported.push(args);
+    };
+    try {
+      const channel = createSlackIngress(
+        trusted,
+        () => Promise.resolve(),
+        createLifecycleHandler(
+          defineAgentConfig({
+            description: "Answers Slack conversations.",
+            name: "Operator Agent",
+            ownerInstructions: "Prefer short answers.",
+            suggestedPrompts: [{ message: "What changed?", title: "Recap" }],
+          }),
+          trusted.botToken,
+          () => {
+            attempts += 1;
+            return Promise.resolve(
+              Response.json({ error: "not_allowed", ok: false }),
+            );
+          },
+        ),
+      );
+      const bindings = testBindings(db);
+      const deliver = async () =>
+        await channel
+          .route()
+          .request(
+            await signedRequest(assistantThreadStarted),
+            undefined,
+            bindings,
+          );
+
+      const first = await deliver();
+      const redelivered = await deliver();
+      await Promise.all(workerWaitUntil);
+      expect(first.status).toBe(200);
+      expect(redelivered.status).toBe(200);
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(attempts).toBe(1);
+    expect(reported).toHaveLength(1);
+  });
+
+  // Slack budgets three seconds for the Events API ack, and the prompt call is
+  // the only Slack round-trip on this path. A Slack that never answers must not
+  // hold the ack open; the side effect is best-effort and the claim is durable.
+  test("acknowledges an assistant-thread start without waiting on the prompt call", async () => {
+    const db = new FakeD1();
+    let calls = 0;
+    const channel = createSlackIngress(
+      trusted,
+      () => Promise.resolve(),
+      createLifecycleHandler(
+        defineAgentConfig({
+          description: "Answers Slack conversations.",
+          name: "Operator Agent",
+          ownerInstructions: "Prefer short answers.",
+          suggestedPrompts: [{ message: "What changed?", title: "Recap" }],
+        }),
+        trusted.botToken,
+        () => {
+          calls += 1;
+          return Promise.withResolvers<Response>().promise;
+        },
+      ),
+    );
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(assistantThreadStarted),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(200);
+    expect(calls).toBe(1);
+    expect(workerWaitUntil).toHaveLength(1);
+  });
+
   test("rejects lifecycle events from a foreign workspace or app", async () => {
     const db = new FakeD1();
     const lifecycles: string[] = [];
@@ -410,14 +873,6 @@ describe("assistant thread lifecycle", () => {
         return Promise.resolve();
       },
     );
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
     const bindings = testBindings(db);
 
     const rejected: AssistantEnvelope[] = [
@@ -436,16 +891,10 @@ describe("assistant thread lifecycle", () => {
       rejected.map(async (payload) => {
         const response = await channel
           .route()
-          .request(
-            await signedRequest(payload),
-            undefined,
-            bindings,
-            executionCtx,
-          );
+          .request(await signedRequest(payload), undefined, bindings);
         expect(response.status).toBe(200);
       }),
     );
-    await Promise.all(pending);
     expect(lifecycles).toEqual([]);
   });
 
@@ -469,6 +918,7 @@ describe("assistant thread lifecycle", () => {
     });
     const app = createApp(
       trusted,
+      MODEL_PROVIDER_CLOUDFLARE,
       (turn) => {
         turns.push(turn.eventId);
         return Promise.resolve();
@@ -488,14 +938,6 @@ describe("assistant thread lifecycle", () => {
         },
       ),
     );
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
 
     const response = await app.request(
       await signedRequest(
@@ -504,10 +946,9 @@ describe("assistant thread lifecycle", () => {
       ),
       undefined,
       testBindings(db),
-      executionCtx,
     );
     expect(response.status).toBe(200);
-    await Promise.all(pending);
+    await Promise.all(workerWaitUntil);
 
     expect(turns).toEqual([]);
     expect(requests).toEqual([
@@ -549,6 +990,7 @@ describe("assistant thread lifecycle", () => {
     });
     const app = createApp(
       secondTrusted,
+      MODEL_PROVIDER_CLOUDFLARE,
       (turn) => {
         turns.push(turn.eventId);
         return Promise.resolve();
@@ -568,14 +1010,6 @@ describe("assistant thread lifecycle", () => {
         },
       ),
     );
-    const pending: Promise<unknown>[] = [];
-    const executionCtx = {
-      passThroughOnException() {},
-      props: {},
-      waitUntil(promise: Promise<unknown>) {
-        pending.push(promise);
-      },
-    };
 
     const response = await app.request(
       await signedRequest(
@@ -584,10 +1018,9 @@ describe("assistant thread lifecycle", () => {
       ),
       undefined,
       testBindings(db),
-      executionCtx,
     );
     expect(response.status).toBe(200);
-    await Promise.all(pending);
+    await Promise.all(workerWaitUntil);
 
     expect(turns).toEqual([]);
     expect(requests).toEqual([
@@ -606,5 +1039,330 @@ describe("assistant thread lifecycle", () => {
         url: "https://slack.com/api/assistant.threads.setSuggestedPrompts",
       },
     ]);
+  });
+});
+
+describe("channel guard", () => {
+  const guardConfig = defineAgentConfig({
+    allowedUserIds: ["U111", "U222"],
+    description: "Guards every channel it was invited to.",
+    name: "Guard Agent",
+    ownerInstructions: "Prefer short answers.",
+  });
+  const guardTrusted = { ...trusted, allowedUserIds: ["U111", "U222"] };
+
+  const guardChannel = (
+    db: FakeD1,
+    calls: RecordedCall[],
+    replies: Record<string, GuardReply> = {},
+  ) =>
+    createSlackIngress(
+      guardTrusted,
+      () => Promise.resolve(),
+      undefined,
+      undefined,
+      createMembershipHandler(
+        guardConfig,
+        guardTrusted.botToken,
+        guardSlackFetcher(calls, replies),
+      ),
+    );
+
+  const readThreadOfForeignChannel = (
+    db: FakeD1,
+    calls: RecordedCall[],
+    channelId: string,
+  ) => {
+    let cursor: string | undefined;
+    const [threadTool] = createSlackReadTools(
+      {
+        channelId: "D777",
+        readsMemberChannels: true,
+        surface: "private",
+        threadTs: "1800000000.000100",
+      },
+      {
+        admissionStore: createSqlSlackChannelAdmissionStore(
+          testBindings(db).DB,
+        ),
+        cursorStore: {
+          load: () => Promise.resolve(cursor),
+          save: (_channelId, value) => {
+            cursor = value;
+            return Promise.resolve();
+          },
+        },
+        fetcher: readSlack(calls),
+        lookbackSeconds: 3600,
+        maxMessages: 50,
+        token: guardTrusted.botToken,
+      },
+    );
+    return threadTool.run({
+      data: { channel: channelId, threadTs: "1800000000.000100" },
+      log: silentLog,
+      toolCallId: "read-call",
+    });
+  };
+
+  test("leaves a channel a foreign user invited the bot to, tells the owners, and reads nothing", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const readCalls: RecordedCall[] = [];
+    const channel = guardChannel(db, guardCalls);
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-foreign", { inviter: "U999" })),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(200);
+    expect(db.seen.has("Ev-foreign")).toBe(true);
+    expect(db.admissions.size).toBe(0);
+    expect(guardCalls.map((call) => call.method)).toEqual([
+      "auth.test",
+      "conversations.leave",
+      "chat.postMessage",
+      "chat.postMessage",
+    ]);
+    expect(guardCalls[1].body).toEqual({ channel: "CFOREIGN" });
+    expect(guardCalls[2].body).toEqual({
+      channel: "U111",
+      text: guardNotice("CFOREIGN", "U999"),
+    });
+    expect(guardCalls[3].body).toEqual({
+      channel: "U222",
+      text: guardNotice("CFOREIGN", "U999"),
+    });
+
+    expect(
+      await refusalOf(
+        Promise.resolve(readThreadOfForeignChannel(db, readCalls, "CFOREIGN")),
+      ),
+    ).toBe("no allowed user invited the bot to CFOREIGN, so it cannot read it");
+    expect(readCalls).toEqual([]);
+  });
+
+  test("admits a channel an allowlisted user invited the bot to, and reads it", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const channel = guardChannel(db, guardCalls);
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-allowed", { inviter: "U111" })),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(200);
+    expect(guardCalls.map((call) => call.method)).toEqual(["auth.test"]);
+    expect([...db.admissions]).toEqual(["CFOREIGN"]);
+
+    const readCalls: RecordedCall[] = [];
+    const { output } = await readThreadOfForeignChannel(
+      db,
+      readCalls,
+      "CFOREIGN",
+    );
+    expect(
+      readCalls
+        .filter((call) => call.method === "conversations.replies")
+        .map((call) => call.body.channel),
+    ).toEqual(["CFOREIGN"]);
+    expect(output.messages.map((message) => message.text)).toEqual(["hello"]);
+  });
+
+  test("ignores a join by any other member", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const channel = guardChannel(db, guardCalls);
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(
+          joined("Ev-member", { inviter: "U999", user: "U999" }),
+        ),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(200);
+    expect(guardCalls.map((call) => call.method)).toEqual(["auth.test"]);
+    expect(db.admissions.size).toBe(0);
+  });
+
+  test("leaves a channel the bot joined with no inviter at all", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const channel = guardChannel(db, guardCalls);
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-nobody")),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(200);
+    expect(guardCalls.map((call) => call.method)).toEqual([
+      "auth.test",
+      "conversations.leave",
+      "chat.postMessage",
+      "chat.postMessage",
+    ]);
+    const notices = guardCalls.filter(
+      (call) => call.method === "chat.postMessage",
+    );
+    expect(notices.map((call) => call.body.channel)).toEqual(["U111", "U222"]);
+    expect(notices.map((call) => call.body.text)).toEqual([
+      guardNotice("CFOREIGN", ""),
+      guardNotice("CFOREIGN", ""),
+    ]);
+    expect(db.admissions.size).toBe(0);
+  });
+
+  test("keeps the leave when Slack refuses an owner's direct message", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const reported: unknown[][] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      reported.push(args);
+    };
+    try {
+      const channel = guardChannel(db, guardCalls, {
+        "chat.postMessage": { error: "channel_not_found", ok: false },
+      });
+
+      const response = await channel
+        .route()
+        .request(
+          await signedRequest(joined("Ev-refused-dm", { inviter: "U999" })),
+          undefined,
+          testBindings(db),
+        );
+
+      expect(response.status).toBe(200);
+    } finally {
+      console.error = originalError;
+    }
+
+    expect(
+      guardCalls.filter((call) => call.method === "conversations.leave"),
+    ).toHaveLength(1);
+    expect(
+      guardCalls.filter((call) => call.method === "chat.postMessage"),
+    ).toHaveLength(2);
+    expect(reported).toHaveLength(2);
+  });
+
+  test("admits any inviter while allowedUserIds is unset, as the ingress admits any user", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const openConfig = defineAgentConfig({
+      description: "Admits everyone.",
+      name: "Open Agent",
+      ownerInstructions: "Prefer short answers.",
+    });
+    const channel = createSlackIngress(
+      trusted,
+      () => Promise.resolve(),
+      undefined,
+      undefined,
+      createMembershipHandler(
+        openConfig,
+        trusted.botToken,
+        guardSlackFetcher(guardCalls),
+      ),
+    );
+
+    const invited = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-open", { inviter: "U999" })),
+        undefined,
+        testBindings(db),
+      );
+    expect(invited.status).toBe(200);
+    expect(guardCalls.map((call) => call.method)).toEqual(["auth.test"]);
+    expect([...db.admissions]).toEqual(["CFOREIGN"]);
+
+    const uninvited = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-open-nobody")),
+        undefined,
+        testBindings(db),
+      );
+    expect(uninvited.status).toBe(200);
+    expect(guardCalls.map((call) => call.method)).toEqual([
+      "auth.test",
+      "auth.test",
+      "conversations.leave",
+    ]);
+    expect(db.admissions.size).toBe(0);
+  });
+
+  test("tells the owners the bot is still there when Slack refuses the leave", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      const channel = guardChannel(db, guardCalls, {
+        "conversations.leave": { error: "missing_scope", ok: false },
+      });
+
+      const response = await channel
+        .route()
+        .request(
+          await signedRequest(joined("Ev-stuck", { inviter: "U999" })),
+          undefined,
+          testBindings(db),
+        );
+
+      expect(response.status).toBe(200);
+    } finally {
+      console.error = originalError;
+    }
+
+    const notices = guardCalls.filter(
+      (call) => call.method === "chat.postMessage",
+    );
+    expect(notices.map((call) => call.body.channel)).toEqual(["U111", "U222"]);
+    for (const notice of notices) {
+      expect(notice.body.text).toContain(
+        "I could not leave <#CFOREIGN> after <@U999> added me there",
+      );
+      expect(notice.body.text).toContain("missing_scope");
+    }
+    expect(db.admissions.size).toBe(0);
+  });
+
+  test("answers non-2xx when Slack cannot say who the bot is, so Slack retries", async () => {
+    const db = new FakeD1();
+    const guardCalls: RecordedCall[] = [];
+    const channel = guardChannel(db, guardCalls, {
+      "auth.test": { user_id: "" },
+    });
+
+    const response = await channel
+      .route()
+      .request(
+        await signedRequest(joined("Ev-no-identity", { inviter: "U999" })),
+        undefined,
+        testBindings(db),
+      );
+
+    expect(response.status).toBe(500);
+    expect(guardCalls.map((call) => call.method)).toEqual(["auth.test"]);
+    expect(db.seen.has("Ev-no-identity")).toBe(false);
   });
 });

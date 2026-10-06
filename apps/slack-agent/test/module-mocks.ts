@@ -42,17 +42,27 @@ export const retentionExtendCapture: RetentionExtendCapture = {};
 // export list and the bindings a test may stand in for are declared here.
 export interface MockedWorkerEnv {
   AI?: unknown;
+  CRM_MCP_TOKEN?: string;
+  DB?: unknown;
   EXTENSION_SECRET?: string;
+  FLUE_SLACK_AGENT_AGENT?: unknown;
   SLACK_APP_ID?: string;
   SLACK_BOT_TOKEN: string;
   SLACK_SIGNING_SECRET?: string;
   SLACK_TEAM_ID?: string;
 }
 
+export const workerWaitUntil: Promise<unknown>[] = [];
+
 export const mockCloudflareWorkers = async (
   env: MockedWorkerEnv,
 ): Promise<void> => {
-  await mock.module("cloudflare:workers", () => ({ env }));
+  await mock.module("cloudflare:workers", () => ({
+    env,
+    waitUntil: (promise: Promise<unknown>) => {
+      workerWaitUntil.push(promise);
+    },
+  }));
 };
 
 export const mockWorkersAi = async (): Promise<void> => {
