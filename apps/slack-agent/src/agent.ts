@@ -7,6 +7,7 @@ import {
   createApprovalFetch,
   createApprovalNotifier,
   createApprovalStore,
+  createSlackMentionTool,
   createSlackReadTools,
   createSqlSlackChannelAdmissionStore,
   createSqlSlackDeliveryStore,
@@ -172,6 +173,20 @@ export const SlackAgent = (props: AgentProps) => {
       );
       for (const tool of tools) {
         useTool(tool);
+      }
+      if (slack.output.surface === "channel") {
+        useTool(
+          createSlackMentionTool(
+            slack.output.channelId,
+            { token: botToken() },
+            (userId) => {
+              applySlackDeliveryEvent(deliveryStore(), props.id, {
+                type: "mention",
+                userId,
+              });
+            },
+          ),
+        );
       }
       if (
         slack.output.surface === "channel" &&

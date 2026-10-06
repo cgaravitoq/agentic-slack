@@ -88,7 +88,18 @@ const taskAppendBody = v.strictObject({
   ts: v.string(),
 });
 const appendStreamBody = v.union([markdownAppendBody, taskAppendBody]);
-const stopStreamBody = v.strictObject({ channel: v.string(), ts: v.string() });
+const stopStreamBody = v.strictObject({
+  blocks: v.optional(
+    v.tuple([
+      v.strictObject({
+        text: v.strictObject({ text: v.string(), type: v.literal("mrkdwn") }),
+        type: v.literal("section"),
+      }),
+    ]),
+  ),
+  channel: v.string(),
+  ts: v.string(),
+});
 
 const parseSlackCall = (method: string, json: string): SlackCall => {
   const raw: unknown = JSON.parse(json);
@@ -1735,6 +1746,23 @@ const markedAnswer = (length: number): string => {
   return `${text.slice(0, length - 5)}<TAIL`;
 };
 
+const closings = (slack: FakeSlack): string[] =>
+  slack.calls
+    .filter((call) => call.method === "chat.stopStream")
+    .flatMap(
+      (call) =>
+        v
+          .parse(stopStreamBody, call.body)
+          .blocks?.map((block) => block.text.text) ?? [],
+    );
+
+const tagMembers = (store: SlackDeliveryStore, id: string) => {
+  for (const userId of ["U0BEN", "U0ANA", "U0BEN"]) {
+    applySlackDeliveryEvent(store, id, { type: "mention", userId });
+  }
+  applySlackDeliveryEvent(store, id, { text: "Tagged.", type: "text" });
+};
+
 const streamToolStep = (store: SlackDeliveryStore, id: string) => {
   applySlackDeliveryEvent(store, id, {
     id: "call-1",
@@ -2002,6 +2030,136 @@ describe("durable Slack delivery", () => {
       expect(slack.taskChunks()).toEqual([]);
       expect(slack.markdownChunks()).toEqual(["Done."]);
     }
+  });
+
+  test("closes the reply with the tags and links its binding carries, live or replayed", async () => {
+    const binding = {
+      ...slackDeliveryBinding(channelTarget),
+      links: "https://github.com/o/r/pull/1?a=1&b=2",
+      mentions: "U0ANA U0BEN",
+    };
+    const live = createFakeSlack();
+    const liveStore = memoryStore();
+    openSlackDelivery(liveStore, "live", binding, BOT_TOKEN, live.fetcher);
+    applySlackDeliveryEvent(liveStore, "live", { text: "Done.", type: "text" });
+    await finishSlackDelivery(liveStore, "live", BOT_TOKEN, live.fetcher);
+    const replayed = createFakeSlack();
+    const replayStore = memoryStore();
+    openSlackDelivery(
+      replayStore,
+      "replay",
+      binding,
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+    evictLiveSlackDelivery("replay");
+    applySlackDeliveryEvent(replayStore, "replay", {
+      text: "Done.",
+      type: "text",
+    });
+    await finishSlackDelivery(
+      replayStore,
+      "replay",
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+
+    for (const slack of [live, replayed]) {
+      expect(slack.markdownChunks()).toEqual(["Done."]);
+      expect(closings(slack)).toEqual([
+        "<@U0ANA> <@U0BEN> <https://github.com/o/r/pull/1?a=1&amp;b=2>",
+      ]);
+    }
+  });
+
+  test("closes the reply with each member the turn tagged once, live or replayed", async () => {
+    const binding = {
+      ...slackDeliveryBinding(channelTarget),
+      mentions: "U0ANA",
+    };
+    const live = createFakeSlack();
+    const liveStore = memoryStore();
+    openSlackDelivery(liveStore, "live", binding, BOT_TOKEN, live.fetcher);
+    tagMembers(liveStore, "live");
+    await finishSlackDelivery(liveStore, "live", BOT_TOKEN, live.fetcher);
+    const replayed = createFakeSlack();
+    const replayStore = memoryStore();
+    openSlackDelivery(
+      replayStore,
+      "replay",
+      binding,
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+    evictLiveSlackDelivery("replay");
+    tagMembers(replayStore, "replay");
+    await finishSlackDelivery(
+      replayStore,
+      "replay",
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+
+    for (const slack of [live, replayed]) {
+      expect(slack.markdownChunks()).toEqual(["Tagged."]);
+      expect(closings(slack)).toEqual(["<@U0ANA> <@U0BEN>"]);
+    }
+  });
+
+  test("still closes a failed turn's milestone with its tags and link", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    openSlackDelivery(
+      store,
+      "i1",
+      {
+        ...slackDeliveryBinding(channelTarget),
+        fallbackText: "PR ready",
+        links: "https://github.com/o/r/pull/1",
+        mentions: "U0ANA",
+      },
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+    evictLiveSlackDelivery("i1");
+
+    await failSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.markdownChunks()).toEqual(["PR ready"]);
+    expect(closings(slack)).toEqual([
+      "<@U0ANA> <https://github.com/o/r/pull/1>",
+    ]);
+  });
+
+  test("a milestone joining the live thread adds its tags and link to the close", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const first = {
+      ...slackDeliveryBinding(channelTarget),
+      fallbackText: "Started",
+      links: "https://example.com/run",
+      mentions: "U0ANA",
+    };
+    openSlackDelivery(store, "i1", first, BOT_TOKEN, slack.fetcher);
+    openSlackDelivery(
+      store,
+      "i1",
+      {
+        ...first,
+        fallbackText: "PR ready",
+        links: "https://github.com/o/r/pull/1",
+        mentions: "U0ANA U0BEN",
+      },
+      BOT_TOKEN,
+      slack.fetcher,
+    );
+
+    await finishSlackDelivery(store, "i1", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.markdownChunks()).toEqual(["Started\n\nPR ready"]);
+    expect(closings(slack)).toEqual([
+      "<@U0ANA> <@U0BEN> <https://example.com/run> <https://github.com/o/r/pull/1>",
+    ]);
   });
 
   test("tells the user and closes the record when the durable replay fails", async () => {

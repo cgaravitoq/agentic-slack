@@ -38,6 +38,7 @@ export {
 } from "./delivery.ts";
 export type { SlackDeliveryBinding, SlackDeliveryStore } from "./delivery.ts";
 export { generateSlackManifest } from "./manifest.ts";
+export { createSlackMentionTool } from "./mention.ts";
 export { composeInstructions } from "./prompt.ts";
 export { createSlackProgressEndpoint } from "./progress.ts";
 export type { SlackProgressEndpoint, SlackProgressTurn } from "./progress.ts";

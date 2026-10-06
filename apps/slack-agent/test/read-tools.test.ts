@@ -1032,6 +1032,7 @@ test("mounts the read tools bound to the channel of the delivered message", asyn
     expect(mounted.map((tool) => tool.name)).toEqual([
       "read_thread",
       "read_channel_since",
+      "mention_member",
     ]);
 
     const readChannelSince = mounted.find(

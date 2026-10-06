@@ -65,13 +65,13 @@ export interface SlackReadOptions {
   readonly token: string;
 }
 
-interface SlackCaller {
+export interface SlackCaller {
   readonly fetcher: Fetcher;
   readonly signal?: AbortSignal;
   readonly token: string;
 }
 
-const slackEnvelope = {
+export const slackEnvelope = {
   error: v.optional(v.string()),
   ok: v.boolean(),
 };
@@ -125,7 +125,7 @@ const authTestSchema = v.object({
 
 type SlackParams = Record<string, string | undefined>;
 
-const callSlack = async <TOutput extends SlackEnvelope>(
+export const callSlack = async <TOutput extends SlackEnvelope>(
   caller: SlackCaller,
   method: string,
   params: SlackParams,

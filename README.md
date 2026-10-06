@@ -95,6 +95,7 @@ A brokered turn streams the same way a Workers AI turn does, including tool call
 
 The sanitizer withholds a bounded tail of `STREAM_TAIL_LENGTH` (512) characters before sending text to Slack.
 It removes Slack broadcast syntax, escapes mention controls, rewrites Slack's own link syntax into the markdown links a stream renders, redacts Slack token patterns, and redacts assignments whose names contain terms such as `TOKEN`, `SECRET`, `PASSWORD`, or `API_KEY`.
+Slack renders neither a mention nor its own link syntax inside streamed markdown, so the tags and links trusted code owes a reply close the message as one section block on `chat.stopStream`: every member the model tagged with `mention_member`.
 This is pattern-based output filtering, not a guarantee that arbitrary credentials or confidential content cannot appear in a reply.
 Appends are coalesced at `COALESCE_CHARS` (1024) characters and on a `COALESCE_MS` (300) millisecond timer.
 Retryable Slack failures use bounded backoff or `Retry-After`, capped at `MAX_RETRY_AFTER_MS` (2000) milliseconds per attempt and `MAX_RETRY_WAIT_MS` (4000) milliseconds across attempts.
@@ -213,10 +214,12 @@ export default defineAgentConfig({
 });
 ```
 
-`read` mounts two tools for the model:
+`read` mounts two read tools for the model, and a third in a channel conversation:
 
 - `read_thread` pages `conversations.replies` to the end of one thread.
 - `read_channel_since` reads the messages posted in one channel after a cursor, oldest first, and expands the parents whose `latest_reply` is after that cursor, because `conversations.history` returns top-level messages only.
+- `mention_member` tags a member of the conversation's channel, named by user ID, display or real name, or one word of it.
+  It refuses anyone outside the channel and a name several members share, and the tag closes the reply instead of riding in the model's text.
 
 Both return compact records - author display name, timestamp, permalink, text - plus a coverage block, and both are bounded by `maxMessages` per call.
 `lookbackSeconds` bounds how far before the cursor `read_channel_since` scans for thread parents.
@@ -241,7 +244,7 @@ It advances only as far as coverage is complete: to the last returned message of
 Slack stays the source of truth: that cursor is the only thing stored, no message is mirrored, and the tools use the bot token you already configured.
 The admission in D1 (`slack_channel_admissions`, migration `0005_slack_channel_admissions.sql`) records which allowlisted user invited the bot to a channel and when, and every read checks it before its first Slack call.
 
-The option adds four more bot token scopes: `channels:history` and `groups:history` to read public and private channels, `mpim:history` to read group DMs, and `users:read` to resolve author display names, cached per call.
+The option adds four more bot token scopes: `channels:history` and `groups:history` to read public and private channels, `mpim:history` to read group DMs, and `users:read` to resolve author display names, cached per call, and the members a tag names.
 Add them in your Slack app and reinstall it; `bun run manifest` includes them as soon as `read` is set.
 
 ## Reporting task progress
