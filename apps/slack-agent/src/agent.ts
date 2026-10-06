@@ -15,6 +15,7 @@ import {
   failSlackDelivery,
   finishSlackDelivery,
   openSlackDelivery,
+  readChannelBeforeMention,
   replaceRetention,
   slackDeliveryBindingSchema,
   slackEventFromObservation,
@@ -25,6 +26,7 @@ import type {
   ExpirySchedule,
   SlackDeliveryBinding,
   SlackDeliveryStore,
+  SlackReadOptions,
 } from "@agentic-slack/core";
 import {
   observe,
@@ -150,7 +152,13 @@ export const SlackAgent = (props: AgentProps) => {
   if (config.read !== undefined && delivery.kind === "signal") {
     const slack = v.safeParse(slackDeliveryBindingSchema, delivery.attributes);
     if (slack.success) {
-      const cursorStore = createSqlSlackReadCursorStore(env.DB);
+      const readOptions: SlackReadOptions = {
+        admissionStore: createSqlSlackChannelAdmissionStore(env.DB),
+        cursorStore: createSqlSlackReadCursorStore(env.DB),
+        lookbackSeconds: config.read.lookbackSeconds,
+        maxMessages: config.read.maxMessages,
+        token: botToken(),
+      };
       const tools = createSlackReadTools(
         {
           channelId: slack.output.channelId,
@@ -160,16 +168,26 @@ export const SlackAgent = (props: AgentProps) => {
           surface: slack.output.surface,
           threadTs: slack.output.threadTs,
         },
-        {
-          admissionStore: createSqlSlackChannelAdmissionStore(env.DB),
-          cursorStore,
-          lookbackSeconds: config.read.lookbackSeconds,
-          maxMessages: config.read.maxMessages,
-          token: botToken(),
-        },
+        readOptions,
       );
       for (const tool of tools) {
         useTool(tool);
+      }
+      if (
+        slack.output.surface === "channel" &&
+        delivery.attributes?.message_ts === slack.output.threadTs
+      ) {
+        const mention = {
+          channelId: slack.output.channelId,
+          ts: slack.output.threadTs,
+        };
+        useAgentStart(async ({ append, signal }) => {
+          append({
+            body: await readChannelBeforeMention(mention, readOptions, signal),
+            kind: "signal",
+            type: "slack.channel_context",
+          });
+        });
       }
     }
   }

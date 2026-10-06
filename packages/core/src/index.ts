@@ -44,7 +44,9 @@ export type { SlackProgressEndpoint, SlackProgressTurn } from "./progress.ts";
 export {
   createSlackReadTools,
   createSqlSlackReadCursorStore,
+  readChannelBeforeMention,
 } from "./read.ts";
+export type { SlackReadOptions } from "./read.ts";
 export {
   expireLatest,
   refreshRetention,
