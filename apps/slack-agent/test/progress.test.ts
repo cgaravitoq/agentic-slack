@@ -1050,7 +1050,102 @@ const repliesEndpoint = (db: FakeD1, calls: RecordedCall[]) => {
   });
 };
 
+const LONG_ROOT_TS = "171.000001";
+
+const longThread = (replies: number) => [
+  {
+    bot_id: "B1",
+    text: "Release 42 · Started",
+    ts: LONG_ROOT_TS,
+    user: "UBLOOP",
+  },
+  ...Array.from({ length: replies }, (_, index) => ({
+    text: `reply ${String(index + 1)}`,
+    ts: `171.${String(index + 2).padStart(6, "0")}`,
+    user: "U0ANA",
+  })),
+];
+
+const pagedThreadReader =
+  (
+    calls: RecordedCall[],
+    messages: readonly { text: string; ts: string; user: string }[],
+  ): Fetcher =>
+  (input, init) => {
+    const url = v.parse(v.string(), input);
+    const method = url.slice(url.lastIndexOf("/") + 1);
+    const body = callBody(init);
+    calls.push({ body, method });
+    if (method === "conversations.replies") {
+      const oldest = Number(body.oldest ?? "0");
+      const matching = messages.filter(
+        (message, index) => index === 0 || Number(message.ts) > oldest,
+      );
+      const offset = Number(body.cursor ?? "0");
+      const limit = Number(body.limit);
+      const more = offset + limit < matching.length;
+      return Promise.resolve(
+        Response.json({
+          has_more: more,
+          messages: matching.slice(offset, offset + limit),
+          ok: true,
+          response_metadata: more
+            ? { next_cursor: String(offset + limit) }
+            : {},
+        }),
+      );
+    }
+    return threadReader([])(input, init);
+  };
+
+const longThreadEndpoint = (calls: RecordedCall[], replies: number) => {
+  const db = new FakeD1();
+  db.admissions.set("C1", ADMITTED_BY);
+  db.roots.set(`C1\u0000release-42`, {
+    root_text: "Release 42 · Started",
+    root_ts: LONG_ROOT_TS,
+  });
+  return endpointFor(db, calls, {
+    fetcher: strictFetch(pagedThreadReader(calls, longThread(replies))),
+  });
+};
+
 describe("progress replies", () => {
+  test("returns every reply of a thread that spans several pages", async () => {
+    const calls: RecordedCall[] = [];
+    const endpoint = longThreadEndpoint(calls, 450);
+
+    const response = await endpoint.handleReplies(
+      getReplies({ channel: "C1", task: "release-42" }),
+    );
+
+    const { messages } = v.parse(
+      v.object({ messages: v.array(v.object({ ts: v.string() })) }),
+      await response.json(),
+    );
+    expect(messages).toHaveLength(450);
+    expect(messages.at(-1)?.ts).toBe("171.000451");
+    expect(
+      calls.filter((call) => call.method === "conversations.replies"),
+    ).toHaveLength(3);
+  });
+
+  test("asks Slack only for what came after oldest, so a poll with nothing new reads nothing old", async () => {
+    const calls: RecordedCall[] = [];
+    const endpoint = longThreadEndpoint(calls, 450);
+
+    const response = await endpoint.handleReplies(
+      getReplies({ channel: "C1", oldest: "171.000451", task: "release-42" }),
+    );
+
+    expect(await response.json()).toEqual({ messages: [], ok: true });
+    const replies = calls.filter(
+      (call) => call.method === "conversations.replies",
+    );
+    expect(replies.map((call) => call.body.oldest)).toEqual(["171.000451"]);
+    expect(calls.map((call) => call.method)).not.toContain("users.info");
+  });
+
   test("returns every reply under a task's root, oldest first, named by author", async () => {
     const calls: RecordedCall[] = [];
     const endpoint = repliesEndpoint(new FakeD1(), calls);

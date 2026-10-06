@@ -633,6 +633,7 @@ export const readThreadReplies = async (
   const after = Math.max(Number(threadTs), Number(oldest ?? threadTs));
   const replies = await fullPages(ctx.caller, "conversations.replies", {
     channel: channelId,
+    oldest,
     ts: threadTs,
   });
   return await messageRecords(
