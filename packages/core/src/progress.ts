@@ -5,6 +5,7 @@ import { createSqlSlackChannelAdmissionStore } from "./admission.ts";
 import { claimAndRun } from "./dedup.ts";
 import { MAX_SLACK_MESSAGE_LENGTH } from "./delivery.ts";
 import type { SlackDeliveryBinding } from "./delivery.ts";
+import { readThreadReplies } from "./read.ts";
 
 const PROGRESS_KINDS = [
   "started",
@@ -101,6 +102,12 @@ const milestoneSchema = v.object({
 });
 
 type SlackProgressMilestone = v.InferOutput<typeof milestoneSchema>;
+
+const repliesQuerySchema = v.object({
+  channel: v.pipe(v.string(), v.nonEmpty(), v.maxLength(CHANNEL_LIMIT)),
+  oldest: v.optional(v.pipe(v.string(), v.regex(/^\d+(?:\.\d+)?$/u))),
+  task: v.pipe(v.string(), v.nonEmpty(), v.maxLength(TASK_LIMIT)),
+});
 
 const rootRow = v.object({ root_text: v.string(), root_ts: v.string() });
 
@@ -228,6 +235,7 @@ export interface SlackProgressEndpoint {
   readonly authSecret: string;
   readonly handle: (request: Request) => Promise<Response>;
   readonly handleChannels: (request: Request) => Promise<Response>;
+  readonly handleReplies: (request: Request) => Promise<Response>;
 }
 
 type SlackChannelKind = "channel" | "group" | "private";
@@ -555,6 +563,41 @@ export const createSlackProgressEndpoint = (
         })),
       );
       return Response.json({ channels, ok: true });
+    },
+    async handleReplies(request) {
+      if (!authorized(request)) {
+        return refusal(401, "unauthorized");
+      }
+      const query = v.safeParse(
+        repliesQuerySchema,
+        Object.fromEntries(new URL(request.url).searchParams),
+      );
+      if (!query.success) {
+        return refusal(400, "invalid_request");
+      }
+      const resolved = await resolveChannel(query.output.channel);
+      if ("refusal" in resolved) {
+        return refusal(
+          resolved.refusal === "ambiguous_channel" ? 409 : 403,
+          resolved.refusal,
+        );
+      }
+      const root = await roots.load(resolved.channelId, query.output.task);
+      if (root === undefined) {
+        return refusal(404, "no_thread");
+      }
+      try {
+        const messages = await readThreadReplies(
+          caller,
+          resolved.channelId,
+          root.rootTs,
+          query.output.oldest,
+        );
+        return Response.json({ messages, ok: true });
+      } catch (error: unknown) {
+        console.error("Slack progress replies failed", error);
+        return refusal(500, "slack_failed");
+      }
     },
   };
 };

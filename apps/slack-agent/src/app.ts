@@ -67,6 +67,10 @@ export const createApp = (
       "/progress/channels",
       async (context) => await progress.handleChannels(context.req.raw),
     );
+    app.get(
+      "/progress/replies",
+      async (context) => await progress.handleReplies(context.req.raw),
+    );
   }
   app.route("/channels/slack", channel.route());
   return app;
