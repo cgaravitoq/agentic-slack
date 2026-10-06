@@ -920,6 +920,7 @@ describe("narrated progress endpoint", () => {
           recipientTeamId: "T123",
           recipientUserId: ADMITTED_BY,
           surface: "channel",
+          taskUpdates: "hidden",
           threadTs: "171.1",
         },
         body: [

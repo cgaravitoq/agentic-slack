@@ -130,6 +130,7 @@ interface SlackStreamTarget {
   readonly recipientUserId: string;
   readonly recipientTeamId: string;
   readonly surface: ConversationSurface;
+  readonly taskUpdates?: "hidden";
   readonly [routedOrigin]: true;
 }
 
@@ -154,6 +155,7 @@ export const slackDeliveryBindingSchema = v.object({
   recipientTeamId: v.pipe(v.string(), v.minLength(1)),
   recipientUserId: v.pipe(v.string(), v.minLength(1)),
   surface: v.picklist(["channel", "private"]),
+  taskUpdates: v.optional(v.literal("hidden")),
   threadTs: v.pipe(v.string(), v.minLength(1)),
 });
 
@@ -175,17 +177,20 @@ export const slackDeliveryBinding = (
 const streamTargetFromBinding = (
   binding: SlackDeliveryBinding,
 ): SlackStreamTarget =>
-  streamTargetFor({
-    appId: "_",
-    channelId: binding.channelId,
-    eventId: "_",
-    kind: "turn",
-    messageTs: "_",
-    surface: binding.surface,
-    teamId: binding.recipientTeamId,
-    text: "_",
-    threadTs: binding.threadTs,
-    userId: binding.recipientUserId,
+  Object.freeze<SlackStreamTarget>({
+    ...streamTargetFor({
+      appId: "_",
+      channelId: binding.channelId,
+      eventId: "_",
+      kind: "turn",
+      messageTs: "_",
+      surface: binding.surface,
+      teamId: binding.recipientTeamId,
+      text: "_",
+      threadTs: binding.threadTs,
+      userId: binding.recipientUserId,
+    }),
+    taskUpdates: binding.taskUpdates,
   });
 
 export interface SlackStream {
@@ -691,7 +696,7 @@ export const createSlackStream = (
       }
     },
     task(update) {
-      if (closed) {
+      if (closed || target.taskUpdates === "hidden") {
         return;
       }
       flushPending();
@@ -756,7 +761,6 @@ const applyDeliveryEvent = (
   }
   stream.task({
     id: event.id,
-    output: event.output,
     status: event.error ? "error" : "complete",
     title: toolNames.get(event.id) ?? "",
   });

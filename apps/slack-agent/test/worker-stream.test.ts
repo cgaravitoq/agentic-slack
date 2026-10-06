@@ -806,7 +806,6 @@ test("streams a tool call as a named, sanitized task update", async () => {
       chunks: [
         {
           id: "call-1",
-          output: "found three matches",
           status: "complete",
           title: "search_docs",
           type: "task_update",
@@ -846,7 +845,6 @@ test("does not reuse a tool-call id title from an earlier turn", async () => {
   expect(taskChunks()).toEqual([
     {
       id: "call-shared",
-      output: "two",
       status: "complete",
       title: "Step",
       type: "task_update",
@@ -864,7 +862,6 @@ test("names an orphan tool result as a fallback step", async () => {
   expect(taskChunks()).toEqual([
     {
       id: "call-orphan",
-      output: "found three",
       status: "complete",
       title: "Step",
       type: "task_update",
@@ -931,7 +928,6 @@ test("marks a failed tool as an error and still finishes the reply", async () =>
     },
     {
       id: "call-2",
-      output: "upstream refused the request",
       status: "error",
       title: "search_docs",
       type: "task_update",
@@ -943,7 +939,7 @@ test("marks a failed tool as an error and still finishes the reply", async () =>
   ]);
 });
 
-test("redacts credentials carried in a tool result before the wire", async () => {
+test("keeps a tool result and its credentials off the wire", async () => {
   toolChunks = [
     toolInput("call-3", "read_env"),
     toolOutput("call-3", {
@@ -976,8 +972,6 @@ test("redacts credentials carried in a tool result before the wire", async () =>
       chunks: [
         {
           id: "call-3",
-          output:
-            '{[internal configuration],"auth":"[secret]","note":[internal configuration]",[internal configuration]}',
           status: "complete",
           title: "read_env",
           type: "task_update",
@@ -991,9 +985,12 @@ test("redacts credentials carried in a tool result before the wire", async () =>
       ts: STREAM_TS,
     },
   ]);
+  expect(JSON.stringify(slackCalls)).not.toContain("AKIA-live-1");
+  expect(JSON.stringify(slackCalls)).not.toContain("hunter2");
+  expect(JSON.stringify(slackCalls)).not.toContain("xoxb-1234567890");
 });
 
-test("redacts credentials escaped by JSON.stringify before the wire", async () => {
+test("keeps a JSON-escaped tool result and its credentials off the wire", async () => {
   toolChunks = [
     toolInput("call-http", "http_get"),
     toolOutput("call-http", {
@@ -1028,8 +1025,6 @@ test("redacts credentials escaped by JSON.stringify before the wire", async () =
       chunks: [
         {
           id: "call-http",
-          output:
-            '{"body":"{[internal configuration],[internal configuration]}","status":200}',
           status: "complete",
           title: "http_get",
           type: "task_update",
@@ -1054,7 +1049,6 @@ test("redacts credentials escaped by JSON.stringify before the wire", async () =
       chunks: [
         {
           id: "call-err",
-          output: '{"stderr":"auth failed for [internal configuration]"}',
           status: "complete",
           title: "run_cmd",
           type: "task_update",
@@ -1068,6 +1062,8 @@ test("redacts credentials escaped by JSON.stringify before the wire", async () =
       ts: STREAM_TS,
     },
   ]);
+  expect(JSON.stringify(slackCalls)).not.toContain("AKIA-live-1");
+  expect(JSON.stringify(slackCalls)).not.toContain("hunter2");
 });
 
 test("returns 200 without awaiting delivery, and the DO alarm path streams the reply", async () => {
@@ -1132,7 +1128,6 @@ test("delivers the durable reply after the isolate drops its live stream handle"
       chunks: [
         {
           id: "call-1",
-          output: "found three matches",
           status: "complete",
           title: "search_docs",
           type: "task_update",

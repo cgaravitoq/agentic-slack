@@ -1715,6 +1715,21 @@ const markedAnswer = (length: number): string => {
   return `${text.slice(0, length - 5)}<TAIL`;
 };
 
+const streamToolStep = (store: SlackDeliveryStore, id: string) => {
+  applySlackDeliveryEvent(store, id, {
+    id: "call-1",
+    name: "read_thread",
+    type: "tool-start",
+  });
+  applySlackDeliveryEvent(store, id, {
+    error: false,
+    id: "call-1",
+    output: '{"coverage":{}}',
+    type: "tool-result",
+  });
+  applySlackDeliveryEvent(store, id, { text: "Done.", type: "text" });
+};
+
 describe("durable Slack delivery", () => {
   const startStreamThreads = (slack: FakeSlack): string[] =>
     slack.calls
@@ -1921,7 +1936,6 @@ describe("durable Slack delivery", () => {
       },
       {
         id: "call-1",
-        output: "found three",
         status: "complete",
         title: "search_docs",
         type: "task_update",
@@ -1934,6 +1948,40 @@ describe("durable Slack delivery", () => {
     expect(
       slack.methods().filter((method) => method === "chat.stopStream"),
     ).toHaveLength(1);
+  });
+
+  test("streams no tool step for a binding that hides them, live or replayed", async () => {
+    const binding = {
+      ...slackDeliveryBinding(channelTarget),
+      taskUpdates: "hidden" as const,
+    };
+    const live = createFakeSlack();
+    const liveStore = memoryStore();
+    openSlackDelivery(liveStore, "live", binding, BOT_TOKEN, live.fetcher);
+    streamToolStep(liveStore, "live");
+    await finishSlackDelivery(liveStore, "live", BOT_TOKEN, live.fetcher);
+    const replayed = createFakeSlack();
+    const replayStore = memoryStore();
+    openSlackDelivery(
+      replayStore,
+      "replay",
+      binding,
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+    evictLiveSlackDelivery("replay");
+    streamToolStep(replayStore, "replay");
+    await finishSlackDelivery(
+      replayStore,
+      "replay",
+      BOT_TOKEN,
+      replayed.fetcher,
+    );
+
+    for (const slack of [live, replayed]) {
+      expect(slack.taskChunks()).toEqual([]);
+      expect(slack.markdownChunks()).toEqual(["Done."]);
+    }
   });
 
   test("tells the user and closes the record when the durable replay fails", async () => {

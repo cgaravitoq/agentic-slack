@@ -19,6 +19,7 @@ type Fetcher = (
 ) => Promise<Response>;
 
 interface FakeSlackMessage {
+  blocks?: { title?: string; type: string }[];
   bot_id?: string;
   latest_reply?: string;
   text?: string;
@@ -287,6 +288,55 @@ test("returns every message of a thread that spans two pages", async () => {
   expect(
     harness.calls.filter((call) => call.method === "users.info"),
   ).toHaveLength(2);
+});
+
+test("reads a streamed reply without the tool step titles Slack puts before its text", async () => {
+  const parentTs = at(-300);
+  const harness = readHarness({
+    binding: channelBinding("C1", parentTs),
+    fixture: {
+      admitted: ["C1"],
+      channels: {},
+      pageSize: 50,
+      threads: {
+        [`C1:${parentTs}`]: [
+          { text: "root", ts: parentTs, user: "U111" },
+          {
+            blocks: [
+              { title: "read_thread", type: "task_card" },
+              { title: "read_channel_since", type: "task_card" },
+              { type: "rich_text" },
+            ],
+            bot_id: "B1",
+            text: "read_thread read_channel_since Carlos opened the PR.",
+            ts: at(0, 200),
+            user: "UBOT",
+          },
+          {
+            blocks: [{ type: "rich_text" }],
+            text: "read_thread is the tool name",
+            ts: at(0, 300),
+            user: "U111",
+          },
+        ],
+      },
+      users: { U111: "Ada", UBOT: "Bloop" },
+    },
+    lookbackSeconds: 3600,
+    maxMessages: 50,
+  });
+
+  const thread = await harness.threadTool.run({
+    data: {},
+    log: silentLog,
+    toolCallId: "read-call",
+  });
+
+  expect(thread.output.messages.map((message) => message.text)).toEqual([
+    "root",
+    "Carlos opened the PR.",
+    "read_thread is the tool name",
+  ]);
 });
 
 test("bounds a thread read across a page boundary and resumes it to the end", async () => {
