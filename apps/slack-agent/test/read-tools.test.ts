@@ -1,5 +1,10 @@
 import { expect, mock, spyOn, test } from "bun:test";
-import type { DeliveredMessage, ToolDefinition } from "@flue/runtime";
+import type {
+  AgentAppendMessage,
+  AgentStartContext,
+  DeliveredMessage,
+  ToolDefinition,
+} from "@flue/runtime";
 import { defineAgentConfig, generateSlackManifest } from "@agentic-slack/core";
 import type { SlackChannelAdmissionStore } from "@agentic-slack/core";
 import * as v from "valibot";
@@ -829,14 +834,19 @@ test("subscribes to the bot's own joins and to nothing else new", () => {
 const workerEnv: MockedWorkerEnv = { SLACK_BOT_TOKEN: "xoxb-test-token" };
 await mockCloudflareWorkers(workerEnv);
 
+type AgentStart = (
+  context: Pick<AgentStartContext, "append" | "log" | "signal">,
+) => void | Promise<void>;
+
 const mounted: ToolDefinition[] = [];
+const agentStarts: AgentStart[] = [];
 let delivery: DeliveredMessage = { body: "", kind: "user" };
 const runtime = await import("@flue/runtime");
 await mock.module("@flue/runtime", () => ({
   ...runtime,
   observe: () => () => {},
   useAgentFinish: () => {},
-  useAgentStart: () => {},
+  useAgentStart: (start: AgentStart) => agentStarts.push(start),
   useDelivery: () => delivery,
   useInstruction: () => {},
   useMcpConnection: () => {},
@@ -998,6 +1008,126 @@ test("mounts the read tools bound to the channel of the delivered message", asyn
     network.mockRestore();
     await mock.module("../agent.config.ts", () => ({ default: shipped }));
   }
+});
+
+const topLevelAttributes = {
+  channelId: "C1",
+  message_ts: at(-50),
+  recipientTeamId: "T123",
+  recipientUserId: "U111",
+  surface: "channel",
+  threadTs: at(-50),
+};
+
+const topLevelMention: DeliveredMessage = {
+  attributes: topLevelAttributes,
+  body: "what do you think?",
+  kind: "signal",
+  type: "slack.app_mention",
+};
+
+const contextFixture: FakeSlackFixture = {
+  admitted: ["C1"],
+  channels: {
+    C1: [
+      { text: "too old to matter", ts: at(-7200), user: "U111" },
+      { text: "SQLite or Postgres for the cache?", ts: at(-200), user: "U111" },
+      { text: "Postgres, for the runners", ts: at(-100), user: "U222" },
+      { text: "what do you think?", ts: at(-50), user: "U111" },
+    ],
+  },
+  pageSize: 50,
+  threads: {},
+  users: { U111: "Ada", U222: "Grace" },
+};
+
+const startAgentWith = async (
+  mention: DeliveredMessage,
+  admitted: readonly string[],
+): Promise<{ appended: AgentAppendMessage[]; calls: FakeSlackCall[] }> => {
+  const { default: shipped } = await import("../agent.config.ts");
+  const api = fakeSlack(contextFixture);
+  const network = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(strictFetch(api.fetcher), { preconnect: fetch.preconnect }),
+  );
+  const db = fakeReadDb();
+  for (const channel of admitted) {
+    db.admissions.add(channel);
+  }
+  workerEnv.DB = db.db;
+  await mock.module("../agent.config.ts", () => ({ default: readConfig }));
+  try {
+    const specifier = "../src/agent.ts?read-mention-context";
+    const entry: unknown = await import(specifier);
+    const slackAgent = v.parse(
+      v.object({ SlackAgent: v.function() }),
+      entry,
+    ).SlackAgent;
+    agentStarts.length = 0;
+    delivery = mention;
+    slackAgent({ id: "test" });
+    const appended: AgentAppendMessage[] = [];
+    await Promise.all(
+      agentStarts.map(async (start) => {
+        await start({
+          append: (message) => {
+            appended.push(message);
+          },
+          log: silentLog,
+          signal: new AbortController().signal,
+        });
+      }),
+    );
+    return { appended, calls: api.calls };
+  } finally {
+    network.mockRestore();
+    await mock.module("../agent.config.ts", () => ({ default: shipped }));
+  }
+};
+
+test("hands the model the channel messages before a mention that opens a thread", async () => {
+  const { appended, calls } = await startAgentWith(topLevelMention, ["C1"]);
+
+  const history = calls.find((call) => call.method === "conversations.history");
+  expect(history?.params.get("channel")).toBe("C1");
+  expect(history?.params.get("latest")).toBe(at(-50));
+  expect(history?.params.get("limit")).toBe("50");
+  expect(appended).toHaveLength(1);
+  const [context] = appended;
+  expect(context?.type).toBe("slack.channel_context");
+  const body = context?.body ?? "";
+  expect(body).toContain("Ada");
+  expect(body.indexOf("SQLite or Postgres for the cache?")).toBeGreaterThan(-1);
+  expect(body.indexOf("Postgres, for the runners")).toBeGreaterThan(
+    body.indexOf("SQLite or Postgres for the cache?"),
+  );
+  expect(body).not.toContain("too old to matter");
+  expect(body).not.toContain("what do you think?");
+});
+
+test("leaves a mention inside a thread to read_thread", async () => {
+  const { appended, calls } = await startAgentWith(
+    {
+      ...topLevelMention,
+      attributes: { ...topLevelAttributes, threadTs: at(-300) },
+    },
+    ["C1"],
+  );
+
+  expect(appended).toEqual([]);
+  expect(calls.map((call) => call.method)).not.toContain(
+    "conversations.history",
+  );
+});
+
+test("tells the model why the channel before a mention could not be read", async () => {
+  const { appended, calls } = await startAgentWith(topLevelMention, []);
+
+  expect(calls.map((call) => call.method)).not.toContain(
+    "conversations.history",
+  );
+  expect(appended).toHaveLength(1);
+  expect(appended[0]?.body).toContain("no allowed user invited the bot to C1");
 });
 
 test("lets the owner's direct message name the channel it reads", async () => {
