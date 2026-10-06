@@ -100,10 +100,10 @@ export const loadChannelMembers = async (
   );
 };
 
-// A person is asked for the way people say them: an ID, a mention someone
-// pasted, a display or real name, or one word of it. The strictest form that
-// matches anyone wins, so "Ana" never turns ambiguous because "Ana María" also
-// exists once an exact "Ana" does.
+// A person is asked for the way people say them: an ID, a pasted mention, or a
+// display name, real name or handle, whole or by some of its words. Every
+// member a name fits is a candidate, so two people who answer to it come back
+// as ambiguous instead of one of them being tagged by a tie-break.
 export const matchMember = (
   users: readonly DirectoryUser[],
   query: string,
@@ -114,23 +114,19 @@ export const matchMember = (
       .replace(/^<@(?<id>[^|>]+)(?:\|[^>]*)?>$/u, "$<id>")
       .replace(/^@/u, ""),
   );
-  const tiers = [
-    (user: DirectoryUser) => folded(user.id) === wanted,
-    (user: DirectoryUser) =>
-      namesOf(user).some((name) => folded(name) === wanted),
-    (user: DirectoryUser) =>
-      namesOf(user).some((name) => ` ${folded(name)} `.includes(` ${wanted} `)),
-  ];
-  for (const matches of tiers) {
-    const found = users.filter(matches);
-    if (found.length > 0) {
-      return found.map((user) => ({
-        name: namesOf(user)[0]?.trim() ?? user.id,
-        userId: user.id,
-      }));
-    }
-  }
-  return [];
+  const byId = users.filter((user) => folded(user.id) === wanted);
+  const found =
+    byId.length > 0
+      ? byId
+      : users.filter((user) =>
+          namesOf(user).some((name) =>
+            ` ${folded(name)} `.includes(` ${wanted} `),
+          ),
+        );
+  return found.map((user) => ({
+    name: namesOf(user)[0]?.trim() ?? user.id,
+    userId: user.id,
+  }));
 };
 
 const mentionInput = v.object({ member: v.pipe(v.string(), v.nonEmpty()) });

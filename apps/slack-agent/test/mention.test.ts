@@ -46,7 +46,6 @@ describe("mention_member", () => {
       "Juan Pérez",
       "perez",
       "juan",
-      "ana",
       "@ana.r",
       "<@U0ANA|ana>",
       "u0anam",
@@ -65,7 +64,6 @@ describe("mention_member", () => {
       "U0JUAN",
       "U0ANA",
       "U0ANA",
-      "U0ANA",
       "U0ANAM",
       "U0ANAM",
     ]);
@@ -77,8 +75,14 @@ describe("mention_member", () => {
     });
   });
 
-  test("refuses someone outside the channel, a deleted member, and a name members share", async () => {
-    const { mention, tagged } = mentionHarness(["U0JUAN", "U0JUANR", "U0GONE"]);
+  test("refuses someone outside the channel, a deleted member, and a name several members answer to, even one that is whole for one of them", async () => {
+    const { mention, tagged } = mentionHarness([
+      "U0JUAN",
+      "U0JUANR",
+      "U0GONE",
+      "U0ANA",
+      "U0ANAM",
+    ]);
 
     expect(await refusalOf(mention("Juan Gómez"))).toBe(
       "No member of this channel matches Juan Gómez",
@@ -88,6 +92,9 @@ describe("mention_member", () => {
     );
     expect(await refusalOf(mention("juan"))).toBe(
       "Several members of this channel match juan: Juan Pérez (U0JUAN), Juan Ruiz (U0JUANR). Call again with the user ID of the one meant.",
+    );
+    expect(await refusalOf(mention("Ana"))).toBe(
+      "Several members of this channel match Ana: ana.r (U0ANA), Ana María López (U0ANAM). Call again with the user ID of the one meant.",
     );
     expect(tagged).toEqual([]);
   });
