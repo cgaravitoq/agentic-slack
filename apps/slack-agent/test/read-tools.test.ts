@@ -1095,7 +1095,11 @@ const contextFixture: FakeSlackFixture = {
 const startAgentWith = async (
   mention: DeliveredMessage,
   admitted: readonly string[],
-): Promise<{ appended: AgentAppendMessage[]; calls: FakeSlackCall[] }> => {
+): Promise<{
+  appended: AgentAppendMessage[];
+  calls: FakeSlackCall[];
+  toolsAfterAppends: string[][];
+}> => {
   const { default: shipped } = await import("../agent.config.ts");
   const api = fakeSlack(contextFixture);
   const network = spyOn(globalThis, "fetch").mockImplementation(
@@ -1129,7 +1133,13 @@ const startAgentWith = async (
         });
       }),
     );
-    return { appended, calls: api.calls };
+    const toolsAfterAppends = appended.map((message) => {
+      mounted.length = 0;
+      delivery = message;
+      slackAgent({ id: "test" });
+      return mounted.map((tool) => tool.name);
+    });
+    return { appended, calls: api.calls, toolsAfterAppends };
   } finally {
     network.mockRestore();
     await mock.module("../agent.config.ts", () => ({ default: shipped }));
@@ -1154,6 +1164,14 @@ test("hands the model the channel messages before a mention that opens a thread"
   );
   expect(body).not.toContain("too old to matter");
   expect(body).not.toContain("what do you think?");
+});
+
+test("keeps every tool mounted on the turns that read the channel context", async () => {
+  const { toolsAfterAppends } = await startAgentWith(topLevelMention, ["C1"]);
+
+  expect(toolsAfterAppends).toEqual([
+    ["read_thread", "read_channel_since", "mention_member"],
+  ]);
 });
 
 test("leaves a mention inside a thread to read_thread", async () => {

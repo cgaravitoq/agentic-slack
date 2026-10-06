@@ -196,8 +196,12 @@ export const SlackAgent = (props: AgentProps) => {
           channelId: slack.output.channelId,
           ts: slack.output.threadTs,
         };
+        const { attributes } = delivery;
+        // Flue's delivery cursor moves onto an appended signal, and every
+        // later render mounts its tools from that signal's attributes.
         useAgentStart(async ({ append, signal }) => {
           append({
+            attributes,
             body: await readChannelBeforeMention(mention, readOptions, signal),
             kind: "signal",
             type: "slack.channel_context",
