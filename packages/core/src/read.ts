@@ -669,3 +669,29 @@ export const createSlackReadTools = (
     }),
   ];
 };
+
+export const readThreadReplies = async (
+  options: Pick<SlackReadOptions, "fetcher" | "token">,
+  channelId: string,
+  threadTs: string,
+  oldest: string | undefined,
+): Promise<SlackReadMessageRecord[]> => {
+  const ctx: ReadContext = {
+    caller: { fetcher: options.fetcher ?? fetch, token: options.token },
+    users: new Map(),
+    workspace: {},
+  };
+  const after = Math.max(Number(threadTs), Number(oldest ?? threadTs));
+  const replies = await fullPages(ctx.caller, "conversations.replies", {
+    channel: channelId,
+    oldest,
+    ts: threadTs,
+  });
+  return await messageRecords(
+    ctx,
+    channelId,
+    replies
+      .filter((message) => Number(message.ts) > after)
+      .map((message) => ({ message, threadTs })),
+  );
+};

@@ -967,6 +967,272 @@ describe("narrated progress endpoint", () => {
   });
 });
 
+const threadReader =
+  (calls: RecordedCall[]): Fetcher =>
+  (input, init) => {
+    const url = v.parse(v.string(), input);
+    const method = url.slice(url.lastIndexOf("/") + 1);
+    const body = callBody(init);
+    calls.push({ body, method });
+    if (method === "conversations.replies") {
+      return Promise.resolve(
+        Response.json({
+          has_more: false,
+          messages: [
+            {
+              bot_id: "B1",
+              text: "Release 42 · Started",
+              ts: "171.1",
+              user: "UBLOOP",
+            },
+            { bot_id: "B1", text: "Kicked off", ts: "171.2", user: "UBLOOP" },
+            { text: "can you also bump the SDK?", ts: "171.3", user: "U0ANA" },
+          ],
+          ok: true,
+        }),
+      );
+    }
+    if (method === "conversations.info") {
+      return Promise.resolve(
+        Response.json({ channel: { name: "sandbox" }, ok: true }),
+      );
+    }
+    if (method === "users.info") {
+      const name = body.user === "U0ANA" ? "Ana" : "Bloop";
+      return Promise.resolve(
+        Response.json({ ok: true, user: { profile: { display_name: name } } }),
+      );
+    }
+    if (method === "auth.test") {
+      return Promise.resolve(
+        Response.json({ ok: true, url: "https://workspace.slack.com/" }),
+      );
+    }
+    return Promise.resolve(
+      Response.json({ error: "unknown_method", ok: false }),
+    );
+  };
+
+const getReplies = (
+  query: Record<string, string>,
+  authorization: string | null = `Bearer ${BEARER}`,
+): Request =>
+  new Request(
+    `https://example.com/progress/replies?${new URLSearchParams(query).toString()}`,
+    { headers: authorization === null ? {} : { authorization } },
+  );
+
+const threadReplies = [
+  {
+    author: "Bloop",
+    permalink:
+      "https://workspace.slack.com/archives/C1/p1712?thread_ts=171.1&cid=C1",
+    text: "Kicked off",
+    ts: "171.2",
+  },
+  {
+    author: "Ana",
+    permalink:
+      "https://workspace.slack.com/archives/C1/p1713?thread_ts=171.1&cid=C1",
+    text: "can you also bump the SDK?",
+    ts: "171.3",
+  },
+];
+
+const repliesEndpoint = (db: FakeD1, calls: RecordedCall[]) => {
+  db.admissions.set("C1", ADMITTED_BY);
+  db.roots.set(`C1\u0000release-42`, {
+    root_text: "Release 42 · Started",
+    root_ts: "171.1",
+  });
+  return endpointFor(db, calls, {
+    fetcher: strictFetch(threadReader(calls)),
+  });
+};
+
+const LONG_ROOT_TS = "171.000001";
+
+const longThread = (replies: number) => [
+  {
+    bot_id: "B1",
+    text: "Release 42 · Started",
+    ts: LONG_ROOT_TS,
+    user: "UBLOOP",
+  },
+  ...Array.from({ length: replies }, (_, index) => ({
+    text: `reply ${String(index + 1)}`,
+    ts: `171.${String(index + 2).padStart(6, "0")}`,
+    user: "U0ANA",
+  })),
+];
+
+const pagedThreadReader =
+  (
+    calls: RecordedCall[],
+    messages: readonly { text: string; ts: string; user: string }[],
+  ): Fetcher =>
+  (input, init) => {
+    const url = v.parse(v.string(), input);
+    const method = url.slice(url.lastIndexOf("/") + 1);
+    const body = callBody(init);
+    calls.push({ body, method });
+    if (method === "conversations.replies") {
+      const oldest = Number(body.oldest ?? "0");
+      const matching = messages.filter(
+        (message, index) => index === 0 || Number(message.ts) > oldest,
+      );
+      const offset = Number(body.cursor ?? "0");
+      const limit = Number(body.limit);
+      const more = offset + limit < matching.length;
+      return Promise.resolve(
+        Response.json({
+          has_more: more,
+          messages: matching.slice(offset, offset + limit),
+          ok: true,
+          response_metadata: more
+            ? { next_cursor: String(offset + limit) }
+            : {},
+        }),
+      );
+    }
+    return threadReader([])(input, init);
+  };
+
+const longThreadEndpoint = (calls: RecordedCall[], replies: number) => {
+  const db = new FakeD1();
+  db.admissions.set("C1", ADMITTED_BY);
+  db.roots.set(`C1\u0000release-42`, {
+    root_text: "Release 42 · Started",
+    root_ts: LONG_ROOT_TS,
+  });
+  return endpointFor(db, calls, {
+    fetcher: strictFetch(pagedThreadReader(calls, longThread(replies))),
+  });
+};
+
+describe("progress replies", () => {
+  test("returns every reply of a thread that spans several pages", async () => {
+    const calls: RecordedCall[] = [];
+    const endpoint = longThreadEndpoint(calls, 450);
+
+    const response = await endpoint.handleReplies(
+      getReplies({ channel: "C1", task: "release-42" }),
+    );
+
+    const { messages } = v.parse(
+      v.object({ messages: v.array(v.object({ ts: v.string() })) }),
+      await response.json(),
+    );
+    expect(messages).toHaveLength(450);
+    expect(messages.at(-1)?.ts).toBe("171.000451");
+    expect(
+      calls.filter((call) => call.method === "conversations.replies"),
+    ).toHaveLength(3);
+  });
+
+  test("asks Slack only for what came after oldest, so a poll with nothing new reads nothing old", async () => {
+    const calls: RecordedCall[] = [];
+    const endpoint = longThreadEndpoint(calls, 450);
+
+    const response = await endpoint.handleReplies(
+      getReplies({ channel: "C1", oldest: "171.000451", task: "release-42" }),
+    );
+
+    expect(await response.json()).toEqual({ messages: [], ok: true });
+    const replies = calls.filter(
+      (call) => call.method === "conversations.replies",
+    );
+    expect(replies.map((call) => call.body.oldest)).toEqual(["171.000451"]);
+    expect(calls.map((call) => call.method)).not.toContain("users.info");
+  });
+
+  test("returns every reply under a task's root, oldest first, named by author", async () => {
+    const calls: RecordedCall[] = [];
+    const endpoint = repliesEndpoint(new FakeD1(), calls);
+
+    const response = await endpoint.handleReplies(
+      getReplies({ channel: "C1", task: "release-42" }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      messages: threadReplies,
+      ok: true,
+    });
+    expect(
+      calls.find((call) => call.method === "conversations.replies")?.body,
+    ).toMatchObject({ channel: "C1", ts: "171.1" });
+  });
+
+  test("returns only the replies after oldest", async () => {
+    const endpoint = repliesEndpoint(new FakeD1(), []);
+
+    const response = await endpoint.handleReplies(
+      getReplies({ channel: "C1", oldest: "171.2", task: "release-42" }),
+    );
+
+    expect(await response.json()).toEqual({
+      messages: threadReplies.slice(1),
+      ok: true,
+    });
+  });
+
+  test("resolves the channel by name the way a milestone does", async () => {
+    const endpoint = repliesEndpoint(new FakeD1(), []);
+
+    const response = await endpoint.handleReplies(
+      getReplies({ channel: "#Sandbox", task: "release-42" }),
+    );
+
+    expect(response.status).toBe(200);
+  });
+
+  test("refuses a task with no thread, a channel not admitted, and a malformed query without reading Slack", async () => {
+    const calls: RecordedCall[] = [];
+    const endpoint = repliesEndpoint(new FakeD1(), calls);
+
+    const queries: Record<string, string>[] = [
+      { channel: "C1", task: "release-43" },
+      { channel: "C2", task: "release-42" },
+      { task: "release-42" },
+      { channel: "C1", oldest: "yesterday", task: "release-42" },
+    ];
+    const refusals = await Promise.all(
+      queries.map(async (query) => {
+        const response = await endpoint.handleReplies(getReplies(query));
+        return { body: await response.json(), status: response.status };
+      }),
+    );
+
+    expect(refusals).toEqual([
+      { body: { error: "no_thread", ok: false }, status: 404 },
+      { body: { error: "channel_not_admitted", ok: false }, status: 403 },
+      { body: { error: "invalid_request", ok: false }, status: 400 },
+      { body: { error: "invalid_request", ok: false }, status: 400 },
+    ]);
+    expect(calls.map((call) => call.method)).not.toContain(
+      "conversations.replies",
+    );
+  });
+
+  test("guards the replies with the same bearer", async () => {
+    const calls: RecordedCall[] = [];
+    const endpoint = repliesEndpoint(new FakeD1(), calls);
+
+    const refusals = await Promise.all(
+      authorizationRefusals.map(async (authorization) => {
+        const response = await endpoint.handleReplies(
+          getReplies({ channel: "C1", task: "release-42" }, authorization),
+        );
+        return response.status;
+      }),
+    );
+
+    expect(refusals).toEqual([401, 401, 401]);
+    expect(calls).toEqual([]);
+  });
+});
+
 describe("progress route", () => {
   test("serves no progress route when no endpoint is configured", async () => {
     const app = createApp(trusted, MODEL_PROVIDER_CLOUDFLARE, async () => {});
@@ -1070,6 +1336,40 @@ describe("progress route", () => {
     const absent = await unconfigured.request(
       "/progress/channels",
       undefined,
+      testBindings(db),
+    );
+    expect(absent.status).toBe(404);
+  });
+
+  test("serves a task's replies only when the endpoint is configured", async () => {
+    const db = new FakeD1();
+    const calls: RecordedCall[] = [];
+    const app = createApp(
+      trusted,
+      MODEL_PROVIDER_CLOUDFLARE,
+      async () => {},
+      undefined,
+      undefined,
+      undefined,
+      repliesEndpoint(db, calls),
+    );
+
+    const listed = await app.request(
+      "/progress/replies?channel=C1&task=release-42",
+      { headers: { authorization: `Bearer ${BEARER}` } },
+      testBindings(db),
+    );
+    expect(listed.status).toBe(200);
+    expect(await listed.json()).toEqual({ messages: threadReplies, ok: true });
+
+    const unconfigured = createApp(
+      trusted,
+      MODEL_PROVIDER_CLOUDFLARE,
+      async () => {},
+    );
+    const absent = await unconfigured.request(
+      "/progress/replies?channel=C1&task=release-42",
+      { headers: { authorization: `Bearer ${BEARER}` } },
       testBindings(db),
     );
     expect(absent.status).toBe(404);
