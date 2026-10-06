@@ -559,6 +559,57 @@ const readChannelSince = async (
   };
 };
 
+export interface SlackMention {
+  readonly channelId: string;
+  readonly ts: string;
+}
+
+// A mention that opens a thread arrives with nothing but its own text, and the
+// model reaches for read_thread, which holds only that mention; the channel it
+// answers has to be in front of the model before its first turn.
+export const readChannelBeforeMention = async (
+  mention: SlackMention,
+  options: SlackReadOptions,
+  signal: AbortSignal,
+): Promise<string> => {
+  const ctx: ReadContext = {
+    caller: { fetcher: options.fetcher ?? fetch, signal, token: options.token },
+    users: new Map(),
+    workspace: {},
+  };
+  try {
+    await requireAdmission(options, mention.channelId);
+    const oldest = tsMinus(mention.ts, options.lookbackSeconds);
+    const page = await callSlack(
+      ctx.caller,
+      "conversations.history",
+      {
+        channel: mention.channelId,
+        latest: mention.ts,
+        limit: String(options.maxMessages),
+        oldest,
+      },
+      slackPageSchema,
+    );
+    const rows = page.messages
+      .filter((message) => message.ts !== mention.ts)
+      .toReversed()
+      .map((message) => ({ message, threadTs: message.ts }));
+    const messages = await messageRecords(ctx, mention.channelId, rows);
+    const coverage = {
+      latest: mention.ts,
+      oldest: page.has_more ? (messages[0]?.ts ?? oldest) : oldest,
+      truncated: page.has_more,
+    };
+    return `This mention opened a new thread, so read_thread holds only the mention. The channel messages posted before it, oldest first:\n${JSON.stringify({ coverage, messages })}`;
+  } catch (error) {
+    if (signal.aborted) {
+      throw error;
+    }
+    return `Reading the channel before this mention failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+
 export const createSlackReadTools = (
   binding: SlackReadBinding,
   options: SlackReadOptions,
