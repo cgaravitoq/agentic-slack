@@ -1585,6 +1585,26 @@ describe("stream sanitizer cutter", () => {
     expect(emissions).toEqual([text.slice(0, 1024), text.slice(1024)]);
   });
 
+  test("rewrites a Slack link the model copied into the markdown Slack renders", () => {
+    expect(
+      sanitizeReply(
+        "See <https://x.dev/pull/1|the PR> and <https://x.dev/run>, ask <@U0ANA>",
+      ),
+    ).toBe(
+      "See [the PR](https://x.dev/pull/1) and https://x.dev/run, ask &lt;@U0ANA>",
+    );
+  });
+
+  test("holds back a Slack link the tail cut would split until it closes", () => {
+    const link = "<https://x.dev/pull/1|the PR>";
+    const text = `${"x".repeat(500)}${link}${"y".repeat(600)}`;
+    const sanitizer = createStreamSanitizer();
+    const output = sanitizer.push(text) + sanitizer.flush();
+    expect(output).toBe(
+      `${"x".repeat(500)}[the PR](https://x.dev/pull/1)${"y".repeat(600)}`,
+    );
+  });
+
   test("redacts an accidental configuration echo on the full emitted payload", () => {
     const sanitizer = createStreamSanitizer();
     const output = sanitizer.push('PASSWORD = "hunter2"') + sanitizer.flush();

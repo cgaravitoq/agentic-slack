@@ -8,6 +8,8 @@ import type { SlackTaskChunk, SlackTaskUpdate } from "./task-chunk.ts";
 const BROADCAST_RE = /<!(?:channel|here|everyone)(?:\|[^>]*)?>/giu;
 const SUBTEAM_RE = /<!subteam\^[^>]+>/giu;
 const CONTROL_OPENER_RE = /<(?=[@#!])/gu;
+const SLACK_LINK_RE = /<(?<url>https?:\/\/[^\s<>|]+)(?:\|(?<label>[^<>]*))?>/gu;
+const MAX_HELD_LINK_LENGTH = 2048;
 const SLACK_TOKEN_RE = /\b(?:xox[a-z]|xapp)-[A-Za-z0-9-]+/gu;
 const SECRET_ASSIGNMENT_RE =
   /(?:\\["'])?["']?\b[A-Z0-9_]{0,64}(?:TOKEN|SECRET|PASSWORD|API_KEY|SIGNING_SECRET)[A-Z0-9_]{0,64}(?:\\["'])?["']?\s{0,16}[:=]\s{0,16}(?:\\"[^"\\]{0,200}\\"|\\'[^'\\]{0,200}\\'|"[^"]{0,200}"|'[^']{0,200}'|[^,\s"']{1,200})/giu;
@@ -37,8 +39,14 @@ const slackResult = v.object({
   ts: v.optional(v.string()),
 });
 
+// Slack renders neither its own link syntax nor a mention inside streamed
+// markdown, so a link the model copied from a Slack message is rewritten to the
+// markdown form Slack does render.
 export const redact = (text: string): string =>
   text
+    .replace(SLACK_LINK_RE, (_, url: string, label?: string) =>
+      label === undefined || label.trim() === "" ? url : `[${label}](${url})`,
+    )
     .replace(BROADCAST_RE, "")
     .replace(SUBTEAM_RE, "")
     .replace(CONTROL_OPENER_RE, "&lt;")
@@ -93,6 +101,14 @@ export const createStreamSanitizer = (): StreamSanitizer => {
     let cut = buffer.length - STREAM_TAIL_LENGTH;
     if (/[\uDC00-\uDFFF]/u.test(buffer.charAt(cut))) {
       cut -= 1;
+    }
+    const opener = buffer.lastIndexOf("<", cut - 1);
+    if (
+      opener !== -1 &&
+      cut - opener <= MAX_HELD_LINK_LENGTH &&
+      !buffer.slice(opener, cut).includes(">")
+    ) {
+      cut = opener;
     }
     if (cut <= 0) {
       return "";

@@ -94,7 +94,7 @@ A brokered turn streams the same way a Workers AI turn does, including tool call
 ## Delivery
 
 The sanitizer withholds a bounded tail of `STREAM_TAIL_LENGTH` (512) characters before sending text to Slack.
-It removes Slack broadcast syntax, escapes mention controls, redacts Slack token patterns, and redacts assignments whose names contain terms such as `TOKEN`, `SECRET`, `PASSWORD`, or `API_KEY`.
+It removes Slack broadcast syntax, escapes mention controls, rewrites Slack's own link syntax into the markdown links a stream renders, redacts Slack token patterns, and redacts assignments whose names contain terms such as `TOKEN`, `SECRET`, `PASSWORD`, or `API_KEY`.
 This is pattern-based output filtering, not a guarantee that arbitrary credentials or confidential content cannot appear in a reply.
 Appends are coalesced at `COALESCE_CHARS` (1024) characters and on a `COALESCE_MS` (300) millisecond timer.
 Retryable Slack failures use bounded backoff or `Retry-After`, capped at `MAX_RETRY_AFTER_MS` (2000) milliseconds per attempt and `MAX_RETRY_WAIT_MS` (4000) milliseconds across attempts.
