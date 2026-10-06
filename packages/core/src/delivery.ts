@@ -8,6 +8,10 @@ import type { SlackTaskChunk, SlackTaskUpdate } from "./task-chunk.ts";
 const BROADCAST_RE = /<!(?:channel|here|everyone)(?:\|[^>]*)?>/giu;
 const SUBTEAM_RE = /<!subteam\^[^>]+>/giu;
 const CONTROL_OPENER_RE = /<(?=[@#!])/gu;
+const SLACK_LINK_RE = /<(?<url>https?:\/\/[^\s<>|]+)(?:\|(?<label>[^<>]*))?>/gu;
+const MAX_HELD_LINK_LENGTH = 2048;
+const SLACK_USER_ID_RE = /^[UW][A-Z0-9]{2,}$/u;
+const SLACK_USER_IDS_RE = /^[UW][A-Z0-9]{2,}(?: [UW][A-Z0-9]{2,})*$/u;
 const SLACK_TOKEN_RE = /\b(?:xox[a-z]|xapp)-[A-Za-z0-9-]+/gu;
 const SECRET_ASSIGNMENT_RE =
   /(?:\\["'])?["']?\b[A-Z0-9_]{0,64}(?:TOKEN|SECRET|PASSWORD|API_KEY|SIGNING_SECRET)[A-Z0-9_]{0,64}(?:\\["'])?["']?\s{0,16}[:=]\s{0,16}(?:\\"[^"\\]{0,200}\\"|\\'[^'\\]{0,200}\\'|"[^"]{0,200}"|'[^']{0,200}'|[^,\s"']{1,200})/giu;
@@ -37,8 +41,14 @@ const slackResult = v.object({
   ts: v.optional(v.string()),
 });
 
+// Slack renders neither its own link syntax nor a mention inside streamed
+// markdown, so a link the model copied from a Slack message is rewritten to the
+// markdown form Slack does render.
 export const redact = (text: string): string =>
   text
+    .replace(SLACK_LINK_RE, (_, url: string, label?: string) =>
+      label === undefined || label.trim() === "" ? url : `[${label}](${url})`,
+    )
     .replace(BROADCAST_RE, "")
     .replace(SUBTEAM_RE, "")
     .replace(CONTROL_OPENER_RE, "&lt;")
@@ -93,6 +103,14 @@ export const createStreamSanitizer = (): StreamSanitizer => {
     let cut = buffer.length - STREAM_TAIL_LENGTH;
     if (/[\uDC00-\uDFFF]/u.test(buffer.charAt(cut))) {
       cut -= 1;
+    }
+    const opener = buffer.lastIndexOf("<", cut - 1);
+    if (
+      opener !== -1 &&
+      cut - opener <= MAX_HELD_LINK_LENGTH &&
+      !buffer.slice(opener, cut).includes(">")
+    ) {
+      cut = opener;
     }
     if (cut <= 0) {
       return "";
@@ -152,6 +170,15 @@ export const slackDeliveryBindingSchema = v.object({
   fallbackText: v.optional(
     v.pipe(v.string(), v.minLength(1), v.maxLength(MAX_SLACK_APPEND_LENGTH)),
   ),
+  // Signal attributes are strings, so the tags and links trusted code closes
+  // the reply with travel as space-separated user IDs and normalized URLs.
+  links: v.optional(
+    v.pipe(
+      v.string(),
+      v.check((value) => value.split(" ").every((url) => URL.canParse(url))),
+    ),
+  ),
+  mentions: v.optional(v.pipe(v.string(), v.regex(SLACK_USER_IDS_RE))),
   recipientTeamId: v.pipe(v.string(), v.minLength(1)),
   recipientUserId: v.pipe(v.string(), v.minLength(1)),
   surface: v.picklist(["channel", "private"]),
@@ -196,14 +223,23 @@ const streamTargetFromBinding = (
 export interface SlackStream {
   append: (delta: string) => void;
   task: (update: SlackTaskUpdate) => void;
-  finish: (fallback: string, notice?: string) => Promise<void>;
+  finish: (
+    fallback: string,
+    notice?: string,
+    closing?: string,
+  ) => Promise<void>;
   // True when the closing notice reached the thread. `replyText` posts a reply
   // the stream never saw, the way `finish` posts its fallback.
-  fail: (notice: string, replyText?: string) => Promise<boolean>;
+  fail: (
+    notice: string,
+    replyText?: string,
+    closing?: string,
+  ) => Promise<boolean>;
 }
 
 export type SlackDeliveryEvent =
   | { type: "text"; text: string }
+  | { type: "mention"; userId: string }
   | { type: "tool-start"; id: string; name: string }
   | { type: "tool-result"; id: string; output: string; error: boolean };
 
@@ -236,6 +272,10 @@ const deliveryRow = v.object({ payload: v.string() });
 
 const deliveryEventSchema = v.union([
   v.object({ text: v.string(), type: v.literal("text") }),
+  v.object({
+    type: v.literal("mention"),
+    userId: v.pipe(v.string(), v.regex(SLACK_USER_ID_RE)),
+  }),
   v.object({
     id: v.string(),
     name: v.string(),
@@ -306,10 +346,31 @@ interface SlackMarkdownChunk {
   type: "markdown_text";
 }
 
+interface SlackSectionBlock {
+  text: { text: string; type: "mrkdwn" };
+  type: "section";
+}
+
 type SlackRequestBody = Record<
   string,
-  string | (SlackMarkdownChunk | SlackTaskChunk)[]
+  string | (SlackMarkdownChunk | SlackTaskChunk | SlackSectionBlock)[]
 >;
+
+const slackLinkTarget = (url: string): string =>
+  url
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("|", "%7C");
+
+export const closingMrkdwn = (
+  userIds: readonly string[],
+  links: readonly string[],
+): string =>
+  [
+    ...[...new Set(userIds)].map((userId) => `<@${userId}>`),
+    ...[...new Set(links)].map((url) => `<${slackLinkTarget(url)}>`),
+  ].join(" ");
 
 export const COALESCE_CHARS = 1024;
 export const COALESCE_MS = 300;
@@ -642,6 +703,7 @@ export const createSlackStream = (
     always: boolean,
     failureNotice: string,
     replyText?: string,
+    closing = "",
   ): Promise<boolean> => {
     if (closed) {
       return failure === undefined;
@@ -674,7 +736,19 @@ export const createSlackStream = (
       return delivered;
     }
     await attempt(async () => {
-      await call("chat.stopStream", { channel: channelId, ts }, closingBudget);
+      await call(
+        "chat.stopStream",
+        closing === ""
+          ? { channel: channelId, ts }
+          : {
+              blocks: [
+                { text: { text: closing, type: "mrkdwn" }, type: "section" },
+              ],
+              channel: channelId,
+              ts,
+            },
+        closingBudget,
+      );
     });
     return delivered;
   };
@@ -686,11 +760,11 @@ export const createSlackStream = (
       }
       bufferAppend(sanitizer.push(delta));
     },
-    fail(notice, replyText) {
-      return close(notice, true, notice, replyText);
+    fail(notice, replyText, closing) {
+      return close(notice, true, notice, replyText, closing);
     },
-    async finish(fallback, notice = SLACK_STREAM_FAILURE_NOTICE) {
-      await close(fallback, false, notice);
+    async finish(fallback, notice = SLACK_STREAM_FAILURE_NOTICE, closing = "") {
+      await close(fallback, false, notice, undefined, closing);
       if (failure !== undefined) {
         throw failure;
       }
@@ -750,6 +824,9 @@ const applyDeliveryEvent = (
     stream.append(event.text);
     return;
   }
+  if (event.type === "mention") {
+    return;
+  }
   if (event.type === "tool-start") {
     toolNames.set(event.id, event.name);
     stream.task({
@@ -784,6 +861,23 @@ const replyTrailer = (
 
 const failureNotice = (binding: SlackDeliveryBinding): string =>
   binding.fallbackText ?? SLACK_STREAM_FAILURE_NOTICE;
+
+const tokens = (value: string | undefined): string[] =>
+  value === undefined ? [] : value.split(" ");
+
+const closingOf = (
+  binding: SlackDeliveryBinding,
+  events: readonly SlackDeliveryEvent[],
+): string =>
+  closingMrkdwn(
+    [
+      ...tokens(binding.mentions),
+      ...events.flatMap((event) =>
+        event.type === "mention" ? [event.userId] : [],
+      ),
+    ],
+    tokens(binding.links),
+  );
 
 const HIGH_SURROGATE_TAIL = /[\uD800-\uDBFF]$/u;
 const ORPHAN_LOW_SURROGATE_TAIL = /(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]$/u;
@@ -913,6 +1007,7 @@ const runSlackAlarmDelivery = async (
   await stream.finish(
     replyTrailer(work.replyText, binding.fallbackText),
     failureNotice(binding),
+    closingOf(binding, work.events),
   );
 };
 
@@ -945,8 +1040,8 @@ const ownsDestination = (
 // those threads is owed the reply, so a delivery that joins an open record
 // adds its destination instead of being dropped.
 // A delivery joining a thread the record already answers still owes that
-// thread its own fallback text, so the owner carries both rather than the
-// joining one being dropped with its text.
+// thread its own fallback text, tags and links, so the owner carries both
+// rather than the joining one being dropped with them.
 const adoptDestination = (
   record: SlackDeliveryRecord,
   binding: SlackDeliveryBinding,
@@ -955,22 +1050,32 @@ const adoptDestination = (
     record.joinedBindings.push(binding);
     return true;
   }
-  const owed = binding.fallbackText;
-  if (owed === undefined) {
+  const { fallbackText: owed, links, mentions } = binding;
+  if (owed === undefined && links === undefined && mentions === undefined) {
     return false;
   }
   const withOwed = (owner: SlackDeliveryBinding): SlackDeliveryBinding => {
-    if (
-      !sameDestination(owner, binding) ||
-      owner.fallbackText?.includes(owed) === true
-    ) {
+    if (!sameDestination(owner, binding)) {
       return owner;
     }
-    const fallbackText = [owner.fallbackText, owed]
-      .filter((text) => text !== undefined)
-      .join("\n\n")
-      .slice(0, MAX_SLACK_APPEND_LENGTH);
-    return { ...owner, fallbackText };
+    const merged = { ...owner };
+    if (owed !== undefined && owner.fallbackText?.includes(owed) !== true) {
+      merged.fallbackText = [owner.fallbackText, owed]
+        .filter((text) => text !== undefined)
+        .join("\n\n")
+        .slice(0, MAX_SLACK_APPEND_LENGTH);
+    }
+    if (links !== undefined) {
+      merged.links = [
+        ...new Set([...tokens(owner.links), ...tokens(links)]),
+      ].join(" ");
+    }
+    if (mentions !== undefined) {
+      merged.mentions = [
+        ...new Set([...tokens(owner.mentions), ...tokens(mentions)]),
+      ].join(" ");
+    }
+    return merged;
   };
   record.binding = withOwed(record.binding);
   record.joinedBindings = record.joinedBindings.map(withOwed);
@@ -1013,7 +1118,13 @@ const replaySlackFailure = async (
     fetcher,
   );
   feedSlackStream(stream, replay.events);
-  if (!(await stream.fail(failureNotice(binding), replay.replyText))) {
+  if (
+    !(await stream.fail(
+      failureNotice(binding),
+      replay.replyText,
+      closingOf(binding, replay.events),
+    ))
+  ) {
     throw new Error("Slack failure notice was not delivered");
   }
 };
@@ -1171,7 +1282,11 @@ export const failSlackDelivery = async (
     live === undefined
       ? () => replaySlackFailure(record.binding, token, replay, fetcher)
       : async () => {
-          await live.stream.fail(failureNotice(record.binding));
+          await live.stream.fail(
+            failureNotice(record.binding),
+            undefined,
+            closingOf(record.binding, record.events),
+          );
         };
   try {
     await settleDestination(primary);
@@ -1214,6 +1329,7 @@ export const finishSlackDelivery = async (
           live.stream.finish(
             replyTrailer(record.replyText, record.binding.fallbackText),
             failureNotice(record.binding),
+            closingOf(record.binding, record.events),
           );
   try {
     await settleDestination(primary);

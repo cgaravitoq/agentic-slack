@@ -3,8 +3,10 @@ import type { SlackThreadRef } from "@flue/slack";
 import * as v from "valibot";
 import { createSqlSlackChannelAdmissionStore } from "./admission.ts";
 import { claimAndRun } from "./dedup.ts";
-import { MAX_SLACK_MESSAGE_LENGTH } from "./delivery.ts";
+import { closingMrkdwn, MAX_SLACK_MESSAGE_LENGTH } from "./delivery.ts";
 import type { SlackDeliveryBinding } from "./delivery.ts";
+import { loadChannelMembers, matchMember } from "./mention.ts";
+import type { SlackMember } from "./mention.ts";
 import { readThreadReplies } from "./read.ts";
 
 const PROGRESS_KINDS = [
@@ -81,11 +83,19 @@ const TITLE_LIMIT = 300;
 // Group DM names run past the 80 Slack bounds a channel name to.
 const CHANNEL_LIMIT = 255;
 const URL_LIMIT = 2048;
+const MENTION_LIMIT = 100;
+const MAX_MENTIONS = 10;
 
 const milestoneSchema = v.object({
   channel: v.pipe(v.string(), v.nonEmpty(), v.maxLength(CHANNEL_LIMIT)),
   id: v.pipe(v.string(), v.nonEmpty(), v.maxLength(MILESTONE_ID_LIMIT)),
   kind: v.picklist(PROGRESS_KINDS),
+  mentions: v.optional(
+    v.pipe(
+      v.array(v.pipe(v.string(), v.nonEmpty(), v.maxLength(MENTION_LIMIT))),
+      v.maxLength(MAX_MENTIONS),
+    ),
+  ),
   task: v.pipe(v.string(), v.nonEmpty(), v.maxLength(TASK_LIMIT)),
   text: v.pipe(v.string(), v.nonEmpty(), v.maxLength(MAX_SLACK_MESSAGE_LENGTH)),
   title: v.pipe(v.string(), v.nonEmpty(), v.maxLength(TITLE_LIMIT)),
@@ -97,6 +107,7 @@ const milestoneSchema = v.object({
         (value) => URL.canParse(value) && new URL(value).protocol === "https:",
         "url must be an https url",
       ),
+      v.transform((value) => new URL(value).href),
     ),
   ),
 });
@@ -276,16 +287,34 @@ const constantTimeEquals = (left: string, right: string): boolean => {
   );
 };
 
-const refusal = (status: number, error: string): Response =>
-  Response.json({ error, ok: false }, { status });
+const refusal = (
+  status: number,
+  error: string,
+  detail: {
+    readonly candidates?: readonly SlackMember[];
+    readonly mention?: string;
+  } = {},
+): Response => Response.json({ ...detail, error, ok: false }, { status });
 
 const isMissingMessage = (error: Error): boolean =>
   error.message.includes("message_not_found");
 
-const replyOf = (milestone: SlackProgressMilestone): string =>
-  milestone.url === undefined
-    ? milestone.text
-    : `${milestone.text}\n${milestone.url}`;
+const closingOf = (
+  milestone: SlackProgressMilestone,
+  members: readonly SlackMember[],
+): string =>
+  closingMrkdwn(
+    members.map((member) => member.userId),
+    milestone.url === undefined ? [] : [milestone.url],
+  );
+
+const replyOf = (
+  milestone: SlackProgressMilestone,
+  members: readonly SlackMember[],
+): string => {
+  const closing = closingOf(milestone, members);
+  return closing === "" ? milestone.text : `${milestone.text}\n${closing}`;
+};
 
 // The progress route reaches a conversation without an ingress channel object,
 // so it spells the canonical id out; worker-stream.test.ts pins it to the id a
@@ -298,8 +327,26 @@ export const slackInstanceId = (ref: SlackThreadRef): string =>
 const NARRATION_RULE =
   "Rewrite this milestone as your reply in that voice: one or two short sentences that use the earlier milestones in this thread as context and say only what this milestone and those earlier milestones say.";
 
+const attachedOf = (
+  milestone: SlackProgressMilestone,
+  members: readonly SlackMember[],
+): string[] => {
+  const attached = [
+    ...(members.length === 0
+      ? []
+      : [`tagging ${members.map((member) => member.name).join(", ")}`]),
+    ...(milestone.url === undefined ? [] : [`linking ${milestone.url}`]),
+  ];
+  return attached.length === 0
+    ? []
+    : [
+        `Trusted code closes your reply by ${attached.join(" and ")}, so do not write the tags or the link yourself.`,
+      ];
+};
+
 const narrationBody = (
   milestone: SlackProgressMilestone,
+  members: readonly SlackMember[],
   narration: string,
   labels: Readonly<Record<ProgressKind, string>>,
 ): string =>
@@ -307,7 +354,8 @@ const narrationBody = (
     narration,
     `Task: ${milestone.task}`,
     `Status: ${labels[milestone.kind]}`,
-    `Milestone: ${replyOf(milestone)}`,
+    `Milestone: ${milestone.text}`,
+    ...attachedOf(milestone, members),
     NARRATION_RULE,
   ].join("\n\n");
 
@@ -325,6 +373,10 @@ const milestoneFrom = async (
 type ChannelResolution =
   | { readonly channelId: string }
   | { readonly refusal: "ambiguous_channel" | "channel_not_admitted" };
+
+type MentionResolution =
+  | { readonly members: readonly SlackMember[] }
+  | { readonly refusal: Response };
 
 export const createSlackProgressEndpoint = (
   config: ResolvedSlackProgressConfig,
@@ -395,6 +447,34 @@ export const createSlackProgressEndpoint = (
     return matches.length === 1
       ? { channelId: match }
       : { refusal: "ambiguous_channel" };
+  };
+
+  const resolveMentions = async (
+    channelId: string,
+    mentions: readonly string[],
+  ): Promise<MentionResolution> => {
+    if (mentions.length === 0) {
+      return { members: [] };
+    }
+    const users = await loadChannelMembers(caller, channelId);
+    const members: SlackMember[] = [];
+    for (const mention of mentions) {
+      const matches = matchMember(users, mention);
+      const [match] = matches;
+      if (match === undefined) {
+        return { refusal: refusal(422, "unknown_mention", { mention }) };
+      }
+      if (matches.length > 1) {
+        return {
+          refusal: refusal(409, "ambiguous_mention", {
+            candidates: matches,
+            mention,
+          }),
+        };
+      }
+      members.push(match);
+    }
+    return { members };
   };
 
   const rootOf = (milestone: SlackProgressMilestone): string =>
@@ -473,23 +553,30 @@ export const createSlackProgressEndpoint = (
 
   const narrateMilestone = async (
     milestone: SlackProgressMilestone,
+    members: readonly SlackMember[],
     admittedBy: string,
     root: SlackProgressRoot,
     narration: string,
-    reply: string,
   ): Promise<void> => {
+    const binding: SlackDeliveryBinding = {
+      channelId: milestone.channel,
+      fallbackText: milestone.text,
+      recipientTeamId: options.teamId,
+      recipientUserId: admittedBy,
+      surface: "channel",
+      taskUpdates: "hidden",
+      threadTs: root.rootTs,
+    };
+    if (members.length > 0) {
+      binding.mentions = members.map((member) => member.userId).join(" ");
+    }
+    if (milestone.url !== undefined) {
+      binding.links = milestone.url;
+    }
     try {
       await options.narrate({
-        binding: {
-          channelId: milestone.channel,
-          fallbackText: reply,
-          recipientTeamId: options.teamId,
-          recipientUserId: admittedBy,
-          surface: "channel",
-          taskUpdates: "hidden",
-          threadTs: root.rootTs,
-        },
-        body: narrationBody(milestone, narration, config.labels),
+        binding,
+        body: narrationBody(milestone, members, narration, config.labels),
         instanceId: slackInstanceId({
           channelId: milestone.channel,
           teamId: options.teamId,
@@ -499,22 +586,30 @@ export const createSlackProgressEndpoint = (
     } catch (error: unknown) {
       // The turn never reached the thread, so the milestone still must.
       console.error("Slack progress narration failed", error);
-      await postReply(milestone.channel, root.rootTs, reply);
+      await postReply(
+        milestone.channel,
+        root.rootTs,
+        replyOf(milestone, members),
+      );
     }
   };
 
   const postMilestone = async (
     milestone: SlackProgressMilestone,
+    members: readonly SlackMember[],
     admittedBy: string,
   ): Promise<void> => {
     const root = await enterRoot(milestone, rootOf(milestone));
-    const reply = replyOf(milestone);
     const { narration } = config;
     if (narration === undefined) {
-      await postReply(milestone.channel, root.rootTs, reply);
+      await postReply(
+        milestone.channel,
+        root.rootTs,
+        replyOf(milestone, members),
+      );
       return;
     }
-    await narrateMilestone(milestone, admittedBy, root, narration, reply);
+    await narrateMilestone(milestone, members, admittedBy, root, narration);
   };
 
   return {
@@ -543,8 +638,15 @@ export const createSlackProgressEndpoint = (
         channel: resolved.channelId,
       };
       try {
+        const mentioned = await resolveMentions(
+          resolved.channelId,
+          milestone.mentions ?? [],
+        );
+        if ("refusal" in mentioned) {
+          return mentioned.refusal;
+        }
         await claimAndRun(options.db, `progress:${resolvedMilestone.id}`, () =>
-          postMilestone(resolvedMilestone, admittedBy),
+          postMilestone(resolvedMilestone, mentioned.members, admittedBy),
         );
       } catch (error: unknown) {
         console.error("Slack progress milestone failed", error);
