@@ -486,6 +486,7 @@ export const createSlackProgressEndpoint = (
           recipientTeamId: options.teamId,
           recipientUserId: admittedBy,
           surface: "channel",
+          taskUpdates: "hidden",
           threadTs: root.rootTs,
         },
         body: narrationBody(milestone, narration, config.labels),

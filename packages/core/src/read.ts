@@ -82,6 +82,7 @@ interface SlackEnvelope {
 }
 
 const slackMessageSchema = v.object({
+  blocks: v.optional(v.array(v.unknown())),
   bot_id: v.optional(v.string()),
   latest_reply: v.optional(v.string()),
   text: v.optional(v.string()),
@@ -262,6 +263,23 @@ const authorName = async (
   return name;
 };
 
+// Slack's `text` for a streamed reply opens with the titles of its tool steps,
+// which the blocks keep apart as task cards; a reader wants the reply itself.
+const taskCardSchema = v.object({
+  title: v.string(),
+  type: v.literal("task_card"),
+});
+
+const withoutStepTitles = (message: SlackMessage): string => {
+  let text = message.text ?? "";
+  for (const block of message.blocks ?? []) {
+    if (v.is(taskCardSchema, block) && text.startsWith(block.title)) {
+      text = text.slice(block.title.length).trimStart();
+    }
+  }
+  return text;
+};
+
 const permalinkFor = (
   workspace: string,
   channelId: string,
@@ -328,7 +346,7 @@ const messageRecords = async (
         row.message.ts,
         row.threadTs,
       ),
-      text: row.message.text ?? "",
+      text: withoutStepTitles(row.message),
       ts: row.message.ts,
     });
   }
