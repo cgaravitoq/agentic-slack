@@ -66,7 +66,7 @@ const allMembers = async <TMember>(
   return members;
 };
 
-interface SlackMember {
+export interface SlackMember {
   readonly name: string;
   readonly userId: string;
 }
@@ -82,7 +82,7 @@ const namesOf = (user: DirectoryUser): string[] =>
 const folded = (text: string): string =>
   text.normalize("NFD").replaceAll(/\p{M}/gu, "").trim().toLowerCase();
 
-const loadChannelMembers = async (
+export const loadChannelMembers = async (
   caller: SlackCaller,
   channelId: string,
 ): Promise<DirectoryUser[]> => {
@@ -104,7 +104,7 @@ const loadChannelMembers = async (
 // pasted, a display or real name, or one word of it. The strictest form that
 // matches anyone wins, so "Ana" never turns ambiguous because "Ana María" also
 // exists once an exact "Ana" does.
-const matchMember = (
+export const matchMember = (
   users: readonly DirectoryUser[],
   query: string,
 ): SlackMember[] => {

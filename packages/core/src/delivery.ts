@@ -363,7 +363,7 @@ const slackLinkTarget = (url: string): string =>
     .replaceAll(">", "&gt;")
     .replaceAll("|", "%7C");
 
-const closingMrkdwn = (
+export const closingMrkdwn = (
   userIds: readonly string[],
   links: readonly string[],
 ): string =>

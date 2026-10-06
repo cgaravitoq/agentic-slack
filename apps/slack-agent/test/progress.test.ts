@@ -15,6 +15,7 @@ import type {
 import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
 import * as v from "valibot";
 import { createApp } from "../src/app.ts";
+import { directoryUsers, slackDirectory } from "./slack-directory.ts";
 
 const BEARER = "progress-bearer-for-tests";
 const ADMITTED_BY = "U0ADMITSU";
@@ -261,6 +262,7 @@ interface Milestone {
   readonly channel: string;
   readonly id: string;
   readonly kind: string;
+  readonly mentions?: readonly string[];
   readonly task: string;
   readonly text: string;
   readonly title: string;
@@ -310,7 +312,7 @@ const rootCalls: RecordedCall[] = [
   {
     body: {
       channel: "C1",
-      text: "Kicked off\nhttps://example.com/run",
+      text: "Kicked off\n<https://example.com/run>",
       thread_ts: "171.1",
     },
     method: "chat.postMessage",
@@ -382,6 +384,13 @@ describe("progress endpoint", () => {
         url: `https://example.com/${"x".repeat(2048)}`,
       }),
       JSON.stringify({ channel: "C1", kind: "started" }),
+      JSON.stringify({ ...milestone, mentions: "juan" }),
+      JSON.stringify({ ...milestone, mentions: [""] }),
+      JSON.stringify({ ...milestone, mentions: ["x".repeat(101)] }),
+      JSON.stringify({
+        ...milestone,
+        mentions: Array.from({ length: 11 }, () => "juan"),
+      }),
     ];
     const refusedResults = await Promise.all(
       refused.map(async (body) => {
@@ -444,7 +453,7 @@ describe("progress endpoint", () => {
       {
         body: {
           channel: "C1",
-          text: "Kicked off\nhttps://example.com/run",
+          text: "Kicked off\n<https://example.com/run>",
           thread_ts: "171.1",
         },
         method: "chat.postMessage",
@@ -453,7 +462,7 @@ describe("progress endpoint", () => {
       {
         body: {
           channel: "C1",
-          text: "Kicked off\nhttps://example.com/run",
+          text: "Kicked off\n<https://example.com/run>",
           thread_ts: "171.1",
         },
         method: "chat.postMessage",
@@ -726,7 +735,7 @@ describe("progress endpoint", () => {
       {
         body: {
           channel: "C1",
-          text: "Waiting on review\nhttps://example.com/run",
+          text: "Waiting on review\n<https://example.com/run>",
           thread_ts: "171.1",
         },
         method: "chat.postMessage",
@@ -734,7 +743,7 @@ describe("progress endpoint", () => {
       {
         body: {
           channel: "C1",
-          text: "Still waiting\nhttps://example.com/run",
+          text: "Still waiting\n<https://example.com/run>",
           thread_ts: "171.1",
         },
         method: "chat.postMessage",
@@ -746,7 +755,7 @@ describe("progress endpoint", () => {
       {
         body: {
           channel: "C1",
-          text: "Still waiting\nhttps://example.com/run",
+          text: "Still waiting\n<https://example.com/run>",
           thread_ts: "171.1",
         },
         method: "chat.postMessage",
@@ -834,7 +843,7 @@ describe("progress endpoint", () => {
     expect(calls.at(-1)).toEqual({
       body: {
         channel: "C1",
-        text: "Waiting on review\nhttps://example.com/run",
+        text: "Waiting on review\n<https://example.com/run>",
         thread_ts: "171.1",
       },
       method: "chat.postMessage",
@@ -872,7 +881,7 @@ describe("progress endpoint", () => {
     expect(calls.at(-1)).toEqual({
       body: {
         channel: "C1",
-        text: "Still waiting\nhttps://example.com/run",
+        text: "Still waiting\n<https://example.com/run>",
         thread_ts: "171.1",
       },
       method: "chat.postMessage",
@@ -916,7 +925,8 @@ describe("narrated progress endpoint", () => {
       {
         binding: {
           channelId: "C1",
-          fallbackText: "Kicked off\nhttps://example.com/run",
+          fallbackText: "Kicked off",
+          links: "https://example.com/run",
           recipientTeamId: "T123",
           recipientUserId: ADMITTED_BY,
           surface: "channel",
@@ -927,7 +937,8 @@ describe("narrated progress endpoint", () => {
           "Write in Spanish, warm and brief.",
           "Task: release-42",
           "Status: Started",
-          "Milestone: Kicked off\nhttps://example.com/run",
+          "Milestone: Kicked off",
+          "Trusted code closes your reply by linking https://example.com/run, so do not write the tags or the link yourself.",
           "Rewrite this milestone as your reply in that voice: one or two short sentences that use the earlier milestones in this thread as context and say only what this milestone and those earlier milestones say.",
         ].join("\n\n"),
         instanceId: "slack:v1:T123:C1:171.1",
@@ -965,6 +976,123 @@ describe("narrated progress endpoint", () => {
     expect([first.status, retried.status]).toEqual([200, 200]);
     expect(calls).toEqual([rootCalls[0]]);
     expect(turns).toHaveLength(1);
+  });
+});
+
+describe("progress mentions", () => {
+  const taggedReply = {
+    body: {
+      channel: "C1",
+      text: "Kicked off\n<@U0JUAN> <@U0ANA> <https://example.com/run>",
+      thread_ts: "171.1",
+    },
+    method: "chat.postMessage",
+  };
+  const directoryEndpoint = (
+    db: FakeD1,
+    calls: RecordedCall[],
+    overrides: EndpointOverrides = {},
+  ) =>
+    endpointFor(db, calls, {
+      ...overrides,
+      fetcher: strictFetch(
+        slackDirectory(
+          { C1: ["U0JUAN", "U0ANA", "U0JUANR"] },
+          directoryUsers,
+          slackRecorder(calls),
+        ),
+      ),
+    });
+
+  test("closes the curated reply with the members a milestone tags and its link", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+
+    const response = await directoryEndpoint(db, calls).handle(
+      postMilestone({ mentions: ["Juan Pérez", "<@U0ANA>"] }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(calls).toEqual([rootCalls[0], taggedReply]);
+  });
+
+  test("hands a narration the members it tags and its link", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const { narrate, turns } = narrations();
+
+    const response = await directoryEndpoint(db, calls, {
+      narrate,
+      narration: "Write in Spanish, warm and brief.",
+    }).handle(postMilestone({ mentions: ["Juan Pérez", "ana.r"] }));
+
+    expect(response.status).toBe(200);
+    expect(calls).toEqual([rootCalls[0]]);
+    expect(turns.map((turn) => turn.binding)).toEqual([
+      {
+        channelId: "C1",
+        fallbackText: "Kicked off",
+        links: "https://example.com/run",
+        mentions: "U0JUAN U0ANA",
+        recipientTeamId: "T123",
+        recipientUserId: ADMITTED_BY,
+        surface: "channel",
+        taskUpdates: "hidden",
+        threadTs: "171.1",
+      },
+    ]);
+    expect(turns[0]?.body).toContain(
+      "Milestone: Kicked off\n\nTrusted code closes your reply by tagging Juan Pérez, ana.r and linking https://example.com/run, so do not write the tags or the link yourself.",
+    );
+  });
+
+  test("posts the tags and the link itself when the narration turn cannot start", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+
+    const response = await directoryEndpoint(db, calls, {
+      narrate: () => Promise.reject(new Error("agent unavailable")),
+      narration: "Write in Spanish, warm and brief.",
+    }).handle(postMilestone({ mentions: ["Juan Pérez", "ana.r"] }));
+
+    expect(response.status).toBe(200);
+    expect(calls).toEqual([rootCalls[0], taggedReply]);
+  });
+
+  test("refuses a mention no channel member matches or several share, before posting anything", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = directoryEndpoint(db, calls);
+
+    const unknown = await endpoint.handle(
+      postMilestone({ mentions: ["Juan Pérez", "Juan Gómez"] }),
+    );
+    const ambiguous = await endpoint.handle(
+      postMilestone({ id: "evt-2", mentions: ["juan"] }),
+    );
+
+    expect(unknown.status).toBe(422);
+    expect(await unknown.json()).toEqual({
+      error: "unknown_mention",
+      mention: "Juan Gómez",
+      ok: false,
+    });
+    expect(ambiguous.status).toBe(409);
+    expect(await ambiguous.json()).toEqual({
+      candidates: [
+        { name: "Juan Pérez", userId: "U0JUAN" },
+        { name: "Juan Ruiz", userId: "U0JUANR" },
+      ],
+      error: "ambiguous_mention",
+      mention: "juan",
+      ok: false,
+    });
+    expect(calls).toEqual([]);
+    expect(db.seen.size).toBe(0);
   });
 });
 

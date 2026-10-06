@@ -95,7 +95,7 @@ A brokered turn streams the same way a Workers AI turn does, including tool call
 
 The sanitizer withholds a bounded tail of `STREAM_TAIL_LENGTH` (512) characters before sending text to Slack.
 It removes Slack broadcast syntax, escapes mention controls, rewrites Slack's own link syntax into the markdown links a stream renders, redacts Slack token patterns, and redacts assignments whose names contain terms such as `TOKEN`, `SECRET`, `PASSWORD`, or `API_KEY`.
-Slack renders neither a mention nor its own link syntax inside streamed markdown, so the tags and links trusted code owes a reply close the message as one section block on `chat.stopStream`: every member the model tagged with `mention_member`.
+Slack renders neither a mention nor its own link syntax inside streamed markdown, so the tags and links trusted code owes a reply close the message as one section block on `chat.stopStream`: a progress milestone's `mentions` and `url`, and every member the model tagged with `mention_member`.
 This is pattern-based output filtering, not a guarantee that arbitrary credentials or confidential content cannot appear in a reply.
 Appends are coalesced at `COALESCE_CHARS` (1024) characters and on a `COALESCE_MS` (300) millisecond timer.
 Retryable Slack failures use bounded backoff or `Retry-After`, capped at `MAX_RETRY_AFTER_MS` (2000) milliseconds per attempt and `MAX_RETRY_WAIT_MS` (4000) milliseconds across attempts.
@@ -310,11 +310,16 @@ It takes the same bearer and answers `401` without it.
 - `task` identifies the task inside the channel; its first event posts the root and stores the root timestamp in D1 (`slack_progress_roots`, migration `0006_slack_progress_roots.sql`), and later events reply in that thread.
 - `kind` is one of `started`, `progress`, `blocked`, `pr`, `review`, `merged`, `done`; the root reads `<title> · <label of the kind>` and is edited whenever that text changes, so the root always shows the task's current status.
   A root Slack refuses to edit is logged and the milestone still gets its reply; when Slack answers that the root is gone, the next milestone posts a fresh one.
-- `text` and its optional `url` are the milestone: without `narration` they post as the reply, with `url` on the line below `text`, and with it they are what the turn rewrites and what the thread falls back to when that turn cannot deliver.
+- `text` and its optional `url` are the milestone: without `narration` they post as the reply, with `url` on the line below `text`, and with it `text` is what the turn rewrites and what the thread falls back to when that turn cannot deliver.
+  A narrated reply carries `url` the same way: trusted code closes it with the link, so the model never retypes it.
+- `mentions` is an optional list of up to 10 members of the destination channel to tag, each a user ID, a display or real name, or one word of it.
+  The tags close the reply next to `url`, whether the reply is narrated or posted as given.
+  Resolving them reads `users.list`, so it needs the `users:read` scope the `read` option adds.
 - `title`, `text`, `id`, `task`, `channel` and `url` are bounded, `url` must be HTTPS, and `channel` names the destination as an id or as a name.
   A name may carry its leading `#` and is compared case-insensitively against the admitted channels, so either form must already carry the admission an allowlisted user's invitation wrote.
 
 The refusals are `401` for a missing or wrong bearer, `400` for a body that is not a milestone, `403` for a channel the admission does not cover, and `409` for a name several admitted channels answer to.
+A mention no channel member matches answers `422` `unknown_mention`, and one several members share answers `409` `ambiguous_mention` with their `candidates`; both name the `mention` and post nothing.
 A Slack failure answers `500` so the sender can retry, and the retry is deduplicated by `id` once a request has succeeded.
 `chat:write` covers both `chat.postMessage` and `chat.update`, so the option adds no scope.
 Milestone content arrives curated: without `narration` it is posted as given, and with it the bot only restates what the milestone and the thread's earlier milestones already say.
