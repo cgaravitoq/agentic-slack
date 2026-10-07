@@ -28,6 +28,7 @@ const trusted = {
 
 class FakeD1 {
   readonly admissions = new Map<string, string>();
+  completeFailures = 0;
   readonly receipts = new Map<
     string,
     { claimed_at: number; state: string; ts: string | null; updated_at: number }
@@ -151,6 +152,10 @@ class FakeD1 {
         updated_at: claimedAt,
       });
       return Promise.resolve({ meta: { changes: 1 } });
+    }
+    if (this.completeFailures > 0) {
+      this.completeFailures -= 1;
+      return Promise.reject(new Error("receipt completion failed"));
     }
     const state = v.parse(v.string(), this.values[1]);
     const ts = v.parse(v.nullable(v.string()), this.values[2]);
@@ -877,6 +882,27 @@ describe("progress endpoint", () => {
     expect(calls).toEqual(rootCalls);
   });
 
+  test("answers a posted duplicate sent by channel name without calling Slack", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls, {
+      fetcher: strictFetch(
+        slackRecorder(calls, [], { C1: { name: "Sandbox" } }),
+      ),
+    });
+
+    const first = await endpoint.handle(postMilestone());
+    const retried = await endpoint.handle(
+      postMilestone({ channel: "#SANDBOX" }),
+    );
+
+    expect(await first.json()).toEqual({ ok: true, ts: "171.1" });
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual({ ok: true, ts: "171.1" });
+    expect(calls).toEqual(rootCalls);
+  });
+
   test("refuses a milestone whose receipt is still in flight", async () => {
     const db = new FakeD1();
     db.admissions.set("C1", ADMITTED_BY);
@@ -919,6 +945,60 @@ describe("progress endpoint", () => {
       state: "posted",
       ts: "171.1",
     });
+  });
+
+  test("retries a receipt write that fails after the post and never posts the milestone twice", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+    db.completeFailures = 1;
+
+    const first = await endpoint.handle(postMilestone());
+
+    expect(first.status).toBe(200);
+    expect(await first.json()).toEqual({ ok: true, ts: "171.1" });
+    expect(db.receipts.get("evt-1")).toMatchObject({
+      state: "posted",
+      ts: "171.1",
+    });
+
+    const stored = db.receipts.get("evt-1");
+    if (stored === undefined) {
+      throw new Error("the post left no receipt");
+    }
+    const stale = Math.floor(Date.now() / 1000) - 301;
+    db.receipts.set("evt-1", {
+      claimed_at: stale,
+      state: stored.state,
+      ts: stored.ts,
+      updated_at: stale,
+    });
+
+    const retried = await endpoint.handle(postMilestone());
+
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual({ ok: true, ts: "171.1" });
+    expect(calls).toEqual(rootCalls);
+  });
+
+  test("settles the receipt when every completion write fails, so a retry does not repost", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+    db.completeFailures = 2;
+
+    const first = await endpoint.handle(postMilestone());
+
+    expect(first.status).toBe(500);
+    expect(db.receipts.get("evt-1")).toMatchObject({ state: "narrated" });
+
+    const retried = await endpoint.handle(postMilestone());
+
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual({ narrated: true, ok: true });
+    expect(calls).toEqual(rootCalls);
   });
 
   test("adopts the thread a milestone names and posts no root of its own", async () => {
