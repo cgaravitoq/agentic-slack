@@ -276,7 +276,7 @@ export const createDelegationStore = (db: D1Database) => {
     ): Promise<boolean> {
       const result = await db
         .prepare(
-          "UPDATE delegation_tasks SET state = ?3 WHERE id = ?1 AND runner = ?2 AND (state IN ('claimed', 'running') OR (state = 'unknown' AND ?3 = 'failed'))",
+          "UPDATE delegation_tasks SET state = ?3 WHERE id = ?1 AND runner = ?2 AND state <> ?3 AND (state IN ('claimed', 'running') OR (state = 'unknown' AND ?3 = 'failed'))",
         )
         .bind(id, runner, state)
         .run();
