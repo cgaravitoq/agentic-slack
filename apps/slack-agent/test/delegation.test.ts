@@ -653,6 +653,35 @@ test("task token scopes progress and replies, and verbatim done settles its rece
       ),
     ),
   ).toBe(403);
+  const strangers: HeadersInit[] = [
+    {},
+    { authorization: "Bearer not-a-task-token" },
+  ];
+  const refusals = await Promise.all(
+    strangers.flatMap((headers) => [
+      progress.handle(
+        new Request("https://helper.example/progress", {
+          body: JSON.stringify(milestone),
+          headers,
+          method: "POST",
+        }),
+      ),
+      progress.handleReplies(
+        new Request(
+          `https://helper.example/progress/replies?channel=C1&task=delegation:${output.id}`,
+          { headers },
+        ),
+      ),
+      progress.handleChannels(
+        new Request("https://helper.example/progress/channels", { headers }),
+      ),
+    ]),
+  );
+  expect(
+    await Promise.all(
+      refusals.map(async (refused) => [refused.status, await refused.json()]),
+    ),
+  ).toEqual(refusals.map(() => [401, { error: "unauthorized", ok: false }]));
   expect(
     await statusOf(
       h.request(
@@ -686,10 +715,10 @@ test("task token scopes progress and replies, and verbatim done settles its rece
     )
     .all();
   expect(receipt.results).toEqual([{ state: "posted", ts: "172.1" }]);
-  expect(await statusOf(post({ ...milestone, id: "after-done" }))).toBe(403);
+  expect(await statusOf(post({ ...milestone, id: "after-done" }))).toBe(401);
   expect(
     await statusOf(replies(`channel=C1&task=delegation:${output.id}`)),
-  ).toBe(403);
+  ).toBe(401);
 });
 
 test("delegation HTTP routes are absent without configuration and mount when configured", async () => {

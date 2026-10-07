@@ -833,24 +833,22 @@ export const createSlackProgressEndpoint = (
     }
   };
 
+  const bearerTask = async (
+    request: Request,
+  ): Promise<StoredDelegationTask | undefined> =>
+    await options.delegation?.store.tokenTask(
+      /^Bearer (?<token>[A-Za-z0-9_-]+)$/u.exec(
+        request.headers.get("authorization") ?? "",
+      )?.groups?.token ?? "",
+    );
+
   const authorizeTask = async (
     request: Request,
   ): Promise<StoredDelegationTask | Response | undefined> => {
     if (authorized(request)) {
       return undefined;
     }
-    const task = await options.delegation?.store.tokenTask(
-      /^Bearer (?<token>[A-Za-z0-9_-]+)$/u.exec(
-        request.headers.get("authorization") ?? "",
-      )?.groups?.token ?? "",
-    );
-    return (
-      task ??
-      refusal(
-        options.delegation === undefined ? 401 : 403,
-        options.delegation === undefined ? "unauthorized" : "token_scope",
-      )
-    );
+    return (await bearerTask(request)) ?? refusal(401, "unauthorized");
   };
 
   return {
@@ -931,10 +929,9 @@ export const createSlackProgressEndpoint = (
     },
     async handleChannels(request) {
       if (!authorized(request)) {
-        return refusal(
-          options.delegation === undefined ? 401 : 403,
-          options.delegation === undefined ? "unauthorized" : "token_scope",
-        );
+        return (await bearerTask(request)) === undefined
+          ? refusal(401, "unauthorized")
+          : refusal(403, "token_scope");
       }
       const admittedChannelIds = await admissionStore.listAdmittedChannelIds();
       const channels: SlackProgressChannel[] = await Promise.all(
