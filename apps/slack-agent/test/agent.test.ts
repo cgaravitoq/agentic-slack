@@ -47,6 +47,8 @@ const refunds = defineSkill({
   name: "refunds",
 });
 const operatorConfig = defineAgentConfig({
+  allowedUserIds: ["U777"],
+  delegation: { authSecret: "DELEGATION_SECRET", repos: ["example"] },
   description: "Exercises operator configuration.",
   mcpServers: [
     {
@@ -123,6 +125,7 @@ interface WiredRetentionAgent extends RecordingAgent {
 const instructions: string[] = [];
 const mcpConnections: McpConnectionDefinition[] = [];
 const mountedSkills: Skill[] = [];
+const mountedTools: { name: string }[] = [];
 let resolvedModel = "";
 const userMessage: DeliveredMessage = { body: "", kind: "user" };
 let delivery: DeliveredMessage = userMessage;
@@ -161,6 +164,7 @@ await mock.module("@flue/runtime", () => ({
     resolvedModel = model;
   },
   useSkill: (skill: Skill) => mountedSkills.push(skill),
+  useTool: (tool: { name: string }) => mountedTools.push(tool),
 }));
 // The spread keeps the mocked export list as wide as the real module: Bun
 // freezes it on first use, so a narrow mock breaks whichever test file loads
@@ -268,16 +272,16 @@ test("mounts each configured skill with its name and instructions", () => {
   expect(mountedSkills).toEqual([refunds]);
 });
 
-const directMessage = (threadTs: string): DeliveredMessage => ({
+const directMessage = (threadTs: string, user = "U777"): DeliveredMessage => ({
   attributes: {
     channelId: "D777",
     event_id: `Ev-${threadTs}`,
     message_ts: threadTs,
     recipientTeamId: "T123",
-    recipientUserId: "U777",
+    recipientUserId: user,
     surface: "private",
     threadTs,
-    user: "U777",
+    user,
   },
   body: threadTs,
   kind: "signal",
@@ -357,6 +361,19 @@ test("holds a gated call for the requester of the conversation's thread", async 
   network.mockRestore();
   evictLiveSlackDelivery(instanceId);
   deliveryRows.delete(instanceId);
+  delivery = userMessage;
+});
+
+test("mounts delegate_to_conductor only for an allowlisted requester", () => {
+  const instanceId = "slack:v1:T123:D777:D777";
+  const toolsFor = (user: string) => {
+    mountedTools.length = 0;
+    delivery = directMessage("183.1", user);
+    SlackAgent({ id: instanceId });
+    return mountedTools.map((tool) => tool.name);
+  };
+  expect(toolsFor("U777")).toEqual(["delegate_to_conductor"]);
+  expect(toolsFor("U888")).toEqual([]);
   delivery = userMessage;
 });
 
