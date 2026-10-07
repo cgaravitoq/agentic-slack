@@ -448,7 +448,7 @@ test("reporters leave out Bloop's own replies and every bot message", async () =
   const h = await harness({
     thread: [
       ...rawThread,
-      { bot_id: "B1", text: "On it", ts: "171.3", user: "UBOT" },
+      { text: "On it", ts: "171.3", user: "UBOT" },
       { bot_id: "B2", text: "Build passed", ts: "171.4", user: "UBUILDER" },
     ],
   });
