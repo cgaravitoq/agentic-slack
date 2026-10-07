@@ -821,13 +821,6 @@ export const createSlackProgressEndpoint = (
         if (mismatch !== undefined) {
           return mismatch;
         }
-        const mentioned = await resolveMentions(
-          resolved.channelId,
-          milestone.mentions ?? [],
-        );
-        if ("refusal" in mentioned) {
-          return mentioned.refusal;
-        }
         const claim = await receipts.claim(resolvedMilestone.id);
         if (claim.outcome === "busy") {
           return refusal(409, "in_flight");
@@ -837,6 +830,14 @@ export const createSlackProgressEndpoint = (
         }
         let outcome: SlackMilestoneOutcome;
         try {
+          const mentioned = await resolveMentions(
+            resolved.channelId,
+            milestone.mentions ?? [],
+          );
+          if ("refusal" in mentioned) {
+            await receipts.drop(resolvedMilestone.id);
+            return mentioned.refusal;
+          }
           outcome = await postMilestone(
             resolvedMilestone,
             mentioned.members,

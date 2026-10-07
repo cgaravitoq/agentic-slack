@@ -1355,6 +1355,21 @@ describe("progress mentions", () => {
     expect(calls).toEqual([rootCalls[0], taggedReply]);
   });
 
+  test("answers a retry of a tagged milestone from its receipt without reading the directory", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const retryCalls: RecordedCall[] = [];
+    const tagged = () => postMilestone({ mentions: ["Juan Pérez", "ana.r"] });
+
+    const first = await directoryEndpoint(db, calls).handle(tagged());
+    const retried = await endpointFor(db, retryCalls).handle(tagged());
+
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual(await first.json());
+    expect(retryCalls).toEqual([]);
+  });
+
   test("refuses a mention no channel member matches or several share, before posting anything", async () => {
     const db = new FakeD1();
     db.admissions.set("C1", ADMITTED_BY);
@@ -1385,7 +1400,7 @@ describe("progress mentions", () => {
       ok: false,
     });
     expect(calls).toEqual([]);
-    expect(db.seen.size).toBe(0);
+    expect(db.receipts.size).toBe(0);
   });
 });
 
