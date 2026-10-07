@@ -2,7 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { SlackThreadRef } from "@flue/slack";
 import * as v from "valibot";
 import { createSqlSlackChannelAdmissionStore } from "./admission.ts";
-import { closingMrkdwn, MAX_SLACK_MESSAGE_LENGTH } from "./delivery.ts";
+import { closingMrkdwn, MAX_SLACK_MESSAGE_LENGTH, redact } from "./delivery.ts";
 import type { SlackDeliveryBinding } from "./delivery.ts";
 import { loadChannelMembers, matchMember } from "./mention.ts";
 import type { SlackMember } from "./mention.ts";
@@ -84,6 +84,7 @@ const CHANNEL_LIMIT = 255;
 const URL_LIMIT = 2048;
 const MENTION_LIMIT = 100;
 const MAX_MENTIONS = 10;
+const SLACK_TS_RE = /^\d+\.\d+$/u;
 
 const milestoneSchema = v.object({
   channel: v.pipe(v.string(), v.nonEmpty(), v.maxLength(CHANNEL_LIMIT)),
@@ -97,6 +98,7 @@ const milestoneSchema = v.object({
   ),
   task: v.pipe(v.string(), v.nonEmpty(), v.maxLength(TASK_LIMIT)),
   text: v.pipe(v.string(), v.nonEmpty(), v.maxLength(MAX_SLACK_MESSAGE_LENGTH)),
+  threadTs: v.optional(v.pipe(v.string(), v.regex(SLACK_TS_RE))),
   title: v.pipe(v.string(), v.nonEmpty(), v.maxLength(TITLE_LIMIT)),
   url: v.optional(
     v.pipe(
@@ -109,6 +111,7 @@ const milestoneSchema = v.object({
       v.transform((value) => new URL(value).href),
     ),
   ),
+  verbatim: v.optional(v.boolean()),
 });
 
 type SlackProgressMilestone = v.InferOutput<typeof milestoneSchema>;
@@ -119,9 +122,14 @@ const repliesQuerySchema = v.object({
   task: v.pipe(v.string(), v.nonEmpty(), v.maxLength(TASK_LIMIT)),
 });
 
-const rootRow = v.object({ root_text: v.string(), root_ts: v.string() });
+const rootRow = v.object({
+  owned: v.number(),
+  root_text: v.string(),
+  root_ts: v.string(),
+});
 
 interface SlackProgressRoot {
+  readonly owned: boolean;
   readonly rootText: string;
   readonly rootTs: string;
 }
@@ -154,23 +162,34 @@ export const createSqlSlackProgressRootStore = (
   async load(channelId, taskId) {
     const { results } = await db
       .prepare(
-        "SELECT root_ts, root_text FROM slack_progress_roots WHERE channel_id = ?1 AND task_id = ?2",
+        "SELECT owned, root_ts, root_text FROM slack_progress_roots WHERE channel_id = ?1 AND task_id = ?2",
       )
       .bind(channelId, taskId)
       .all();
     const [row] = results;
     return v.is(rootRow, row)
-      ? { rootText: row.root_text, rootTs: row.root_ts }
+      ? {
+          owned: row.owned === 1,
+          rootText: row.root_text,
+          rootTs: row.root_ts,
+        }
       : undefined;
   },
   async save(channelId, taskId, root, now) {
     await db
       .prepare(
-        `INSERT INTO slack_progress_roots (channel_id, task_id, root_ts, root_text, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(channel_id, task_id) DO UPDATE SET root_ts = excluded.root_ts, root_text = excluded.root_text, updated_at = excluded.updated_at`,
+        `INSERT INTO slack_progress_roots (channel_id, task_id, root_ts, root_text, owned, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(channel_id, task_id) DO UPDATE SET root_ts = excluded.root_ts, root_text = excluded.root_text, owned = excluded.owned, updated_at = excluded.updated_at`,
       )
-      .bind(channelId, taskId, root.rootTs, root.rootText, now)
+      .bind(
+        channelId,
+        taskId,
+        root.rootTs,
+        root.rootText,
+        root.owned ? 1 : 0,
+        now,
+      )
       .run();
   },
 });
@@ -437,9 +456,10 @@ const requiredTs = (posted: { readonly ts?: string | undefined }): string => {
 const replyOf = (
   milestone: SlackProgressMilestone,
   members: readonly SlackMember[],
+  text: string = milestone.text,
 ): string => {
   const closing = closingOf(milestone, members);
-  return closing === "" ? milestone.text : `${milestone.text}\n${closing}`;
+  return closing === "" ? text : `${text}\n${closing}`;
 };
 
 // The progress route reaches a conversation without an ingress channel object,
@@ -613,6 +633,15 @@ export const createSlackProgressEndpoint = (
   ): Promise<SlackProgressRoot> => {
     const stored = await roots.load(milestone.channel, milestone.task);
     if (stored === undefined) {
+      if (milestone.threadTs !== undefined) {
+        const root = {
+          owned: false,
+          rootText: text,
+          rootTs: milestone.threadTs,
+        };
+        await roots.save(milestone.channel, milestone.task, root, Date.now());
+        return root;
+      }
       const posted = await callSlack(
         caller,
         "chat.postMessage",
@@ -622,9 +651,12 @@ export const createSlackProgressEndpoint = (
         },
         slackEnvelope,
       );
-      const root = { rootText: text, rootTs: requiredTs(posted) };
+      const root = { owned: true, rootText: text, rootTs: requiredTs(posted) };
       await roots.save(milestone.channel, milestone.task, root, Date.now());
       return root;
+    }
+    if (!stored.owned) {
+      return stored;
     }
     if (stored.rootText !== text) {
       try {
@@ -648,11 +680,23 @@ export const createSlackProgressEndpoint = (
         }
         return stored;
       }
-      const root = { rootText: text, rootTs: stored.rootTs };
+      const root = { owned: true, rootText: text, rootTs: stored.rootTs };
       await roots.save(milestone.channel, milestone.task, root, Date.now());
       return root;
     }
     return stored;
+  };
+
+  const threadMismatch = async (
+    milestone: SlackProgressMilestone,
+  ): Promise<Response | undefined> => {
+    if (milestone.threadTs === undefined) {
+      return undefined;
+    }
+    const stored = await roots.load(milestone.channel, milestone.task);
+    return stored !== undefined && stored.rootTs !== milestone.threadTs
+      ? refusal(409, "thread_mismatch")
+      : undefined;
   };
 
   const postReply = async (
@@ -728,14 +772,14 @@ export const createSlackProgressEndpoint = (
   ): Promise<SlackMilestoneOutcome> => {
     const root = await enterRoot(milestone, rootOf(milestone));
     const { narration } = config;
-    if (narration === undefined) {
+    const reply =
+      milestone.verbatim === true
+        ? replyOf(milestone, members, redact(milestone.text))
+        : replyOf(milestone, members);
+    if (narration === undefined || milestone.verbatim === true) {
       return {
         state: "posted",
-        ts: await postReply(
-          milestone.channel,
-          root.rootTs,
-          replyOf(milestone, members),
-        ),
+        ts: await postReply(milestone.channel, root.rootTs, reply),
       };
     }
     return await narrateMilestone(
@@ -773,6 +817,10 @@ export const createSlackProgressEndpoint = (
         channel: resolved.channelId,
       };
       try {
+        const mismatch = await threadMismatch(resolvedMilestone);
+        if (mismatch !== undefined) {
+          return mismatch;
+        }
         const mentioned = await resolveMentions(
           resolved.channelId,
           milestone.mentions ?? [],

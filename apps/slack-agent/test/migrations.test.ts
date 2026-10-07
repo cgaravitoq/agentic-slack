@@ -705,27 +705,29 @@ describe("slack progress root storage", () => {
     await store.save(
       "C1",
       "task-1",
-      { rootText: "Release 42 · Started", rootTs: "171.1" },
+      { owned: true, rootText: "Release 42 · Started", rootTs: "171.1" },
       NOW,
     );
     await store.save(
       "C1",
       "task-2",
-      { rootText: "Release 43 · Started", rootTs: "171.2" },
+      { owned: true, rootText: "Release 43 · Started", rootTs: "171.2" },
       NOW,
     );
     await store.save(
       "C1",
       "task-1",
-      { rootText: "Release 42 · Blocked", rootTs: "171.1" },
+      { owned: true, rootText: "Release 42 · Blocked", rootTs: "171.1" },
       NOW + 60,
     );
 
     expect(await store.load("C1", "task-1")).toEqual({
+      owned: true,
       rootText: "Release 42 · Blocked",
       rootTs: "171.1",
     });
     expect(await store.load("C1", "task-2")).toEqual({
+      owned: true,
       rootText: "Release 43 · Started",
       rootTs: "171.2",
     });
@@ -735,24 +737,44 @@ describe("slack progress root storage", () => {
     await store.drop("C1", "task-9");
     expect(await store.load("C1", "task-1")).toBeUndefined();
     expect(await store.load("C1", "task-2")).toEqual({
+      owned: true,
       rootText: "Release 43 · Started",
       rootTs: "171.2",
     });
 
     const rows = await db
       .prepare(
-        "SELECT channel_id, task_id, root_ts, root_text, updated_at FROM slack_progress_roots ORDER BY channel_id, task_id",
+        "SELECT channel_id, task_id, root_ts, root_text, owned, updated_at FROM slack_progress_roots ORDER BY channel_id, task_id",
       )
       .all();
     expect(rows.results).toEqual([
       {
         channel_id: "C1",
+        owned: 1,
         root_text: "Release 43 · Started",
         root_ts: "171.2",
         task_id: "task-2",
         updated_at: NOW,
       },
     ]);
+  });
+
+  test("keeps a root a thread the bot does not own adopted", async () => {
+    const { db } = migrated();
+    const store = createSqlSlackProgressRootStore(db);
+
+    await store.save(
+      "C1",
+      "task-1",
+      { owned: false, rootText: "Release 42 · Started", rootTs: "171.1" },
+      NOW,
+    );
+
+    expect(await store.load("C1", "task-1")).toEqual({
+      owned: false,
+      rootText: "Release 42 · Started",
+      rootTs: "171.1",
+    });
   });
 });
 

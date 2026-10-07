@@ -32,7 +32,10 @@ class FakeD1 {
     string,
     { claimed_at: number; state: string; ts: string | null; updated_at: number }
   >();
-  readonly roots = new Map<string, { root_text: string; root_ts: string }>();
+  readonly roots = new Map<
+    string,
+    { owned: number; root_text: string; root_ts: string }
+  >();
   readonly seen = new Set<string>();
   private values: unknown[] = [];
 
@@ -77,6 +80,7 @@ class FakeD1 {
             return Promise.resolve({ meta: { changes: 1 } });
           }
           this.roots.set(this.rootKey(), {
+            owned: Number(this.values[4]),
             root_text: String(this.values[3]),
             root_ts: String(this.values[2]),
           });
@@ -334,8 +338,10 @@ interface Milestone {
   readonly mentions?: readonly string[];
   readonly task: string;
   readonly text: string;
+  readonly threadTs?: string;
   readonly title: string;
   readonly url?: string;
+  readonly verbatim?: boolean;
 }
 
 const milestone: Milestone = {
@@ -566,7 +572,7 @@ describe("progress endpoint", () => {
       },
     ]);
     expect([...db.roots.values()]).toEqual([
-      { root_text: "Release 42 · Started", root_ts: "171.1" },
+      { owned: 1, root_text: "Release 42 · Started", root_ts: "171.1" },
     ]);
     expect(
       turns.map((turn) => [turn.binding.channelId, turn.instanceId]),
@@ -715,7 +721,7 @@ describe("progress endpoint", () => {
     expect(await response.json()).toEqual({ ok: true, ts: "171.1" });
     expect(calls).toEqual(rootCalls);
     expect([...db.roots.values()]).toEqual([
-      { root_text: "Release 42 · Started", root_ts: "171.1" },
+      { owned: 1, root_text: "Release 42 · Started", root_ts: "171.1" },
     ]);
     expect(db.receipts.get("evt-1")).toMatchObject({
       state: "posted",
@@ -915,6 +921,102 @@ describe("progress endpoint", () => {
     });
   });
 
+  test("adopts the thread a milestone names and posts no root of its own", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+
+    const adopted = await endpoint.handle(
+      postMilestone({ threadTs: "555.000" }),
+    );
+    const later = await endpoint.handle(
+      postMilestone({
+        id: "evt-2",
+        kind: "blocked",
+        text: "Waiting on review",
+        threadTs: "555.000",
+      }),
+    );
+
+    expect([adopted.status, later.status]).toEqual([200, 200]);
+    expect(await adopted.json()).toEqual({ ok: true, ts: "171.1" });
+    expect(calls.map((call) => call.method)).toEqual([
+      "chat.postMessage",
+      "chat.postMessage",
+    ]);
+    expect(calls.map((call) => call.body.thread_ts)).toEqual([
+      "555.000",
+      "555.000",
+    ]);
+    expect([...db.roots.values()]).toEqual([
+      { owned: 0, root_text: "Release 42 · Started", root_ts: "555.000" },
+    ]);
+  });
+
+  test("leaves the text of a thread it does not own alone when the label changes", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+
+    await endpoint.handle(postMilestone({ threadTs: "555.000" }));
+    const blocked = await endpoint.handle(
+      postMilestone({
+        id: "evt-2",
+        kind: "blocked",
+        text: "Waiting on review",
+        threadTs: "555.000",
+      }),
+    );
+    const renamed = await endpoint.handle(
+      postMilestone({
+        id: "evt-3",
+        task: "release-43",
+        threadTs: "555.000",
+      }),
+    );
+
+    expect([blocked.status, renamed.status]).toEqual([200, 200]);
+    expect(calls.map((call) => call.method)).not.toContain("chat.update");
+    expect([...db.roots.values()]).toEqual([
+      { owned: 0, root_text: "Release 42 · Started", root_ts: "555.000" },
+      { owned: 0, root_text: "Release 42 · Started", root_ts: "555.000" },
+    ]);
+  });
+
+  test("refuses a thread that is not the one it holds", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+
+    await endpoint.handle(postMilestone({ threadTs: "555.000" }));
+    const owned = await endpoint.handle(
+      postMilestone({ id: "evt-2", task: "release-43" }),
+    );
+    const unowned = await endpoint.handle(
+      postMilestone({ id: "evt-3", threadTs: "666.000" }),
+    );
+    const ownedMismatch = await endpoint.handle(
+      postMilestone({ id: "evt-4", task: "release-43", threadTs: "666.000" }),
+    );
+
+    expect([owned.status, unowned.status, ownedMismatch.status]).toEqual([
+      200, 409, 409,
+    ]);
+    expect(await unowned.json()).toEqual({
+      error: "thread_mismatch",
+      ok: false,
+    });
+    expect(await ownedMismatch.json()).toEqual({
+      error: "thread_mismatch",
+      ok: false,
+    });
+    expect(db.receipts.has("evt-3")).toBe(false);
+    expect(db.receipts.has("evt-4")).toBe(false);
+  });
+
   test("answers non-2xx when Slack refuses the root, and lets the retry through", async () => {
     const db = new FakeD1();
     db.admissions.set("C1", ADMITTED_BY);
@@ -989,7 +1091,7 @@ describe("progress endpoint", () => {
       method: "chat.postMessage",
     });
     expect([...db.roots.values()]).toEqual([
-      { root_text: "Release 42 · Started", root_ts: "171.1" },
+      { owned: 1, root_text: "Release 42 · Started", root_ts: "171.1" },
     ]);
   });
 
@@ -1027,7 +1129,7 @@ describe("progress endpoint", () => {
       method: "chat.postMessage",
     });
     expect([...db.roots.values()]).toEqual([
-      { root_text: "Release 42 · Blocked", root_ts: "171.1" },
+      { owned: 1, root_text: "Release 42 · Blocked", root_ts: "171.1" },
     ]);
   });
 });
@@ -1046,6 +1148,55 @@ describe("narrated progress endpoint", () => {
     expect(response.status).toBe(200);
     expect(calls).toEqual(rootCalls);
     expect(turns).toEqual([]);
+  });
+
+  test("posts a verbatim milestone as given and never narrates it", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const { narrate, turns } = narrations();
+
+    const response = await endpointFor(db, calls, {
+      narrate,
+      narration: "Write in Spanish, warm and brief.",
+    }).handle(postMilestone({ threadTs: "555.000", verbatim: true }));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, ts: "171.1" });
+    expect(turns).toEqual([]);
+    expect(calls).toEqual([
+      {
+        body: {
+          channel: "C1",
+          text: "Kicked off\n<https://example.com/run>",
+          thread_ts: "555.000",
+        },
+        method: "chat.postMessage",
+      },
+    ]);
+    expect(db.receipts.get("evt-1")).toMatchObject({
+      state: "posted",
+      ts: "171.1",
+    });
+  });
+
+  test("redacts what a verbatim milestone would carry", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+
+    const response = await endpointFor(db, calls).handle(
+      postMilestone({
+        text: "Bearer xoxb-1234-not-a-real-token",
+        threadTs: "555.000",
+        verbatim: true,
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(calls[0]?.body.text).toBe(
+      "Bearer [secret]\n<https://example.com/run>",
+    );
   });
 
   test("narrates a milestone as one turn in its thread and posts no reply itself", async () => {
@@ -1313,6 +1464,7 @@ const threadReplies = [
 const repliesEndpoint = (db: FakeD1, calls: RecordedCall[]) => {
   db.admissions.set("C1", ADMITTED_BY);
   db.roots.set(`C1\u0000release-42`, {
+    owned: 1,
     root_text: "Release 42 · Started",
     root_ts: "171.1",
   });
@@ -1373,6 +1525,7 @@ const longThreadEndpoint = (calls: RecordedCall[], replies: number) => {
   const db = new FakeD1();
   db.admissions.set("C1", ADMITTED_BY);
   db.roots.set(`C1\u0000release-42`, {
+    owned: 1,
     root_text: "Release 42 · Started",
     root_ts: LONG_ROOT_TS,
   });
