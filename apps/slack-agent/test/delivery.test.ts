@@ -1820,6 +1820,29 @@ describe("durable Slack delivery", () => {
     expect(startStreamThreads(slack)).toEqual(["171.2", "182.2"]);
   });
 
+  // The runtime steers a dispatch that arrives mid-response into the next turn
+  // of the same reply, so one reply carries two milestones' notes. Without a
+  // separator the second note's first delta lands against the first note's last
+  // character ("...feedback." + "Now on the fix." reads as "feedback.Now").
+  test("keeps a blank line between the notes a joined response carries", async () => {
+    const slack = createFakeSlack();
+    const store = memoryStore();
+    const binding = slackDeliveryBinding(channelTarget);
+    openSlackDelivery(store, "notes", binding, BOT_TOKEN, slack.fetcher);
+    applySlackDeliveryEvent(store, "notes", {
+      text: "Reviewed the feedback.",
+      type: "text",
+    });
+    openSlackDelivery(store, "notes", binding, BOT_TOKEN, slack.fetcher);
+    applySlackDeliveryEvent(store, "notes", {
+      text: "Now on the fix.",
+      type: "text",
+    });
+    await finishSlackDelivery(store, "notes", BOT_TOKEN, slack.fetcher);
+
+    expect(slack.markdown()).toBe("Reviewed the feedback.\n\nNow on the fix.");
+  });
+
   // A record left open by an interrupted turn belongs to the thread that
   // opened it; the next turn's thread must not inherit it. The threads that
   // record still owes an outcome are told when the turn that replaced it

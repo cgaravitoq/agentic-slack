@@ -929,6 +929,7 @@ interface LiveSlackDelivery {
   flushTimer: ReturnType<typeof setTimeout> | undefined;
   pendingText: number;
   record: SlackDeliveryRecord;
+  separateJoinedText: boolean;
   store: SlackDeliveryStore;
   stream: SlackStream;
   toolNames: Map<string, string>;
@@ -1034,6 +1035,16 @@ const ownsDestination = (
   [record.binding, ...record.joinedBindings].some((candidate) =>
     sameDestination(candidate, binding),
   );
+
+// A delivery that joins a response the record already answers continues the
+// same reply, so the note it brings would otherwise start against the previous
+// note's last character. The separator rides the joined turn's first text
+// rather than the join itself: a turn that answers with a tool call and no note
+// yet has nothing to separate.
+const joinsAfterNote = (
+  record: SlackDeliveryRecord,
+  binding: SlackDeliveryBinding,
+): boolean => ownsDestination(record, binding) && record.replyText !== "";
 
 // Flue joins a dispatch to a busy instance into the live response, so one
 // response carries a `useAgentStart()` run per requesting thread. Every one of
@@ -1166,6 +1177,7 @@ export const openSlackDelivery = (
 ): void => {
   const live = liveDeliveries.get(instanceId);
   if (live !== undefined) {
+    live.separateJoinedText ||= joinsAfterNote(live.record, binding);
     if (adoptDestination(live.record, binding)) {
       flushLiveDelivery(instanceId, live);
     }
@@ -1197,6 +1209,7 @@ export const openSlackDelivery = (
     flushTimer: undefined,
     pendingText: 0,
     record,
+    separateJoinedText: false,
     store,
     stream: createSlackStream(
       streamTargetFromBinding(record.binding),
@@ -1214,13 +1227,20 @@ export const applySlackDeliveryEvent = (
 ): void => {
   const live = liveDeliveries.get(instanceId);
   if (live !== undefined) {
-    applyRecordEvent(live.record, event);
-    applyDeliveryEvent(live.stream, live.toolNames, event);
-    if (event.type !== "text") {
+    const applied: SlackDeliveryEvent =
+      live.separateJoinedText && event.type === "text"
+        ? { text: `\n\n${event.text}`, type: "text" }
+        : event;
+    if (event.type === "text") {
+      live.separateJoinedText = false;
+    }
+    applyRecordEvent(live.record, applied);
+    applyDeliveryEvent(live.stream, live.toolNames, applied);
+    if (applied.type !== "text") {
       flushLiveDelivery(instanceId, live);
       return;
     }
-    live.pendingText += event.text.length;
+    live.pendingText += applied.text.length;
     if (live.pendingText >= COALESCE_CHARS) {
       flushLiveDelivery(instanceId, live);
       return;
