@@ -348,14 +348,21 @@ export const createDelegation = (
           if (!(await admission.isAdmitted(channel))) {
             throw new Error("Channel is not admitted");
           }
-          const rawThread = await readRawSlackThread(
+          const raw = await readRawSlackThread(
             { fetcher, signal, token: options.botToken },
             channel,
             threadTs,
           );
+          const rawThread = raw.map(({ author, permalink, text, ts }) => ({
+            author,
+            permalink,
+            text,
+            ts,
+          }));
           const reporters = [
             ...new Set(
-              rawThread
+              raw
+                .filter((message) => !message.bot)
                 .map((message) => message.author)
                 .filter((author) => /^[UW][A-Z0-9]+$/u.test(author)),
             ),
