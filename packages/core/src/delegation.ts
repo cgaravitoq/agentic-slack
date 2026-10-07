@@ -57,6 +57,14 @@ const decisionValue = v.object({
   id: v.string(),
   runner: v.optional(v.string()),
 });
+const alreadyHolds = (
+  stored: StoredDelegationTask | undefined,
+  runner: string,
+  state: string,
+): boolean =>
+  stored !== undefined &&
+  stored.runner === runner &&
+  stored.task.state === state;
 const proposalInput = (repos: readonly string[]) =>
   v.object({
     channel: v.optional(v.string()),
@@ -97,6 +105,13 @@ export const createDelegation = (
     );
     if (!response.ok || !result.ok) {
       throw new Error("Slack delegation message failed");
+    }
+  };
+  const notify = async (task: DelegationTask, text: string): Promise<void> => {
+    try {
+      await slack(task, text);
+    } catch (error: unknown) {
+      console.error("Slack delegation notice failed", error);
     }
   };
   const runnerRequest = (
@@ -187,14 +202,19 @@ export const createDelegation = (
         input.output.runner,
         input.output.state,
       );
-      if (!changed) {
+      const stored = await store.read(id);
+      if (
+        !changed &&
+        !alreadyHolds(stored, input.output.runner, input.output.state)
+      ) {
         return errorAnswer(409, "invalid_transition");
       }
-      const stored = await store.read(id);
-      if (stored !== undefined) {
-        await slack(
-          stored.task,
-          `${{ failed: "Failed", running: "Started", unknown: "Outcome unknown" }[input.output.state]}.${input.output.note === undefined ? "" : ` ${redact(input.output.note)}`}`,
+      if (changed && stored !== undefined) {
+        options.waitUntil(
+          notify(
+            stored.task,
+            `${{ failed: "Failed", running: "Started", unknown: "Outcome unknown" }[input.output.state]}.${input.output.note === undefined ? "" : ` ${redact(input.output.note)}`}`,
+          ),
         );
       }
       return Response.json({ ok: true });
@@ -207,9 +227,8 @@ export const createDelegation = (
       if (await store.expire(id)) {
         const stored = await store.read(id);
         if (stored !== undefined) {
-          await slack(
-            stored.task,
-            "Task expired after 24 hours without a claim.",
+          options.waitUntil(
+            notify(stored.task, "Task expired after 24 hours without a claim."),
           );
         }
       }

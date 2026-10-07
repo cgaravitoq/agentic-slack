@@ -158,6 +158,10 @@ const postSchema = v.object({
   text: v.string(),
   thread_ts: v.optional(v.string()),
 });
+const postAnswer = (refused: boolean): Response =>
+  refused
+    ? Response.json({ error: "ratelimited", ok: false }, { status: 429 })
+    : Response.json({ ok: true, ts: "172.1" });
 const rawThread: {
   text: string;
   ts: string;
@@ -187,7 +191,12 @@ const harness = async (
   const scheduled: { id: string; expiresAt: number; instance: string }[] = [];
   const cancelled: string[] = [];
   const background: Promise<void>[] = [];
-  const network = { dispatch: 202, health: 200, throws: false };
+  const network = {
+    dispatch: 202,
+    health: 200,
+    slackFails: false,
+    throws: false,
+  };
   const fetcher: NonNullable<DelegationOptions["fetcher"]> = function fetcher(
     this: undefined,
     input,
@@ -258,7 +267,7 @@ const harness = async (
       posts.push(
         v.parse(postSchema, JSON.parse(v.parse(v.string(), init?.body))),
       );
-      return Promise.resolve(Response.json({ ok: true, ts: "172.1" }));
+      return Promise.resolve(postAnswer(network.slackFails));
     }
     if (method === "conversations.info") {
       return Promise.resolve(
@@ -1014,6 +1023,64 @@ test("claim versus cancellation is exclusive and runner state transitions preser
   expect(
     await statusOf(h.request("/delegation/tasks/task-2?runner=runner-1")),
   ).toBe(200);
+});
+
+test.each(["running", "unknown", "failed"] as const)(
+  "a saved %s state answers 200 even when its Slack notice is refused",
+  async (state) => {
+    const h = await harness();
+    await h.delegation.store.register(runner);
+    await h.delegation.store.propose(proposal, "instance-1");
+    await h.delegation.store.approve(proposal.id, runner.name, "U1");
+    await h.delegation.store.claim(proposal.id, runner.name);
+    h.network.slackFails = true;
+    const report = () =>
+      statusOf(
+        h.request(
+          `/delegation/tasks/${proposal.id}/state`,
+          "POST",
+          JSON.stringify({ runner: runner.name, state }),
+        ),
+      ).catch(() => 500);
+    expect(await report()).toBe(200);
+    const stored = await h.delegation.store.read(proposal.id);
+    expect(stored?.task.state).toBe(state);
+    h.network.slackFails = false;
+    expect(await report()).toBe(200);
+  },
+);
+
+test("a repeated runner state answers 200 once and another runner is still refused", async () => {
+  const h = await harness();
+  await h.delegation.store.register(runner);
+  await h.delegation.store.propose(proposal, "instance-1");
+  await h.delegation.store.approve(proposal.id, runner.name, "U1");
+  await h.delegation.store.claim(proposal.id, runner.name);
+  const report = (state: "running" | "failed", name = runner.name) =>
+    statusOf(
+      h.request(
+        `/delegation/tasks/${proposal.id}/state`,
+        "POST",
+        JSON.stringify({ runner: name, state }),
+      ),
+    );
+  expect(await report("running")).toBe(200);
+  expect(await report("running")).toBe(200);
+  expect(await report("running", "runner-2")).toBe(409);
+  expect(await report("failed")).toBe(200);
+  expect(await report("failed")).toBe(200);
+  expect(h.posts.map((post) => post.text)).toEqual(["Started.", "Failed."]);
+});
+
+test("expiry survives a refused Slack notice and leaves the task expired", async () => {
+  const h = await harness();
+  await h.delegation.store.propose({ ...proposal, expiresAt: 1 }, "instance-1");
+  h.network.slackFails = true;
+  await h.delegation.expire(proposal.id);
+  const stored = await h.delegation.store.read(proposal.id);
+  expect(stored?.task.state).toBe("expired");
+  expect(h.posts.at(-1)?.text).toContain("expired");
+  await Promise.all(h.background);
 });
 
 test("a transport failure keeps approval queued until the runner returns", async () => {
