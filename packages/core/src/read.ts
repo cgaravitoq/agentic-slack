@@ -121,6 +121,7 @@ const usersInfoSchema = v.object({
 const authTestSchema = v.object({
   ...slackEnvelope,
   url: v.pipe(v.string(), v.nonEmpty()),
+  user_id: v.optional(v.string()),
 });
 
 type SlackParams = Record<string, string | undefined>;
@@ -719,7 +720,13 @@ export const readRawSlackThread = async (
   channelId: string,
   threadTs: string,
 ): Promise<
-  { ts: string; author: string; text: string; permalink: string }[]
+  {
+    ts: string;
+    author: string;
+    bot: boolean;
+    text: string;
+    permalink: string;
+  }[]
 > => {
   const messages = await fullPages(caller, "conversations.replies", {
     channel: channelId,
@@ -728,6 +735,9 @@ export const readRawSlackThread = async (
   const workspace = await callSlack(caller, "auth.test", {}, authTestSchema);
   return messages.map((message) => ({
     author: message.user ?? message.bot_id ?? "",
+    bot:
+      message.bot_id !== undefined ||
+      (workspace.user_id !== undefined && message.user === workspace.user_id),
     permalink: permalinkFor(workspace.url, channelId, message.ts, threadTs),
     text: message.text ?? "",
     ts: message.ts,

@@ -57,12 +57,13 @@ const decisionValue = v.object({
   id: v.string(),
   runner: v.optional(v.string()),
 });
-const proposalInput = v.object({
-  channel: v.optional(v.string()),
-  repo: v.string(),
-  summary: v.pipe(v.string(), v.nonEmpty()),
-  threadTs: v.optional(v.pipe(v.string(), v.regex(/^\d+\.\d+$/u))),
-});
+const proposalInput = (repos: readonly string[]) =>
+  v.object({
+    channel: v.optional(v.string()),
+    repo: v.picklist([...repos]),
+    summary: v.pipe(v.string(), v.nonEmpty()),
+    threadTs: v.optional(v.pipe(v.string(), v.regex(/^\d+\.\d+$/u))),
+  });
 
 export const createDelegation = (
   config: DelegationConfig,
@@ -70,6 +71,8 @@ export const createDelegation = (
 ) => {
   const store = createDelegationStore(options.db);
   const fetcher = options.fetcher ?? fetch;
+  const proposal = proposalInput(config.repos);
+  const proposalDescription = `Propose delegation only when the requester explicitly asks. Capture the bound thread and request their approval for a configured repo and runner. The configured repos are ${config.repos.join(", ")}. In an owner's DM, supply an admitted channel and threadTs.`;
   const slack = async (
     task: DelegationTask,
     text: string,
@@ -313,9 +316,8 @@ export const createDelegation = (
     store,
     tool(binding: SlackReadBinding, requester: string, instanceId: string) {
       return defineTool({
-        description:
-          "Propose delegation only when the requester explicitly asks. Capture the bound thread and request their approval for a configured repo and runner. In an owner's DM, supply an admitted channel and threadTs.",
-        input: proposalInput,
+        description: proposalDescription,
+        input: proposal,
         name: "delegate_to_conductor",
         output: v.object({ id: v.string(), state: v.literal("proposed") }),
         async run({ data, signal }) {
@@ -346,14 +348,21 @@ export const createDelegation = (
           if (!(await admission.isAdmitted(channel))) {
             throw new Error("Channel is not admitted");
           }
-          const rawThread = await readRawSlackThread(
+          const raw = await readRawSlackThread(
             { fetcher, signal, token: options.botToken },
             channel,
             threadTs,
           );
+          const rawThread = raw.map(({ author, permalink, text, ts }) => ({
+            author,
+            permalink,
+            text,
+            ts,
+          }));
           const reporters = [
             ...new Set(
-              rawThread
+              raw
+                .filter((message) => !message.bot)
                 .map((message) => message.author)
                 .filter((author) => /^[UW][A-Z0-9]+$/u.test(author)),
             ),
