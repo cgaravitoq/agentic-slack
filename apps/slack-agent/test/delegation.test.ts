@@ -167,7 +167,7 @@ const runner = {
   repos: ["example"],
   url: "https://runner.example",
 };
-const harness = async () => {
+const harness = async (options: { repos?: readonly string[] } = {}) => {
   const db = await database();
   await db
     .prepare(
@@ -259,7 +259,7 @@ const harness = async () => {
     throw new Error(`Unexpected request ${url.pathname}`);
   };
   const delegation = createDelegation(
-    { authSecret: "DELEGATION_SECRET", repos: ["example"] },
+    { authSecret: "DELEGATION_SECRET", repos: options.repos ?? ["example"] },
     {
       bearer: SECRET,
       botToken: "test-bot-token",
@@ -416,6 +416,22 @@ test("tool captures raw thread in code, lists online and offline runners and sch
   expect(h.runnerCalls[0]?.headers.get("CF-Access-Client-Secret")).toBe(
     "client-secret",
   );
+});
+
+test("the tool offers exactly the configured repos as the repo the model must name", async () => {
+  const h = await harness({ repos: ["example", "right-hand"] });
+  expect(h.tool.input.entries.repo.options).toEqual([
+    "example",
+    "right-hand",
+  ]);
+  expect(h.tool.description).toContain("example, right-hand");
+  expect(
+    v.parse(h.tool.input, { repo: "right-hand", summary: "Fix login" }),
+  ).toEqual({ repo: "right-hand", summary: "Fix login" });
+  expect(() =>
+    v.parse(h.tool.input, { repo: "Mac", summary: "Fix login" }),
+  ).toThrow();
+  expect(() => v.parse(h.tool.input, { summary: "Fix login" })).toThrow();
 });
 
 test("tool refuses an unconfigured repo and DM targets outside admitted channels", async () => {
