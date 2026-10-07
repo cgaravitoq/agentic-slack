@@ -498,10 +498,16 @@ const narrationBody = (
   members: readonly SlackMember[],
   narration: string,
   labels: Readonly<Record<ProgressKind, string>>,
+  conductor: string | undefined,
 ): string =>
   [
     narration,
     `Task: ${milestone.task}`,
+    ...(conductor === undefined
+      ? []
+      : [
+          `Delegation: the conductor ${conductor} is doing this task on the owner's behalf; name the conductor, never the owner, as the one working.`,
+        ]),
     `Status: ${labels[milestone.kind]}`,
     `Milestone: ${milestone.text}`,
     ...attachedOf(milestone, members),
@@ -737,6 +743,7 @@ export const createSlackProgressEndpoint = (
     admittedBy: string,
     root: SlackProgressRoot,
     narration: string,
+    conductor: string | undefined,
   ): Promise<SlackMilestoneOutcome> => {
     const binding: SlackDeliveryBinding = {
       channelId: milestone.channel,
@@ -756,7 +763,13 @@ export const createSlackProgressEndpoint = (
     try {
       await options.narrate({
         binding,
-        body: narrationBody(milestone, members, narration, config.labels),
+        body: narrationBody(
+          milestone,
+          members,
+          narration,
+          config.labels,
+          conductor,
+        ),
         instanceId: slackInstanceId({
           channelId: milestone.channel,
           teamId: options.teamId,
@@ -783,6 +796,7 @@ export const createSlackProgressEndpoint = (
     milestone: SlackProgressMilestone,
     members: readonly SlackMember[],
     admittedBy: string,
+    conductor: string | undefined,
   ): Promise<SlackMilestoneOutcome> => {
     const root = await enterRoot(milestone, rootOf(milestone));
     const { narration } = config;
@@ -802,6 +816,7 @@ export const createSlackProgressEndpoint = (
       admittedBy,
       root,
       narration,
+      conductor,
     );
   };
 
@@ -915,6 +930,7 @@ export const createSlackProgressEndpoint = (
             resolvedMilestone,
             mentioned.members,
             admittedBy,
+            taskToken?.runner ?? undefined,
           );
         } catch (error: unknown) {
           await receipts.drop(resolvedMilestone.id);

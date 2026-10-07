@@ -8,6 +8,7 @@ import {
   MODEL_PROVIDER_CLOUDFLARE,
 } from "@agentic-slack/core";
 import type { SlackBlockActionsPayload } from "@agentic-slack/core";
+import type { SlackProgressTurn } from "../../../packages/core/src/progress.ts";
 import type { DelegationOptions } from "../../../packages/core/src/delegation.ts";
 import { createApp } from "../src/app.ts";
 import { createDelegationStore } from "../../../packages/core/src/delegation-store.ts";
@@ -773,6 +774,80 @@ test("task token scopes progress and replies, and verbatim done settles its rece
   expect(
     await statusOf(replies(`channel=C1&task=delegation:${output.id}`)),
   ).toBe(401);
+});
+
+// The narration voice comes from the operator's config and names the owner as
+// the actor, so a delegated milestone's body has to say who actually works.
+test("narrates a delegated milestone as the conductor's work, not the owner's", async () => {
+  const h = await harness();
+  await h.request("/delegation/runners", "POST", JSON.stringify(runner));
+  const { output } = await h.propose();
+  await h.delegation.interaction(click(output.id));
+  await Promise.all(h.background);
+  const claimed = await h.request(
+    `/delegation/tasks/${output.id}/claim`,
+    "POST",
+    JSON.stringify({ runner: "runner-1" }),
+  );
+  const { token } = v.parse(
+    v.object({ token: v.string() }),
+    await claimed.json(),
+  );
+  const turns: SlackProgressTurn[] = [];
+  const progress = createSlackProgressEndpoint(
+    {
+      authSecret: "PROGRESS_SECRET",
+      labels: {
+        blocked: "Blocked",
+        done: "Done",
+        merged: "Merged",
+        pr: "PR",
+        progress: "Progress",
+        review: "Review",
+        started: "Started",
+      },
+      narration: "Write in Spanish, warm and brief.",
+    },
+    {
+      bearer: "progress-secret",
+      db: h.db,
+      delegation: h.delegation,
+      fetcher: h.fetcher,
+      narrate: (turn) => {
+        turns.push(turn);
+        return Promise.resolve();
+      },
+      teamId: "T1",
+      token: "bot-token",
+    },
+  );
+  const milestone = {
+    channel: "C1",
+    id: "m-1",
+    kind: "progress",
+    task: `delegation:${output.id}`,
+    text: "Working",
+    threadTs: "171.1",
+    title: "Fix login",
+  };
+  const post = (body: typeof milestone, authorization: string) =>
+    progress.handle(
+      new Request("https://helper.example/progress", {
+        body: JSON.stringify(body),
+        headers: { authorization, "content-type": "application/json" },
+        method: "POST",
+      }),
+    );
+
+  expect(await statusOf(post(milestone, `Bearer ${token}`))).toBe(200);
+  expect(
+    await statusOf(post({ ...milestone, id: "m-2" }, "Bearer progress-secret")),
+  ).toBe(200);
+
+  expect(turns[0]?.body).toContain(
+    "Delegation: the conductor runner-1 is doing this task on the owner's behalf; name the conductor, never the owner, as the one working.",
+  );
+  expect(turns[1]?.body).not.toContain("the conductor");
 });
 
 test("delegation HTTP routes are absent without configuration and mount when configured", async () => {
