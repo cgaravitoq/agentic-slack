@@ -810,26 +810,49 @@ export const createSlackProgressEndpoint = (
     outcome: SlackMilestoneOutcome,
     taskToken: StoredDelegationTask | undefined,
   ): Promise<void> => {
-    const { delegation } = options;
-    if (
-      delegation !== undefined &&
-      taskToken !== undefined &&
-      milestone.kind === "done" &&
-      milestone.verbatim === true &&
-      outcome.state === "posted"
-    ) {
-      await delegation.store.complete(
-        taskToken.task.id,
-        taskToken.tokenHash ?? "",
-        milestone.id,
-        outcome.ts,
-      );
-      const stored = await delegation.store.read(taskToken.task.id);
-      if (stored?.task.state === "done") {
-        await delegation.cancelExpiry(stored);
+    const write = async (): Promise<void> => {
+      const { delegation } = options;
+      if (
+        delegation !== undefined &&
+        taskToken !== undefined &&
+        milestone.kind === "done" &&
+        milestone.verbatim === true &&
+        outcome.state === "posted"
+      ) {
+        await delegation.store.complete(
+          taskToken.task.id,
+          taskToken.tokenHash ?? "",
+          milestone.id,
+          outcome.ts,
+        );
+        const stored = await delegation.store.read(taskToken.task.id);
+        if (stored?.task.state === "done") {
+          await delegation.cancelExpiry(stored);
+        }
+        return;
       }
-    } else {
       await receipts.complete(milestone.id, outcome);
+    };
+    try {
+      await write();
+    } catch {
+      try {
+        await write();
+      } catch (error: unknown) {
+        if (outcome.state === "posted") {
+          // A receipt left in flight after the post is reclaimed and posts the
+          // milestone twice, so a last resort settles it without its ts.
+          try {
+            await receipts.complete(milestone.id, { state: "narrated" });
+          } catch (fallbackError: unknown) {
+            console.error(
+              "Slack progress receipt fallback failed",
+              fallbackError,
+            );
+          }
+        }
+        throw error;
+      }
     }
   };
 
@@ -874,27 +897,8 @@ export const createSlackProgressEndpoint = (
       ) {
         return refusal(403, "token_scope");
       }
-      const resolved = await resolveChannel(milestone.channel);
-      if ("refusal" in resolved) {
-        return refusal(
-          resolved.refusal === "ambiguous_channel" ? 409 : 403,
-          resolved.refusal,
-        );
-      }
-      const admittedBy = await admissionStore.admittedBy(resolved.channelId);
-      if (admittedBy === undefined) {
-        return refusal(403, "channel_not_admitted");
-      }
-      const resolvedMilestone = {
-        ...milestone,
-        channel: resolved.channelId,
-      };
       try {
-        const mismatch = await threadMismatch(resolvedMilestone);
-        if (mismatch !== undefined) {
-          return mismatch;
-        }
-        const claim = await receipts.claim(resolvedMilestone.id);
+        const claim = await receipts.claim(milestone.id);
         if (claim.outcome === "busy") {
           return refusal(409, "in_flight");
         }
@@ -902,13 +906,38 @@ export const createSlackProgressEndpoint = (
           return receiptAnswer(claim.receipt);
         }
         let outcome: SlackMilestoneOutcome;
+        let resolvedMilestone: SlackProgressMilestone;
         try {
+          const resolved = await resolveChannel(milestone.channel);
+          if ("refusal" in resolved) {
+            await receipts.drop(milestone.id);
+            return refusal(
+              resolved.refusal === "ambiguous_channel" ? 409 : 403,
+              resolved.refusal,
+            );
+          }
+          const admittedBy = await admissionStore.admittedBy(
+            resolved.channelId,
+          );
+          if (admittedBy === undefined) {
+            await receipts.drop(milestone.id);
+            return refusal(403, "channel_not_admitted");
+          }
+          resolvedMilestone = {
+            ...milestone,
+            channel: resolved.channelId,
+          };
+          const mismatch = await threadMismatch(resolvedMilestone);
+          if (mismatch !== undefined) {
+            await receipts.drop(milestone.id);
+            return mismatch;
+          }
           const mentioned = await resolveMentions(
             resolved.channelId,
             milestone.mentions ?? [],
           );
           if ("refusal" in mentioned) {
-            await receipts.drop(resolvedMilestone.id);
+            await receipts.drop(milestone.id);
             return mentioned.refusal;
           }
           outcome = await postMilestone(
@@ -917,7 +946,7 @@ export const createSlackProgressEndpoint = (
             admittedBy,
           );
         } catch (error: unknown) {
-          await receipts.drop(resolvedMilestone.id);
+          await receipts.drop(milestone.id);
           throw error;
         }
         await completeMilestone(resolvedMilestone, outcome, taskToken);
