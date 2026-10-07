@@ -60,6 +60,11 @@ export const expireLatest = async (
 
 export interface ConversationLifecycleAgent extends Rpc.DurableObjectBranded {
   refreshRetention: (surface: ConversationSurface) => Promise<void>;
+  scheduleDelegationExpiry: (
+    taskId: string,
+    expiresAt: number,
+  ) => Promise<void>;
+  cancelDelegationExpiry: (taskId: string) => Promise<void>;
 }
 
 export const refreshRetention = async (

@@ -19,7 +19,7 @@ export const generateSlackManifest = (
     "mpim:read",
     "mpim:write",
     "reactions:write",
-    ...(config.read === undefined
+    ...(config.read === undefined && config.delegation === undefined
       ? []
       : ["channels:history", "groups:history", "mpim:history", "users:read"]),
   ].toSorted();

@@ -16,6 +16,7 @@ import { SlackAgent } from "./agent.ts";
 import { createApp } from "./app.ts";
 import type { WorkerBindings } from "./app.ts";
 import { createApprovalHandler } from "./approval.ts";
+import { configuredDelegation } from "./delegation.ts";
 import { createLifecycleHandler } from "./lifecycle.ts";
 import { createMembershipHandler } from "./membership.ts";
 import { selectProvider } from "./provider.ts";
@@ -48,16 +49,35 @@ export const narrateProgressTurn = async (
   });
 };
 
+const delegation = configuredDelegation(bindings, trusted.botToken);
 const progress =
-  config.progress === undefined
+  config.progress === undefined && delegation === undefined
     ? undefined
-    : createSlackProgressEndpoint(config.progress, {
-        bearer: workerSecretValue(bindings, config.progress.authSecret) ?? "",
-        db: bindings.DB,
-        narrate: narrateProgressTurn,
-        teamId: trusted.teamId,
-        token: trusted.botToken,
-      });
+    : createSlackProgressEndpoint(
+        config.progress ?? {
+          authSecret: config.delegation?.authSecret ?? "",
+          labels: {
+            blocked: "Blocked",
+            done: "Done",
+            merged: "Merged",
+            pr: "Pull request",
+            progress: "Progress",
+            review: "Review",
+            started: "Started",
+          },
+        },
+        {
+          bearer:
+            config.progress === undefined
+              ? ""
+              : (workerSecretValue(bindings, config.progress.authSecret) ?? ""),
+          db: bindings.DB,
+          delegation,
+          narrate: narrateProgressTurn,
+          teamId: trusted.teamId,
+          token: trusted.botToken,
+        },
+      );
 
 instrument(createCloudflareTracing({ content: CLOUDFLARE_TRACING_CONTENT }));
 setProvider(selectProvider(config.modelProvider, bindings));
@@ -110,8 +130,18 @@ export default createApp(
   },
   createLifecycleHandler(config, trusted.botToken),
   requiresApproval(config)
-    ? createApprovalHandler(trusted.botToken)
+    ? async (payload, turnBindings) => {
+        await delegation?.interaction(payload);
+        await createApprovalHandler(trusted.botToken)(payload, turnBindings);
+      }
     : undefined,
   createMembershipHandler(config, trusted.botToken),
   progress,
+  delegation,
+  config.delegation === undefined
+    ? []
+    : [
+        config.delegation.authSecret,
+        ...Object.values(config.delegation.runnerHeaders ?? {}),
+      ],
 );

@@ -68,3 +68,6 @@ export type {
   TrustedSlackConfig,
 } from "./slack.ts";
 export type { SlackBlockActionsPayload } from "@flue/slack";
+
+export { createDelegation } from "./delegation.ts";
+export type { Delegation } from "./delegation.ts";

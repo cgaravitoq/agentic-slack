@@ -2,6 +2,8 @@ import { timingSafeEqual } from "node:crypto";
 import type { SlackThreadRef } from "@flue/slack";
 import * as v from "valibot";
 import { createSqlSlackChannelAdmissionStore } from "./admission.ts";
+import type { Delegation } from "./delegation.ts";
+import type { StoredDelegationTask } from "./delegation-store.ts";
 import { closingMrkdwn, MAX_SLACK_MESSAGE_LENGTH, redact } from "./delivery.ts";
 import type { SlackDeliveryBinding } from "./delivery.ts";
 import { loadChannelMembers, matchMember } from "./mention.ts";
@@ -405,6 +407,7 @@ export interface SlackProgressTurn {
 
 export interface SlackProgressEndpointOptions {
   readonly bearer: string;
+  readonly delegation?: Delegation;
   readonly db: D1Database;
   readonly fetcher?: Fetcher;
   readonly narrate: (turn: SlackProgressTurn) => Promise<void>;
@@ -523,6 +526,17 @@ type ChannelResolution =
 type MentionResolution =
   | { readonly members: readonly SlackMember[] }
   | { readonly refusal: Response };
+
+const scopeMatches = (
+  task: StoredDelegationTask | undefined,
+  channel: string,
+  taskId: string,
+  threadTs?: string,
+): boolean =>
+  task === undefined ||
+  (channel === task.task.channel &&
+    taskId === `delegation:${task.task.id}` &&
+    (threadTs === undefined || threadTs === task.task.threadTs));
 
 export const createSlackProgressEndpoint = (
   config: ResolvedSlackProgressConfig,
@@ -791,15 +805,74 @@ export const createSlackProgressEndpoint = (
     );
   };
 
+  const completeMilestone = async (
+    milestone: SlackProgressMilestone,
+    outcome: SlackMilestoneOutcome,
+    taskToken: StoredDelegationTask | undefined,
+  ): Promise<void> => {
+    const { delegation } = options;
+    if (
+      delegation !== undefined &&
+      taskToken !== undefined &&
+      milestone.kind === "done" &&
+      milestone.verbatim === true &&
+      outcome.state === "posted"
+    ) {
+      await delegation.store.complete(
+        taskToken.task.id,
+        taskToken.tokenHash ?? "",
+        milestone.id,
+        outcome.ts,
+      );
+      const stored = await delegation.store.read(taskToken.task.id);
+      if (stored?.task.state === "done") {
+        await delegation.cancelExpiry(stored);
+      }
+    } else {
+      await receipts.complete(milestone.id, outcome);
+    }
+  };
+
+  const bearerTask = async (
+    request: Request,
+  ): Promise<StoredDelegationTask | undefined> =>
+    await options.delegation?.store.tokenTask(
+      /^Bearer (?<token>[A-Za-z0-9_-]+)$/u.exec(
+        request.headers.get("authorization") ?? "",
+      )?.groups?.token ?? "",
+    );
+
+  const authorizeTask = async (
+    request: Request,
+  ): Promise<StoredDelegationTask | Response | undefined> => {
+    if (authorized(request)) {
+      return undefined;
+    }
+    return (await bearerTask(request)) ?? refusal(401, "unauthorized");
+  };
+
   return {
     authSecret: config.authSecret,
     async handle(request) {
-      if (!authorized(request)) {
-        return refusal(401, "unauthorized");
+      const taskToken = await authorizeTask(request);
+      if (taskToken instanceof Response) {
+        return taskToken;
       }
       const milestone = await milestoneFrom(request);
       if (milestone === undefined) {
         return refusal(400, "invalid_request");
+      }
+      if (
+        taskToken !== undefined &&
+        (milestone.threadTs === undefined ||
+          !scopeMatches(
+            taskToken,
+            milestone.channel,
+            milestone.task,
+            milestone.threadTs,
+          ))
+      ) {
+        return refusal(403, "token_scope");
       }
       const resolved = await resolveChannel(milestone.channel);
       if ("refusal" in resolved) {
@@ -847,7 +920,7 @@ export const createSlackProgressEndpoint = (
           await receipts.drop(resolvedMilestone.id);
           throw error;
         }
-        await receipts.complete(resolvedMilestone.id, outcome);
+        await completeMilestone(resolvedMilestone, outcome, taskToken);
         return receiptAnswer(outcome);
       } catch (error: unknown) {
         console.error("Slack progress milestone failed", error);
@@ -856,7 +929,9 @@ export const createSlackProgressEndpoint = (
     },
     async handleChannels(request) {
       if (!authorized(request)) {
-        return refusal(401, "unauthorized");
+        return (await bearerTask(request)) === undefined
+          ? refusal(401, "unauthorized")
+          : refusal(403, "token_scope");
       }
       const admittedChannelIds = await admissionStore.listAdmittedChannelIds();
       const channels: SlackProgressChannel[] = await Promise.all(
@@ -868,8 +943,9 @@ export const createSlackProgressEndpoint = (
       return Response.json({ channels, ok: true });
     },
     async handleReplies(request) {
-      if (!authorized(request)) {
-        return refusal(401, "unauthorized");
+      const taskToken = await authorizeTask(request);
+      if (taskToken instanceof Response) {
+        return taskToken;
       }
       const query = v.safeParse(
         repliesQuerySchema,
@@ -878,6 +954,13 @@ export const createSlackProgressEndpoint = (
       if (!query.success) {
         return refusal(400, "invalid_request");
       }
+      if (
+        taskToken !== undefined &&
+        (query.output.channel !== taskToken.task.channel ||
+          query.output.task !== `delegation:${taskToken.task.id}`)
+      ) {
+        return refusal(403, "token_scope");
+      }
       const resolved = await resolveChannel(query.output.channel);
       if ("refusal" in resolved) {
         return refusal(
@@ -885,7 +968,14 @@ export const createSlackProgressEndpoint = (
           resolved.refusal,
         );
       }
-      const root = await roots.load(resolved.channelId, query.output.task);
+      const root =
+        (await roots.load(resolved.channelId, query.output.task)) ??
+        (taskToken === undefined
+          ? undefined
+          : { rootTs: taskToken.task.threadTs });
+      if (taskToken !== undefined && root?.rootTs !== taskToken.task.threadTs) {
+        return refusal(403, "token_scope");
+      }
       if (root === undefined) {
         return refusal(404, "no_thread");
       }

@@ -46,6 +46,42 @@ interface McpServerConfig {
   requireApproval?: readonly string[];
 }
 
+export interface DelegationConfig {
+  repos: readonly string[];
+  authSecret: string;
+  runnerHeaders?: Readonly<Record<string, string>>;
+}
+
+const resolveDelegation = (
+  config: DelegationConfig | undefined,
+): DelegationConfig | undefined => {
+  if (config === undefined) {
+    return undefined;
+  }
+  const repos = [...new Set(config.repos.map((repo) => repo.trim()))];
+  if (
+    repos.length === 0 ||
+    repos.some((repo) => !repo) ||
+    !config.authSecret.trim()
+  ) {
+    throw new Error("Delegation requires repos and authSecret");
+  }
+  for (const [header, secret] of Object.entries(config.runnerHeaders ?? {})) {
+    if (
+      !/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u.test(header) ||
+      !secret.trim() ||
+      header.toLowerCase() === "authorization"
+    ) {
+      throw new Error("Delegation requires valid runnerHeaders secret names");
+    }
+  }
+  return Object.freeze({
+    authSecret: config.authSecret.trim(),
+    repos: Object.freeze(repos),
+    runnerHeaders: config.runnerHeaders,
+  });
+};
+
 export interface AgentConfig {
   name: string;
   description: string;
@@ -58,6 +94,7 @@ export interface AgentConfig {
   };
   read?: SlackReadConfig;
   progress?: SlackProgressConfig;
+  delegation?: DelegationConfig;
   model?: string;
   mcpServers?: readonly McpServerConfig[];
   skills?: readonly Skill[];
@@ -75,6 +112,7 @@ export interface ResolvedAgentConfig {
   };
   read?: ResolvedSlackReadConfig;
   progress?: ResolvedSlackProgressConfig;
+  delegation?: DelegationConfig;
   model: string;
   modelProvider: ModelProvider;
   mcpServers: readonly McpServerConfig[];
@@ -227,9 +265,10 @@ const resolveRead = (
 };
 
 // The one predicate that decides whether the deployment can ask a person to
-// approve a call: the manifest enables interactivity on it, and the worker
+// approve a call or task: the manifest enables interactivity on it, and the worker
 // mounts the interactions route on it.
 export const requiresApproval = (config: ResolvedAgentConfig): boolean =>
+  config.delegation !== undefined ||
   config.mcpServers.some((server) => (server.requireApproval?.length ?? 0) > 0);
 
 const isModelProvider = (provider: string): provider is ModelProvider =>
@@ -271,6 +310,7 @@ export const defineAgentConfig = (config: AgentConfig): ResolvedAgentConfig => {
       config.allowedUserIds === undefined
         ? Object.freeze([])
         : resolveAllowedUserIds(config.allowedUserIds),
+    delegation: resolveDelegation(config.delegation),
     description: config.description.trim(),
     mcpServers: resolveMcpServers(config.mcpServers ?? []),
     model,

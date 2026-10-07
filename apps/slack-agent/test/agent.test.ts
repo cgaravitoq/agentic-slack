@@ -47,6 +47,8 @@ const refunds = defineSkill({
   name: "refunds",
 });
 const operatorConfig = defineAgentConfig({
+  allowedUserIds: ["U777"],
+  delegation: { authSecret: "DELEGATION_SECRET", repos: ["example"] },
   description: "Exercises operator configuration.",
   mcpServers: [
     {
@@ -73,8 +75,8 @@ class RecordingAgent {
   destroyed = 0;
   listed: ExpirySchedule[] = [];
   scheduled: {
-    callback: "expireConversation";
-    payload: ExpiryPayload;
+    callback: "expireConversation" | "expireDelegation";
+    payload: ExpiryPayload | { taskId: string };
     seconds: number;
   }[] = [];
 
@@ -108,6 +110,11 @@ class RecordingAgent {
 }
 
 interface WiredRetentionAgent extends RecordingAgent {
+  scheduleDelegationExpiry: (
+    taskId: string,
+    expiresAt: number,
+  ) => Promise<void>;
+  cancelDelegationExpiry: (taskId: string) => Promise<void>;
   expireConversation: (
     payload: ExpiryPayload,
     schedule: ExpirySchedule,
@@ -118,6 +125,7 @@ interface WiredRetentionAgent extends RecordingAgent {
 const instructions: string[] = [];
 const mcpConnections: McpConnectionDefinition[] = [];
 const mountedSkills: Skill[] = [];
+const mountedTools: { name: string }[] = [];
 let resolvedModel = "";
 const userMessage: DeliveredMessage = { body: "", kind: "user" };
 let delivery: DeliveredMessage = userMessage;
@@ -156,6 +164,7 @@ await mock.module("@flue/runtime", () => ({
     resolvedModel = model;
   },
   useSkill: (skill: Skill) => mountedSkills.push(skill),
+  useTool: (tool: { name: string }) => mountedTools.push(tool),
 }));
 // The spread keeps the mocked export list as wide as the real module: Bun
 // freezes it on first use, so a narrow mock breaks whichever test file loads
@@ -263,16 +272,16 @@ test("mounts each configured skill with its name and instructions", () => {
   expect(mountedSkills).toEqual([refunds]);
 });
 
-const directMessage = (threadTs: string): DeliveredMessage => ({
+const directMessage = (threadTs: string, user = "U777"): DeliveredMessage => ({
   attributes: {
     channelId: "D777",
     event_id: `Ev-${threadTs}`,
     message_ts: threadTs,
     recipientTeamId: "T123",
-    recipientUserId: "U777",
+    recipientUserId: user,
     surface: "private",
     threadTs,
-    user: "U777",
+    user,
   },
   body: threadTs,
   kind: "signal",
@@ -355,6 +364,19 @@ test("holds a gated call for the requester of the conversation's thread", async 
   delivery = userMessage;
 });
 
+test("mounts delegate_to_conductor only for an allowlisted requester", () => {
+  const instanceId = "slack:v1:T123:D777:D777";
+  const toolsFor = (user: string) => {
+    mountedTools.length = 0;
+    delivery = directMessage("183.1", user);
+    SlackAgent({ id: instanceId });
+    return mountedTools.map((tool) => tool.name);
+  };
+  expect(toolsFor("U777")).toEqual(["delegate_to_conductor"]);
+  expect(toolsFor("U888")).toEqual([]);
+  delivery = userMessage;
+});
+
 test("streams each dispatched message's reply to the thread named in its attributes", () => {
   const instanceId = "slack:v1:T123:D777:D777";
   const startWith = (message: DeliveredMessage) => {
@@ -426,5 +448,71 @@ test("destroys through expireLatest so a stale expiry cannot wipe a live convers
   await agent.expireConversation({ surface: "private" }, stale);
   expect(agent.destroyed).toBe(0);
   await agent.expireConversation({ surface: "private" }, latest);
+  expect(agent.destroyed).toBe(1);
+});
+
+test("schedules delegation expiry on its instance and cancels only that task's alarm", async () => {
+  const agent = createRetentionAgent();
+  await agent.scheduleDelegationExpiry("task-1", Date.now() + 86_400_000);
+  expect(agent.scheduled).toEqual([
+    {
+      callback: "expireDelegation",
+      payload: { taskId: "task-1" },
+      seconds: 86_400,
+    },
+  ]);
+  agent.listed = [
+    {
+      callback: "expireConversation",
+      id: "retention",
+      payload: { surface: "channel" },
+      time: 1,
+    },
+    {
+      callback: "expireDelegation",
+      id: "task-1-alarm",
+      payload: { taskId: "task-1" },
+      time: 2,
+    },
+    {
+      callback: "expireDelegation",
+      id: "task-2-alarm",
+      payload: { taskId: "task-2" },
+      time: 3,
+    },
+  ];
+  await agent.cancelDelegationExpiry("task-1");
+  expect(agent.cancels).toEqual(["task-1-alarm"]);
+});
+
+test("conversation retention waits for its pending delegation alarm", async () => {
+  const agent = createRetentionAgent();
+  const now = Math.floor(Date.now() / 1000);
+  const retention = {
+    callback: "expireConversation",
+    id: "retention",
+    payload: { surface: "channel" },
+    time: now,
+  };
+  agent.listed = [
+    retention,
+    {
+      callback: "expireDelegation",
+      id: "task-alarm",
+      payload: { taskId: "task-1" },
+      time: now + 60,
+    },
+  ];
+  await agent.expireConversation({ surface: "channel" }, retention);
+  expect(agent.destroyed).toBe(0);
+  expect(agent.scheduled).toEqual([
+    {
+      callback: "expireConversation",
+      payload: { surface: "channel" },
+      seconds: 61,
+    },
+  ]);
+  agent.listed = [retention];
+  await agent.expireConversation({ surface: "channel" }, retention);
   expect(agent.destroyed).toBe(1);
 });
