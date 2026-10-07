@@ -439,7 +439,7 @@ describe("progress endpoint", () => {
 
     expect(refused.status).toBe(401);
     expect(calls).toEqual([]);
-    expect(db.seen.size).toBe(0);
+    expect(db.receipts.size).toBe(0);
   });
 
   test("refuses a body that is not a milestone without calling Slack", async () => {
@@ -486,7 +486,7 @@ describe("progress endpoint", () => {
     );
 
     expect(calls).toEqual([]);
-    expect(db.seen.size).toBe(0);
+    expect(db.receipts.size).toBe(0);
   });
 
   test("refuses a channel no allowlisted user invited the bot to", async () => {
@@ -502,7 +502,7 @@ describe("progress endpoint", () => {
       ok: false,
     });
     expect(calls).toEqual([]);
-    expect(db.seen.size).toBe(0);
+    expect(db.receipts.size).toBe(0);
   });
 
   test("posts to the channel an admitted name resolves to, with or without # and in any case", async () => {
@@ -618,7 +618,7 @@ describe("progress endpoint", () => {
       { body: { channel: "C1" }, method: "conversations.info" },
     ]);
     expect(db.roots.size).toBe(0);
-    expect(db.seen.size).toBe(0);
+    expect(db.receipts.size).toBe(0);
   });
 
   test("refuses a name that matches several admitted channels", async () => {
@@ -649,7 +649,7 @@ describe("progress endpoint", () => {
       { body: { channel: "C2" }, method: "conversations.info" },
     ]);
     expect(db.roots.size).toBe(0);
-    expect(db.seen.size).toBe(0);
+    expect(db.receipts.size).toBe(0);
   });
 
   test("lists every admitted channel, naming the one Slack refuses to describe", async () => {
@@ -732,7 +732,7 @@ describe("progress endpoint", () => {
       state: "posted",
       ts: "171.1",
     });
-    expect(db.seen.size).toBe(0);
+    expect(db.receipts.size).toBe(1);
   });
 
   test("posts the root and the reply through an injected fetcher that rejects a receiver", async () => {
@@ -1109,8 +1109,7 @@ describe("progress endpoint", () => {
     expect(refused.status).toBe(500);
     expect(await refused.json()).toEqual({ error: "slack_failed", ok: false });
     expect(refusedCalls).toEqual([rootCalls[0]]);
-    expect(db.seen.size).toBe(0);
-    expect(db.receipts.size).toBe(0);
+    expect(db.receipts.has("evt-1")).toBe(false);
 
     const retriedCalls: RecordedCall[] = [];
     const retried = await endpointFor(db, retriedCalls).handle(postMilestone());
@@ -1130,8 +1129,7 @@ describe("progress endpoint", () => {
 
     expect(refused.status).toBe(500);
     expect(refusedCalls).toEqual(rootCalls);
-    expect(db.seen.size).toBe(0);
-    expect(db.receipts.size).toBe(0);
+    expect(db.receipts.has("evt-1")).toBe(false);
 
     const retriedCalls: RecordedCall[] = [];
     const retried = await endpointFor(db, retriedCalls).handle(postMilestone());
@@ -1480,7 +1478,8 @@ describe("progress mentions", () => {
       ok: false,
     });
     expect(calls).toEqual([]);
-    expect(db.receipts.size).toBe(0);
+    expect(db.receipts.has("evt-1")).toBe(false);
+    expect(db.receipts.has("evt-2")).toBe(false);
   });
 });
 
