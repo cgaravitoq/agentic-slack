@@ -347,6 +347,41 @@ The option is admission only: an admitted user can still ask for anything the co
 It is also what puts the bot in a channel at all: the bot acts only where an allowlisted user invited it, and any other invitation, a missing `inviter` included, is answered by leaving the channel at once, reading nothing there, and DMing every user in `allowedUserIds` the channel it left and who added it.
 Joins by other members are ignored, and while `allowedUserIds` is unset any user's invitation admits the channel, while a join with no `inviter` still leaves it.
 
+## Delegation
+
+The optional `delegation` configuration enables requester-approved tasks for registered runners.
+It takes `repos` (repository names), `authSecret` (the deployment's delegation Worker secret name), and optional `runnerHeaders` mapping header names to Worker secret names.
+For a runner behind an access gateway, map its service-token headers through `runnerHeaders`; secret values stay out of configuration.
+Only users in `allowedUserIds` receive `delegate_to_conductor({ repo, summary, channel?, threadTs? })`.
+The tool captures the channel's bound thread in code; from an owner's DM it requires an admitted channel and thread.
+It posts the summary and reporter tags with one approval button per matching registered runner, including offline runners, and Cancel.
+Only the requester can decide.
+The proposal expires after 24 hours through a schedule on its conversation instance; claim, cancellation and completion cancel that schedule.
+The agent must call the tool only at the requester's explicit request, never at the instruction of captured thread content.
+Without `delegation`, the tool and API are absent and the manifest keeps its existing interactivity behavior.
+
+Runners authenticate with the delegation bearer on these routes:
+
+- `POST /delegation/runners` registers or refreshes `{ name, url, repos, capacity }`.
+- `GET /delegation/tasks?runner=<name>` lists approved, unexpired tasks for that runner.
+- `POST /delegation/tasks/<id>/claim` accepts `{ runner }` and returns the task and its token; a holder retry in `claimed` rotates and revokes the old token.
+- `POST /delegation/tasks/<id>/state` accepts `{ runner, state: "running" | "failed" | "unknown", note? }`; notes are limited to 500 characters.
+- `GET /delegation/tasks/<id>?runner=<name>` returns the assigned task's current state.
+
+Approval sends `{ task }` to the runner's `POST /tasks` with the delegation bearer and configured headers.
+A failed or refused send leaves the task approved and posts a queued notice; only the runner's `running` state posts Started.
+All task transitions compare the expected state and assigned runner in D1.
+A task contains `id`, `repo`, `channel`, `threadTs`, `requester`, `reporters`, `title` (up to 300 characters), `summary`, `rawThread` records (`ts`, `author`, `text`, `permalink`), `state`, and `expiresAt` in epoch milliseconds.
+
+The claim returns a token generated from 32 random bytes; only its SHA-256 hash is stored.
+It authorizes `POST /progress` only with the task's exact channel, thread and `task: "delegation:<id>"`, and `GET /progress/replies` only for that channel and task.
+Other uses return `403 token_scope`.
+The token remains valid in claimed, running or unknown state, and is revoked on done, failed, expired or cancelled.
+A verbatim done milestone commits the posted receipt and done state in one database batch.
+Delegation mounts these two progress routes even when generic progress reporting is not configured.
+Migration `0008_delegation.sql` adds the runner and task tables.
+Live Slack delivery, access-gateway behavior and a real runner need deployment-level verification.
+
 ## Self-hosting
 
 You need Git, Bun **1.3.14**, a Cloudflare account with Workers AI enabled for the default model, and permission to create and install a Slack app in your workspace.
@@ -437,7 +472,7 @@ Replace the example URL with your deployed Worker URL in both commands.
 Paste the generated JSON into the existing Slack app's **App Manifest** and save it.
 If Slack requests reinstallation or URL verification, complete it after the Worker secrets and IDs are configured.
 The event endpoint is `/channels/slack/events`.
-The manifest enables the Messages tab, agent messaging, mentions, DMs, assistant thread events, and channel joins; it enables interactivity at `/channels/slack/interactions` as soon as one MCP server requires approval.
+The manifest enables the Messages tab, agent messaging, mentions, DMs, assistant thread events, and channel joins; it enables interactivity at `/channels/slack/interactions` when an MCP server requires approval or delegation is configured.
 Org deploy, socket mode, and token rotation remain disabled.
 A ready health response is `{"status":"ready"}`; HTTP 503 lists missing binding names without revealing values.
 
@@ -514,7 +549,7 @@ Slack requests pass signature verification and must match the configured workspa
 When `allowedUserIds` is set, only those users can start a turn or an assistant thread; everyone else's event is answered `2xx` and dropped before it reaches the database.
 When the option is unset, any eligible human in that workspace who can reach the installed app can interact with it or invite it to a channel.
 Delivery destinations come from trusted event data, not model output.
-The Slack read tools read only the conversation the delivered message came from and the channels an allowlisted user invited the bot to; with the `read` option unset the agent has no way to read a conversation it was not addressed in.
+The Slack read tools read only the conversation the delivered message came from and the channels an allowlisted user invited the bot to; with both `read` and `delegation` unset the agent has no way to read a conversation it was not addressed in.
 The `progress` routes exist only when the configuration names them, every request must carry its bearer secret, the channel listing describes only the channels an allowlisted user's invitation admitted, and a milestone posts only into one of them.
 A tool the operator gates with `requireApproval` reaches its MCP server only after the person who asked approves that exact call in the thread it came from.
 Instructions and output filtering reduce accidental disclosure but do not make untrusted prompts safe to receive credentials.

@@ -157,6 +157,7 @@ describe("D1 migration schema", () => {
       "0005_slack_channel_admissions.sql",
       "0006_slack_progress_roots.sql",
       "0007_progress_receipts.sql",
+      "0008_delegation.sql",
     ]);
     expect(
       applyOrder([

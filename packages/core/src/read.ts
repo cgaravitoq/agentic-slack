@@ -713,3 +713,23 @@ export const readThreadReplies = async (
       .map((message) => ({ message, threadTs })),
   );
 };
+
+export const readRawSlackThread = async (
+  caller: SlackCaller,
+  channelId: string,
+  threadTs: string,
+): Promise<
+  { ts: string; author: string; text: string; permalink: string }[]
+> => {
+  const messages = await fullPages(caller, "conversations.replies", {
+    channel: channelId,
+    ts: threadTs,
+  });
+  const workspace = await callSlack(caller, "auth.test", {}, authTestSchema);
+  return messages.map((message) => ({
+    author: message.user ?? message.bot_id ?? "",
+    permalink: permalinkFor(workspace.url, channelId, message.ts, threadTs),
+    text: message.text ?? "",
+    ts: message.ts,
+  }));
+};

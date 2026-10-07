@@ -73,8 +73,8 @@ class RecordingAgent {
   destroyed = 0;
   listed: ExpirySchedule[] = [];
   scheduled: {
-    callback: "expireConversation";
-    payload: ExpiryPayload;
+    callback: "expireConversation" | "expireDelegation";
+    payload: ExpiryPayload | { taskId: string };
     seconds: number;
   }[] = [];
 
@@ -108,6 +108,11 @@ class RecordingAgent {
 }
 
 interface WiredRetentionAgent extends RecordingAgent {
+  scheduleDelegationExpiry: (
+    taskId: string,
+    expiresAt: number,
+  ) => Promise<void>;
+  cancelDelegationExpiry: (taskId: string) => Promise<void>;
   expireConversation: (
     payload: ExpiryPayload,
     schedule: ExpirySchedule,
@@ -426,5 +431,71 @@ test("destroys through expireLatest so a stale expiry cannot wipe a live convers
   await agent.expireConversation({ surface: "private" }, stale);
   expect(agent.destroyed).toBe(0);
   await agent.expireConversation({ surface: "private" }, latest);
+  expect(agent.destroyed).toBe(1);
+});
+
+test("schedules delegation expiry on its instance and cancels only that task's alarm", async () => {
+  const agent = createRetentionAgent();
+  await agent.scheduleDelegationExpiry("task-1", Date.now() + 86_400_000);
+  expect(agent.scheduled).toEqual([
+    {
+      callback: "expireDelegation",
+      payload: { taskId: "task-1" },
+      seconds: 86_400,
+    },
+  ]);
+  agent.listed = [
+    {
+      callback: "expireConversation",
+      id: "retention",
+      payload: { surface: "channel" },
+      time: 1,
+    },
+    {
+      callback: "expireDelegation",
+      id: "task-1-alarm",
+      payload: { taskId: "task-1" },
+      time: 2,
+    },
+    {
+      callback: "expireDelegation",
+      id: "task-2-alarm",
+      payload: { taskId: "task-2" },
+      time: 3,
+    },
+  ];
+  await agent.cancelDelegationExpiry("task-1");
+  expect(agent.cancels).toEqual(["task-1-alarm"]);
+});
+
+test("conversation retention waits for its pending delegation alarm", async () => {
+  const agent = createRetentionAgent();
+  const now = Math.floor(Date.now() / 1000);
+  const retention = {
+    callback: "expireConversation",
+    id: "retention",
+    payload: { surface: "channel" },
+    time: now,
+  };
+  agent.listed = [
+    retention,
+    {
+      callback: "expireDelegation",
+      id: "task-alarm",
+      payload: { taskId: "task-1" },
+      time: now + 60,
+    },
+  ];
+  await agent.expireConversation({ surface: "channel" }, retention);
+  expect(agent.destroyed).toBe(0);
+  expect(agent.scheduled).toEqual([
+    {
+      callback: "expireConversation",
+      payload: { surface: "channel" },
+      seconds: 61,
+    },
+  ]);
+  agent.listed = [retention];
+  await agent.expireConversation({ surface: "channel" }, retention);
   expect(agent.destroyed).toBe(1);
 });

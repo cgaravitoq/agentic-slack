@@ -1,5 +1,10 @@
-import { createSlackIngress, missingReadiness } from "@agentic-slack/core";
+import {
+  createSlackIngress,
+  missingReadiness,
+  workerSecretValue,
+} from "@agentic-slack/core";
 import type {
+  Delegation,
   ModelProvider,
   RoutedSlackLifecycle,
   RoutedSlackMembership,
@@ -38,6 +43,8 @@ export const createApp = (
     bindings: SlackCoreBindings,
   ) => Promise<void> | void,
   progress?: SlackProgressEndpoint,
+  delegation?: Delegation,
+  delegationSecrets: readonly string[] = [],
 ) => {
   const channel = createSlackIngress(
     trusted,
@@ -54,6 +61,11 @@ export const createApp = (
       modelProvider,
       progress?.authSecret,
     );
+    for (const name of delegationSecrets) {
+      if ((workerSecretValue(context.env, name) ?? "") === "") {
+        missing.push(name);
+      }
+    }
     return missing.length === 0
       ? context.json({ status: "ready" })
       : context.json({ missing, status: "not_ready" }, 503);
@@ -70,6 +82,12 @@ export const createApp = (
     app.get(
       "/progress/replies",
       async (context) => await progress.handleReplies(context.req.raw),
+    );
+  }
+  if (delegation !== undefined) {
+    app.all(
+      "/delegation/*",
+      async (context) => await delegation.handle(context.req.raw),
     );
   }
   app.route("/channels/slack", channel.route());

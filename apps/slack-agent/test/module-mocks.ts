@@ -10,6 +10,11 @@ import type { ExpiryPayload, ExpirySchedule } from "@agentic-slack/core";
 type RetentionClassFactory = <TBase extends new () => RetentionHost>(
   Base: TBase,
 ) => new () => InstanceType<TBase> & {
+  scheduleDelegationExpiry: (
+    taskId: string,
+    expiresAt: number,
+  ) => Promise<void>;
+  cancelDelegationExpiry: (taskId: string) => Promise<void>;
   expireConversation: (
     payload: ExpiryPayload,
     schedule: ExpirySchedule,

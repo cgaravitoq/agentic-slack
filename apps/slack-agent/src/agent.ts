@@ -48,6 +48,7 @@ import type {
 import { extend, getCloudflareContext } from "@flue/runtime/cloudflare";
 import * as v from "valibot";
 import config from "../agent.config.ts";
+import { configuredDelegation } from "./delegation.ts";
 
 // Rebuilding the store re-runs its CREATE TABLE on every observation, and one
 // isolate can host several Durable Objects, so the cache is keyed by storage.
@@ -124,6 +125,35 @@ const finishSlackTurnDelivery = (instanceId: string): Promise<void> =>
   finishSlackDelivery(deliveryStore(), instanceId, botToken());
 
 observe(observeSlackTurnDelivery);
+
+const mountDelegationTool = (
+  delivery: ReturnType<typeof useDelivery>,
+  instanceId: string,
+): void => {
+  if (config.delegation !== undefined && delivery.kind === "signal") {
+    const slack = v.safeParse(slackDeliveryBindingSchema, delivery.attributes);
+    if (
+      slack.success &&
+      config.allowedUserIds.includes(slack.output.recipientUserId)
+    ) {
+      const delegation = configuredDelegation(env, botToken());
+      if (delegation !== undefined) {
+        useTool(
+          delegation.tool(
+            {
+              channelId: slack.output.channelId,
+              readsMemberChannels: slack.output.surface === "private",
+              surface: slack.output.surface,
+              threadTs: slack.output.threadTs,
+            },
+            slack.output.recipientUserId,
+            instanceId,
+          ),
+        );
+      }
+    }
+  }
+};
 
 export const SlackAgent = (props: AgentProps) => {
   useModel(config.model);
@@ -210,6 +240,7 @@ export const SlackAgent = (props: AgentProps) => {
       }
     }
   }
+  mountDelegationTool(delivery, props.id);
   useAgentStart(() => {
     if (delivery.kind !== "signal") {
       return;
@@ -230,8 +261,8 @@ interface RetentionAgent {
   cancelSchedule: (id: string) => Promise<boolean>;
   schedule: (
     delaySeconds: number,
-    callback: "expireConversation",
-    payload: ExpiryPayload,
+    callback: "expireConversation" | "expireDelegation",
+    payload: ExpiryPayload | { taskId: string },
   ) => Promise<ExpirySchedule>;
   destroy: () => Promise<void>;
 }
@@ -252,14 +283,58 @@ const refreshConfiguredRetention = (
 export const cloudflare = extend<RetentionAgent>({
   base: (Base) =>
     class extends Base {
+      async scheduleDelegationExpiry(
+        taskId: string,
+        expiresAt: number,
+      ): Promise<void> {
+        await this.schedule(
+          Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000)),
+          "expireDelegation",
+          { taskId },
+        );
+      }
+
+      async cancelDelegationExpiry(taskId: string): Promise<void> {
+        const schedules = await this.listSchedules();
+        await Promise.all(
+          schedules
+            .filter(
+              (schedule) =>
+                schedule.callback === "expireDelegation" &&
+                v.is(v.object({ taskId: v.literal(taskId) }), schedule.payload),
+            )
+            .map((schedule) => this.cancelSchedule(schedule.id)),
+        );
+      }
+
+      async expireDelegation(payload: { taskId: string }): Promise<void> {
+        await configuredDelegation(env, botToken())?.expire(payload.taskId);
+        await this.cancelDelegationExpiry(payload.taskId);
+      }
+
       async refreshRetention(surface: "private" | "channel"): Promise<void> {
         await refreshConfiguredRetention(this, surface);
       }
 
       async expireConversation(
-        _payload: ExpiryPayload,
+        payload: ExpiryPayload,
         schedule: ExpirySchedule,
       ): Promise<void> {
+        const schedules = await this.listSchedules();
+        const delegationAlarms = schedules.filter(
+          (entry) => entry.callback === "expireDelegation",
+        );
+        if (delegationAlarms.length > 0) {
+          const lastExpiry = Math.max(
+            ...delegationAlarms.map((entry) => entry.time),
+          );
+          await this.schedule(
+            Math.max(1, lastExpiry - Math.floor(Date.now() / 1000) + 1),
+            "expireConversation",
+            payload,
+          );
+          return;
+        }
         await expireLatest(this, schedule);
       }
     },
