@@ -1454,12 +1454,14 @@ test("a narrated milestone turns in the thread its conversation already holds", 
       teamId: binding.recipientTeamId,
       threadTs: binding.threadTs,
     }),
+    milestoneId: "evt-narration",
   });
 
   expect(dispatched).toEqual([
     {
       instanceId: mention.instanceId,
       request: {
+        idempotencyKey: "progress:evt-narration",
         message: {
           attributes: binding,
           body: "Rewrite this milestone in that voice.",

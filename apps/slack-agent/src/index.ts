@@ -38,6 +38,7 @@ export const narrateProgressTurn = async (
     "channel",
   );
   await init(SlackAgent, { id: turn.instanceId }).dispatch({
+    idempotencyKey: `progress:${turn.milestoneId}`,
     message: {
       attributes: turn.binding,
       body: turn.body,

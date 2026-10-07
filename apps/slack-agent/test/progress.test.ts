@@ -28,7 +28,14 @@ const trusted = {
 
 class FakeD1 {
   readonly admissions = new Map<string, string>();
-  readonly roots = new Map<string, { root_text: string; root_ts: string }>();
+  readonly receipts = new Map<
+    string,
+    { claimed_at: number; state: string; ts: string | null; updated_at: number }
+  >();
+  readonly roots = new Map<
+    string,
+    { owned: number; root_text: string; root_ts: string }
+  >();
   readonly seen = new Set<string>();
   private values: unknown[] = [];
 
@@ -55,6 +62,10 @@ class FakeD1 {
                 : [{ admitted_by: admittedBy, channel_id: channelId }],
           });
         }
+        if (sql.includes("progress_receipts")) {
+          const row = this.receipts.get(String(this.values[0]));
+          return Promise.resolve({ results: row === undefined ? [] : [row] });
+        }
         const row = this.roots.get(this.rootKey());
         return Promise.resolve({ results: row === undefined ? [] : [row] });
       },
@@ -69,10 +80,14 @@ class FakeD1 {
             return Promise.resolve({ meta: { changes: 1 } });
           }
           this.roots.set(this.rootKey(), {
+            owned: Number(this.values[4]),
             root_text: String(this.values[3]),
             root_ts: String(this.values[2]),
           });
           return Promise.resolve({ meta: { changes: 1 } });
+        }
+        if (sql.includes("progress_receipts")) {
+          return this.runReceipt(sql);
         }
         const eventId = String(this.values[0]);
         if (sql.startsWith("INSERT INTO seen_events")) {
@@ -88,6 +103,64 @@ class FakeD1 {
         return Promise.resolve({ meta: { changes: 1 } });
       },
     };
+  }
+
+  private runReceipt(sql: string): Promise<{ meta: { changes: number } }> {
+    if (sql.startsWith("DELETE FROM progress_receipts WHERE rowid")) {
+      const [cutoff, limit] = this.values.map(Number);
+      const stale = [...this.receipts.entries()]
+        .filter(([, row]) => row.updated_at < cutoff)
+        .slice(0, limit);
+      for (const [id] of stale) {
+        this.receipts.delete(id);
+      }
+      return Promise.resolve({ meta: { changes: stale.length } });
+    }
+    const milestoneId = String(this.values[0]);
+    if (sql.startsWith("DELETE FROM progress_receipts")) {
+      this.receipts.delete(milestoneId);
+      return Promise.resolve({ meta: { changes: 1 } });
+    }
+    if (sql.startsWith("UPDATE progress_receipts")) {
+      const [, now, claimedAt] = this.values.map(Number);
+      const row = this.receipts.get(milestoneId);
+      if (
+        row === undefined ||
+        row.state !== "in_flight" ||
+        row.claimed_at !== claimedAt
+      ) {
+        return Promise.resolve({ meta: { changes: 0 } });
+      }
+      this.receipts.set(milestoneId, {
+        ...row,
+        claimed_at: now,
+        updated_at: now,
+      });
+      return Promise.resolve({ meta: { changes: 1 } });
+    }
+    const now = Number(this.values[3]);
+    if (sql.includes("DO NOTHING")) {
+      const claimedAt = Number(this.values[1]);
+      if (this.receipts.has(milestoneId)) {
+        return Promise.resolve({ meta: { changes: 0 } });
+      }
+      this.receipts.set(milestoneId, {
+        claimed_at: claimedAt,
+        state: "in_flight",
+        ts: null,
+        updated_at: claimedAt,
+      });
+      return Promise.resolve({ meta: { changes: 1 } });
+    }
+    const state = v.parse(v.string(), this.values[1]);
+    const ts = v.parse(v.nullable(v.string()), this.values[2]);
+    this.receipts.set(milestoneId, {
+      claimed_at: this.receipts.get(milestoneId)?.claimed_at ?? now,
+      state,
+      ts,
+      updated_at: now,
+    });
+    return Promise.resolve({ meta: { changes: 1 } });
   }
 
   private rootKey(): string {
@@ -265,8 +338,10 @@ interface Milestone {
   readonly mentions?: readonly string[];
   readonly task: string;
   readonly text: string;
+  readonly threadTs?: string;
   readonly title: string;
   readonly url?: string;
+  readonly verbatim?: boolean;
 }
 
 const milestone: Milestone = {
@@ -497,7 +572,7 @@ describe("progress endpoint", () => {
       },
     ]);
     expect([...db.roots.values()]).toEqual([
-      { root_text: "Release 42 · Started", root_ts: "171.1" },
+      { owned: 1, root_text: "Release 42 · Started", root_ts: "171.1" },
     ]);
     expect(
       turns.map((turn) => [turn.binding.channelId, turn.instanceId]),
@@ -643,12 +718,16 @@ describe("progress endpoint", () => {
     const response = await endpoint.handle(postMilestone());
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true });
+    expect(await response.json()).toEqual({ ok: true, ts: "171.1" });
     expect(calls).toEqual(rootCalls);
     expect([...db.roots.values()]).toEqual([
-      { root_text: "Release 42 · Started", root_ts: "171.1" },
+      { owned: 1, root_text: "Release 42 · Started", root_ts: "171.1" },
     ]);
-    expect([...db.seen]).toEqual(["progress:evt-1"]);
+    expect(db.receipts.get("evt-1")).toMatchObject({
+      state: "posted",
+      ts: "171.1",
+    });
+    expect(db.seen.size).toBe(0);
   });
 
   test("posts the root and the reply through an injected fetcher that rejects a receiver", async () => {
@@ -662,7 +741,7 @@ describe("progress endpoint", () => {
     const response = await endpoint.handle(postMilestone());
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true });
+    expect(await response.json()).toEqual({ ok: true, ts: "171.1" });
     expect(calls).toEqual(rootCalls);
   });
 
@@ -687,7 +766,7 @@ describe("progress endpoint", () => {
       const response = await endpoint.handle(postMilestone());
 
       expect(response.status).toBe(200);
-      expect(await response.json()).toEqual({ ok: true });
+      expect(await response.json()).toEqual({ ok: true, ts: "171.1" });
       expect(calls).toEqual(rootCalls);
     } finally {
       network.mockRestore();
@@ -773,8 +852,169 @@ describe("progress endpoint", () => {
     const retried = await endpoint.handle(postMilestone());
 
     expect([first.status, retried.status]).toEqual([200, 200]);
-    expect(await retried.json()).toEqual({ ok: true });
+    expect(await retried.json()).toEqual({ ok: true, ts: "171.1" });
     expect(calls).toEqual(rootCalls);
+  });
+
+  test("answers a milestone it already posted with the stored timestamp", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+
+    const first = await endpoint.handle(postMilestone());
+    db.receipts.set("evt-1", {
+      claimed_at: 1,
+      state: "posted",
+      ts: "999.001",
+      updated_at: 1,
+    });
+
+    const retried = await endpoint.handle(postMilestone());
+
+    expect(await first.json()).toEqual({ ok: true, ts: "171.1" });
+    expect(await retried.json()).toEqual({ ok: true, ts: "999.001" });
+    expect(calls).toEqual(rootCalls);
+  });
+
+  test("refuses a milestone whose receipt is still in flight", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+    const now = Math.floor(Date.now() / 1000);
+    db.receipts.set("evt-1", {
+      claimed_at: now,
+      state: "in_flight",
+      ts: null,
+      updated_at: now,
+    });
+
+    const response = await endpoint.handle(postMilestone());
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ error: "in_flight", ok: false });
+    expect(calls).toEqual([]);
+  });
+
+  test("reclaims a receipt left in flight past its lease and posts once", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+    const stale = Math.floor(Date.now() / 1000) - 301;
+    db.receipts.set("evt-1", {
+      claimed_at: stale,
+      state: "in_flight",
+      ts: null,
+      updated_at: stale,
+    });
+
+    const response = await endpoint.handle(postMilestone());
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, ts: "171.1" });
+    expect(calls).toEqual(rootCalls);
+    expect(db.receipts.get("evt-1")).toMatchObject({
+      state: "posted",
+      ts: "171.1",
+    });
+  });
+
+  test("adopts the thread a milestone names and posts no root of its own", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+
+    const adopted = await endpoint.handle(
+      postMilestone({ threadTs: "555.000" }),
+    );
+    const later = await endpoint.handle(
+      postMilestone({
+        id: "evt-2",
+        kind: "blocked",
+        text: "Waiting on review",
+        threadTs: "555.000",
+      }),
+    );
+
+    expect([adopted.status, later.status]).toEqual([200, 200]);
+    expect(await adopted.json()).toEqual({ ok: true, ts: "171.1" });
+    expect(calls.map((call) => call.method)).toEqual([
+      "chat.postMessage",
+      "chat.postMessage",
+    ]);
+    expect(calls.map((call) => call.body.thread_ts)).toEqual([
+      "555.000",
+      "555.000",
+    ]);
+    expect([...db.roots.values()]).toEqual([
+      { owned: 0, root_text: "Release 42 · Started", root_ts: "555.000" },
+    ]);
+  });
+
+  test("leaves the text of a thread it does not own alone when the label changes", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+
+    await endpoint.handle(postMilestone({ threadTs: "555.000" }));
+    const blocked = await endpoint.handle(
+      postMilestone({
+        id: "evt-2",
+        kind: "blocked",
+        text: "Waiting on review",
+        threadTs: "555.000",
+      }),
+    );
+    const renamed = await endpoint.handle(
+      postMilestone({
+        id: "evt-3",
+        task: "release-43",
+        threadTs: "555.000",
+      }),
+    );
+
+    expect([blocked.status, renamed.status]).toEqual([200, 200]);
+    expect(calls.map((call) => call.method)).not.toContain("chat.update");
+    expect([...db.roots.values()]).toEqual([
+      { owned: 0, root_text: "Release 42 · Started", root_ts: "555.000" },
+      { owned: 0, root_text: "Release 42 · Started", root_ts: "555.000" },
+    ]);
+  });
+
+  test("refuses a thread that is not the one it holds", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+
+    await endpoint.handle(postMilestone({ threadTs: "555.000" }));
+    const owned = await endpoint.handle(
+      postMilestone({ id: "evt-2", task: "release-43" }),
+    );
+    const unowned = await endpoint.handle(
+      postMilestone({ id: "evt-3", threadTs: "666.000" }),
+    );
+    const ownedMismatch = await endpoint.handle(
+      postMilestone({ id: "evt-4", task: "release-43", threadTs: "666.000" }),
+    );
+
+    expect([owned.status, unowned.status, ownedMismatch.status]).toEqual([
+      200, 409, 409,
+    ]);
+    expect(await unowned.json()).toEqual({
+      error: "thread_mismatch",
+      ok: false,
+    });
+    expect(await ownedMismatch.json()).toEqual({
+      error: "thread_mismatch",
+      ok: false,
+    });
+    expect(db.receipts.has("evt-3")).toBe(false);
+    expect(db.receipts.has("evt-4")).toBe(false);
   });
 
   test("answers non-2xx when Slack refuses the root, and lets the retry through", async () => {
@@ -790,6 +1030,7 @@ describe("progress endpoint", () => {
     expect(await refused.json()).toEqual({ error: "slack_failed", ok: false });
     expect(refusedCalls).toEqual([rootCalls[0]]);
     expect(db.seen.size).toBe(0);
+    expect(db.receipts.size).toBe(0);
 
     const retriedCalls: RecordedCall[] = [];
     const retried = await endpointFor(db, retriedCalls).handle(postMilestone());
@@ -810,6 +1051,7 @@ describe("progress endpoint", () => {
     expect(refused.status).toBe(500);
     expect(refusedCalls).toEqual(rootCalls);
     expect(db.seen.size).toBe(0);
+    expect(db.receipts.size).toBe(0);
 
     const retriedCalls: RecordedCall[] = [];
     const retried = await endpointFor(db, retriedCalls).handle(postMilestone());
@@ -849,7 +1091,7 @@ describe("progress endpoint", () => {
       method: "chat.postMessage",
     });
     expect([...db.roots.values()]).toEqual([
-      { root_text: "Release 42 · Started", root_ts: "171.1" },
+      { owned: 1, root_text: "Release 42 · Started", root_ts: "171.1" },
     ]);
   });
 
@@ -887,7 +1129,7 @@ describe("progress endpoint", () => {
       method: "chat.postMessage",
     });
     expect([...db.roots.values()]).toEqual([
-      { root_text: "Release 42 · Blocked", root_ts: "171.1" },
+      { owned: 1, root_text: "Release 42 · Blocked", root_ts: "171.1" },
     ]);
   });
 });
@@ -906,6 +1148,55 @@ describe("narrated progress endpoint", () => {
     expect(response.status).toBe(200);
     expect(calls).toEqual(rootCalls);
     expect(turns).toEqual([]);
+  });
+
+  test("posts a verbatim milestone as given and never narrates it", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const { narrate, turns } = narrations();
+
+    const response = await endpointFor(db, calls, {
+      narrate,
+      narration: "Write in Spanish, warm and brief.",
+    }).handle(postMilestone({ threadTs: "555.000", verbatim: true }));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, ts: "171.1" });
+    expect(turns).toEqual([]);
+    expect(calls).toEqual([
+      {
+        body: {
+          channel: "C1",
+          text: "Kicked off\n<https://example.com/run>",
+          thread_ts: "555.000",
+        },
+        method: "chat.postMessage",
+      },
+    ]);
+    expect(db.receipts.get("evt-1")).toMatchObject({
+      state: "posted",
+      ts: "171.1",
+    });
+  });
+
+  test("redacts what a verbatim milestone would carry", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+
+    const response = await endpointFor(db, calls).handle(
+      postMilestone({
+        text: "Bearer xoxb-1234-not-a-real-token",
+        threadTs: "555.000",
+        verbatim: true,
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(calls[0]?.body.text).toBe(
+      "Bearer [secret]\n<https://example.com/run>",
+    );
   });
 
   test("narrates a milestone as one turn in its thread and posts no reply itself", async () => {
@@ -942,6 +1233,7 @@ describe("narrated progress endpoint", () => {
           "Rewrite this milestone as your reply in that voice: one or two short sentences that use the earlier milestones in this thread as context and say only what this milestone and those earlier milestones say.",
         ].join("\n\n"),
         instanceId: "slack:v1:T123:C1:171.1",
+        milestoneId: "evt-1",
       },
     ]);
   });
@@ -974,6 +1266,7 @@ describe("narrated progress endpoint", () => {
     const retried = await endpoint.handle(postMilestone());
 
     expect([first.status, retried.status]).toEqual([200, 200]);
+    expect(await retried.json()).toEqual({ narrated: true, ok: true });
     expect(calls).toEqual([rootCalls[0]]);
     expect(turns).toHaveLength(1);
   });
@@ -1062,6 +1355,21 @@ describe("progress mentions", () => {
     expect(calls).toEqual([rootCalls[0], taggedReply]);
   });
 
+  test("answers a retry of a tagged milestone from its receipt without reading the directory", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const retryCalls: RecordedCall[] = [];
+    const tagged = () => postMilestone({ mentions: ["Juan Pérez", "ana.r"] });
+
+    const first = await directoryEndpoint(db, calls).handle(tagged());
+    const retried = await endpointFor(db, retryCalls).handle(tagged());
+
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual(await first.json());
+    expect(retryCalls).toEqual([]);
+  });
+
   test("refuses a mention no channel member matches or several share, before posting anything", async () => {
     const db = new FakeD1();
     db.admissions.set("C1", ADMITTED_BY);
@@ -1092,7 +1400,7 @@ describe("progress mentions", () => {
       ok: false,
     });
     expect(calls).toEqual([]);
-    expect(db.seen.size).toBe(0);
+    expect(db.receipts.size).toBe(0);
   });
 });
 
@@ -1171,6 +1479,7 @@ const threadReplies = [
 const repliesEndpoint = (db: FakeD1, calls: RecordedCall[]) => {
   db.admissions.set("C1", ADMITTED_BY);
   db.roots.set(`C1\u0000release-42`, {
+    owned: 1,
     root_text: "Release 42 · Started",
     root_ts: "171.1",
   });
@@ -1231,6 +1540,7 @@ const longThreadEndpoint = (calls: RecordedCall[], replies: number) => {
   const db = new FakeD1();
   db.admissions.set("C1", ADMITTED_BY);
   db.roots.set(`C1\u0000release-42`, {
+    owned: 1,
     root_text: "Release 42 · Started",
     root_ts: LONG_ROOT_TS,
   });

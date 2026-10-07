@@ -2,8 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { SlackThreadRef } from "@flue/slack";
 import * as v from "valibot";
 import { createSqlSlackChannelAdmissionStore } from "./admission.ts";
-import { claimAndRun } from "./dedup.ts";
-import { closingMrkdwn, MAX_SLACK_MESSAGE_LENGTH } from "./delivery.ts";
+import { closingMrkdwn, MAX_SLACK_MESSAGE_LENGTH, redact } from "./delivery.ts";
 import type { SlackDeliveryBinding } from "./delivery.ts";
 import { loadChannelMembers, matchMember } from "./mention.ts";
 import type { SlackMember } from "./mention.ts";
@@ -85,6 +84,7 @@ const CHANNEL_LIMIT = 255;
 const URL_LIMIT = 2048;
 const MENTION_LIMIT = 100;
 const MAX_MENTIONS = 10;
+const SLACK_TS_RE = /^\d+\.\d+$/u;
 
 const milestoneSchema = v.object({
   channel: v.pipe(v.string(), v.nonEmpty(), v.maxLength(CHANNEL_LIMIT)),
@@ -98,6 +98,7 @@ const milestoneSchema = v.object({
   ),
   task: v.pipe(v.string(), v.nonEmpty(), v.maxLength(TASK_LIMIT)),
   text: v.pipe(v.string(), v.nonEmpty(), v.maxLength(MAX_SLACK_MESSAGE_LENGTH)),
+  threadTs: v.optional(v.pipe(v.string(), v.regex(SLACK_TS_RE))),
   title: v.pipe(v.string(), v.nonEmpty(), v.maxLength(TITLE_LIMIT)),
   url: v.optional(
     v.pipe(
@@ -110,6 +111,7 @@ const milestoneSchema = v.object({
       v.transform((value) => new URL(value).href),
     ),
   ),
+  verbatim: v.optional(v.boolean()),
 });
 
 type SlackProgressMilestone = v.InferOutput<typeof milestoneSchema>;
@@ -120,9 +122,14 @@ const repliesQuerySchema = v.object({
   task: v.pipe(v.string(), v.nonEmpty(), v.maxLength(TASK_LIMIT)),
 });
 
-const rootRow = v.object({ root_text: v.string(), root_ts: v.string() });
+const rootRow = v.object({
+  owned: v.number(),
+  root_text: v.string(),
+  root_ts: v.string(),
+});
 
 interface SlackProgressRoot {
+  readonly owned: boolean;
   readonly rootText: string;
   readonly rootTs: string;
 }
@@ -155,26 +162,153 @@ export const createSqlSlackProgressRootStore = (
   async load(channelId, taskId) {
     const { results } = await db
       .prepare(
-        "SELECT root_ts, root_text FROM slack_progress_roots WHERE channel_id = ?1 AND task_id = ?2",
+        "SELECT owned, root_ts, root_text FROM slack_progress_roots WHERE channel_id = ?1 AND task_id = ?2",
       )
       .bind(channelId, taskId)
       .all();
     const [row] = results;
     return v.is(rootRow, row)
-      ? { rootText: row.root_text, rootTs: row.root_ts }
+      ? {
+          owned: row.owned === 1,
+          rootText: row.root_text,
+          rootTs: row.root_ts,
+        }
       : undefined;
   },
   async save(channelId, taskId, root, now) {
     await db
       .prepare(
-        `INSERT INTO slack_progress_roots (channel_id, task_id, root_ts, root_text, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(channel_id, task_id) DO UPDATE SET root_ts = excluded.root_ts, root_text = excluded.root_text, updated_at = excluded.updated_at`,
+        `INSERT INTO slack_progress_roots (channel_id, task_id, root_ts, root_text, owned, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(channel_id, task_id) DO UPDATE SET root_ts = excluded.root_ts, root_text = excluded.root_text, owned = excluded.owned, updated_at = excluded.updated_at`,
       )
-      .bind(channelId, taskId, root.rootTs, root.rootText, now)
+      .bind(
+        channelId,
+        taskId,
+        root.rootTs,
+        root.rootText,
+        root.owned ? 1 : 0,
+        now,
+      )
       .run();
   },
 });
+
+type SlackMilestoneOutcome =
+  | { readonly state: "posted"; readonly ts: string }
+  | { readonly state: "narrated" };
+
+type SlackProgressClaim =
+  | { readonly outcome: "busy" }
+  | { readonly outcome: "claimed" }
+  | { readonly outcome: "settled"; readonly receipt: SlackMilestoneOutcome };
+
+interface SlackProgressReceiptStore {
+  readonly claim: (
+    milestoneId: string,
+    now?: number,
+  ) => Promise<SlackProgressClaim>;
+  readonly complete: (
+    milestoneId: string,
+    outcome: SlackMilestoneOutcome,
+    now?: number,
+  ) => Promise<void>;
+  readonly drop: (milestoneId: string) => Promise<void>;
+}
+
+const PROGRESS_RECEIPT_LEASE_SECONDS = 300;
+const PROGRESS_RECEIPT_RETENTION_SECONDS = 7 * 24 * 60 * 60;
+const RECEIPT_SWEEP_BATCH_LIMIT = 1000;
+
+const currentUnixSeconds = (): number => Math.floor(Date.now() / 1000);
+
+const receiptRow = v.object({
+  claimed_at: v.number(),
+  state: v.picklist(["in_flight", "narrated", "posted"]),
+  ts: v.nullable(v.string()),
+});
+
+const sweepReceipts = async (db: D1Database, now: number): Promise<void> => {
+  try {
+    await db
+      .prepare(
+        "DELETE FROM progress_receipts WHERE rowid IN (SELECT rowid FROM progress_receipts WHERE updated_at < ?1 LIMIT ?2)",
+      )
+      .bind(now - PROGRESS_RECEIPT_RETENTION_SECONDS, RECEIPT_SWEEP_BATCH_LIMIT)
+      .run();
+  } catch (error: unknown) {
+    // The receipt already committed; propagating would fail a milestone whose retry would then answer 409 to itself.
+    console.error("progress receipt retention sweep failed", error);
+  }
+};
+
+export const createSqlSlackProgressReceiptStore = (
+  db: D1Database,
+): SlackProgressReceiptStore => ({
+  async claim(milestoneId, now = currentUnixSeconds()) {
+    const inserted = await db
+      .prepare(
+        "INSERT INTO progress_receipts (milestone_id, state, claimed_at, updated_at) VALUES (?1, 'in_flight', ?2, ?2) ON CONFLICT(milestone_id) DO NOTHING",
+      )
+      .bind(milestoneId, now)
+      .run();
+    if (inserted.meta.changes === 1) {
+      await sweepReceipts(db, now);
+      return { outcome: "claimed" };
+    }
+    const { results } = await db
+      .prepare(
+        "SELECT state, ts, claimed_at FROM progress_receipts WHERE milestone_id = ?1",
+      )
+      .bind(milestoneId)
+      .all();
+    const [row] = results;
+    if (!v.is(receiptRow, row)) {
+      // A concurrent sweep removed the row this claim lost to, so the milestone is unclaimed again.
+      return { outcome: "claimed" };
+    }
+    if (row.state === "posted" && row.ts !== null) {
+      return { outcome: "settled", receipt: { state: "posted", ts: row.ts } };
+    }
+    if (row.state === "narrated") {
+      return { outcome: "settled", receipt: { state: "narrated" } };
+    }
+    if (now - row.claimed_at < PROGRESS_RECEIPT_LEASE_SECONDS) {
+      return { outcome: "busy" };
+    }
+    const reclaimed = await db
+      .prepare(
+        "UPDATE progress_receipts SET claimed_at = ?2, updated_at = ?2 WHERE milestone_id = ?1 AND state = 'in_flight' AND claimed_at = ?3",
+      )
+      .bind(milestoneId, now, row.claimed_at)
+      .run();
+    return reclaimed.meta.changes === 1
+      ? { outcome: "claimed" }
+      : { outcome: "busy" };
+  },
+  async complete(milestoneId, outcome, now = currentUnixSeconds()) {
+    const ts = outcome.state === "posted" ? outcome.ts : null;
+    await db
+      .prepare(
+        `INSERT INTO progress_receipts (milestone_id, state, ts, claimed_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)
+         ON CONFLICT(milestone_id) DO UPDATE SET state = excluded.state, ts = excluded.ts, updated_at = excluded.updated_at`,
+      )
+      .bind(milestoneId, outcome.state, ts, now)
+      .run();
+  },
+  async drop(milestoneId) {
+    await db
+      .prepare("DELETE FROM progress_receipts WHERE milestone_id = ?1")
+      .bind(milestoneId)
+      .run();
+  },
+});
+
+const receiptAnswer = (receipt: SlackMilestoneOutcome): Response =>
+  receipt.state === "posted"
+    ? Response.json({ ok: true, ts: receipt.ts })
+    : Response.json({ narrated: true, ok: true });
 
 type Fetcher = (
   input: RequestInfo | URL,
@@ -266,6 +400,7 @@ export interface SlackProgressTurn {
   readonly binding: SlackDeliveryBinding;
   readonly body: string;
   readonly instanceId: string;
+  readonly milestoneId: string;
 }
 
 export interface SlackProgressEndpointOptions {
@@ -308,12 +443,23 @@ const closingOf = (
     milestone.url === undefined ? [] : [milestone.url],
   );
 
+const requiredTs = (posted: { readonly ts?: string | undefined }): string => {
+  const ts = posted.ts ?? "";
+  if (ts === "") {
+    throw new Error(
+      "Slack chat.postMessage answered without a message timestamp",
+    );
+  }
+  return ts;
+};
+
 const replyOf = (
   milestone: SlackProgressMilestone,
   members: readonly SlackMember[],
+  text: string = milestone.text,
 ): string => {
   const closing = closingOf(milestone, members);
-  return closing === "" ? milestone.text : `${milestone.text}\n${closing}`;
+  return closing === "" ? text : `${text}\n${closing}`;
 };
 
 // The progress route reaches a conversation without an ingress channel object,
@@ -388,6 +534,7 @@ export const createSlackProgressEndpoint = (
   };
   const admissionStore = createSqlSlackChannelAdmissionStore(options.db);
   const roots = createSqlSlackProgressRootStore(options.db);
+  const receipts = createSqlSlackProgressReceiptStore(options.db);
   const authorization = `Bearer ${options.bearer}`;
 
   const authorized = (request: Request): boolean =>
@@ -486,6 +633,15 @@ export const createSlackProgressEndpoint = (
   ): Promise<SlackProgressRoot> => {
     const stored = await roots.load(milestone.channel, milestone.task);
     if (stored === undefined) {
+      if (milestone.threadTs !== undefined) {
+        const root = {
+          owned: false,
+          rootText: text,
+          rootTs: milestone.threadTs,
+        };
+        await roots.save(milestone.channel, milestone.task, root, Date.now());
+        return root;
+      }
       const posted = await callSlack(
         caller,
         "chat.postMessage",
@@ -495,15 +651,12 @@ export const createSlackProgressEndpoint = (
         },
         slackEnvelope,
       );
-      const rootTs = posted.ts ?? "";
-      if (rootTs === "") {
-        throw new Error(
-          "Slack chat.postMessage answered without a message timestamp",
-        );
-      }
-      const root = { rootText: text, rootTs };
+      const root = { owned: true, rootText: text, rootTs: requiredTs(posted) };
       await roots.save(milestone.channel, milestone.task, root, Date.now());
       return root;
+    }
+    if (!stored.owned) {
+      return stored;
     }
     if (stored.rootText !== text) {
       try {
@@ -527,29 +680,42 @@ export const createSlackProgressEndpoint = (
         }
         return stored;
       }
-      const root = { rootText: text, rootTs: stored.rootTs };
+      const root = { owned: true, rootText: text, rootTs: stored.rootTs };
       await roots.save(milestone.channel, milestone.task, root, Date.now());
       return root;
     }
     return stored;
   };
 
+  const threadMismatch = async (
+    milestone: SlackProgressMilestone,
+  ): Promise<Response | undefined> => {
+    if (milestone.threadTs === undefined) {
+      return undefined;
+    }
+    const stored = await roots.load(milestone.channel, milestone.task);
+    return stored !== undefined && stored.rootTs !== milestone.threadTs
+      ? refusal(409, "thread_mismatch")
+      : undefined;
+  };
+
   const postReply = async (
     channelId: string,
     threadTs: string,
     text: string,
-  ): Promise<void> => {
-    await callSlack(
-      caller,
-      "chat.postMessage",
-      {
-        channel: channelId,
-        text,
-        thread_ts: threadTs,
-      },
-      slackEnvelope,
+  ): Promise<string> =>
+    requiredTs(
+      await callSlack(
+        caller,
+        "chat.postMessage",
+        {
+          channel: channelId,
+          text,
+          thread_ts: threadTs,
+        },
+        slackEnvelope,
+      ),
     );
-  };
 
   const narrateMilestone = async (
     milestone: SlackProgressMilestone,
@@ -557,7 +723,7 @@ export const createSlackProgressEndpoint = (
     admittedBy: string,
     root: SlackProgressRoot,
     narration: string,
-  ): Promise<void> => {
+  ): Promise<SlackMilestoneOutcome> => {
     const binding: SlackDeliveryBinding = {
       channelId: milestone.channel,
       fallbackText: milestone.text,
@@ -582,15 +748,20 @@ export const createSlackProgressEndpoint = (
           teamId: options.teamId,
           threadTs: root.rootTs,
         }),
+        milestoneId: milestone.id,
       });
+      return { state: "narrated" };
     } catch (error: unknown) {
       // The turn never reached the thread, so the milestone still must.
       console.error("Slack progress narration failed", error);
-      await postReply(
-        milestone.channel,
-        root.rootTs,
-        replyOf(milestone, members),
-      );
+      return {
+        state: "posted",
+        ts: await postReply(
+          milestone.channel,
+          root.rootTs,
+          replyOf(milestone, members),
+        ),
+      };
     }
   };
 
@@ -598,18 +769,26 @@ export const createSlackProgressEndpoint = (
     milestone: SlackProgressMilestone,
     members: readonly SlackMember[],
     admittedBy: string,
-  ): Promise<void> => {
+  ): Promise<SlackMilestoneOutcome> => {
     const root = await enterRoot(milestone, rootOf(milestone));
     const { narration } = config;
-    if (narration === undefined) {
-      await postReply(
-        milestone.channel,
-        root.rootTs,
-        replyOf(milestone, members),
-      );
-      return;
+    const reply =
+      milestone.verbatim === true
+        ? replyOf(milestone, members, redact(milestone.text))
+        : replyOf(milestone, members);
+    if (narration === undefined || milestone.verbatim === true) {
+      return {
+        state: "posted",
+        ts: await postReply(milestone.channel, root.rootTs, reply),
+      };
     }
-    await narrateMilestone(milestone, members, admittedBy, root, narration);
+    return await narrateMilestone(
+      milestone,
+      members,
+      admittedBy,
+      root,
+      narration,
+    );
   };
 
   return {
@@ -638,21 +817,42 @@ export const createSlackProgressEndpoint = (
         channel: resolved.channelId,
       };
       try {
-        const mentioned = await resolveMentions(
-          resolved.channelId,
-          milestone.mentions ?? [],
-        );
-        if ("refusal" in mentioned) {
-          return mentioned.refusal;
+        const mismatch = await threadMismatch(resolvedMilestone);
+        if (mismatch !== undefined) {
+          return mismatch;
         }
-        await claimAndRun(options.db, `progress:${resolvedMilestone.id}`, () =>
-          postMilestone(resolvedMilestone, mentioned.members, admittedBy),
-        );
+        const claim = await receipts.claim(resolvedMilestone.id);
+        if (claim.outcome === "busy") {
+          return refusal(409, "in_flight");
+        }
+        if (claim.outcome === "settled") {
+          return receiptAnswer(claim.receipt);
+        }
+        let outcome: SlackMilestoneOutcome;
+        try {
+          const mentioned = await resolveMentions(
+            resolved.channelId,
+            milestone.mentions ?? [],
+          );
+          if ("refusal" in mentioned) {
+            await receipts.drop(resolvedMilestone.id);
+            return mentioned.refusal;
+          }
+          outcome = await postMilestone(
+            resolvedMilestone,
+            mentioned.members,
+            admittedBy,
+          );
+        } catch (error: unknown) {
+          await receipts.drop(resolvedMilestone.id);
+          throw error;
+        }
+        await receipts.complete(resolvedMilestone.id, outcome);
+        return receiptAnswer(outcome);
       } catch (error: unknown) {
         console.error("Slack progress milestone failed", error);
         return refusal(500, "slack_failed");
       }
-      return Response.json({ ok: true });
     },
     async handleChannels(request) {
       if (!authorized(request)) {

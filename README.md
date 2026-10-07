@@ -294,7 +294,7 @@ curl --fail https://your-worker.example.com/progress \
   --data '{"id":"evt-9f2c","task":"release-42","title":"Release 42","channel":"C0123456789","kind":"pr","text":"Opened the release pull request","url":"https://github.com/you/repo/pull/7"}'
 ```
 
-A success answers `200 {"ok":true}`; a refusal answers a 4xx with `{"ok":false,"error":"..."}` and calls Slack not at all.
+A success answers `200 {"ok":true,"ts":"<the reply's Slack ts>"}` when the milestone posted as a reply itself, `200 {"ok":true,"narrated":true}` when it went to a narration turn, and `200` with the stored receipt when the id already posted; a refusal answers a 4xx with `{"ok":false,"error":"..."}` and calls Slack not at all.
 
 A client that would rather not store an id lists the channels the bot may post to:
 
@@ -306,21 +306,26 @@ curl --fail --header "authorization: Bearer $SLACK_PROGRESS_BEARER" \
 It answers `{"ok":true,"channels":[{"id":"C0123456789","name":"sandbox","kind":"channel"}]}`: one entry per admitted channel, where `kind` is `channel`, `private`, or `group` (a group DM) and `name` is the channel's name, or `null` for a channel Slack will not describe.
 It takes the same bearer and answers `401` without it.
 
-- `id` identifies the event: a retry with an id that already posted is a no-op that still answers success.
+- `id` identifies the milestone and keys its receipt in D1 (`progress_receipts`, migration `0007_progress_receipts.sql`): a retry of an id that posted or narrated answers the stored receipt and calls Slack not at all, so a sender that retries the same text never double-posts it.
+  A retry that lands while the first request is still posting answers `409` `in_flight`, and only a claim older than five minutes is reclaimed and posted again.
+  A Slack failure deletes the receipt before answering `500`, so the retry posts the milestone instead of being deduplicated into silence.
 - `task` identifies the task inside the channel; its first event posts the root and stores the root timestamp in D1 (`slack_progress_roots`, migration `0006_slack_progress_roots.sql`), and later events reply in that thread.
+- `threadTs` is the ts of a thread the sender already owns: the first milestone of a task stores it as an unowned root, nothing is posted for that root and its text is never edited, and every milestone of the task becomes a reply in the named thread.
+  A `threadTs` that differs from the root the task already holds answers `409` `thread_mismatch`.
 - `kind` is one of `started`, `progress`, `blocked`, `pr`, `review`, `merged`, `done`; the root reads `<title> · <label of the kind>` and is edited whenever that text changes, so the root always shows the task's current status.
   A root Slack refuses to edit is logged and the milestone still gets its reply; when Slack answers that the root is gone, the next milestone posts a fresh one.
 - `text` and its optional `url` are the milestone: without `narration` they post as the reply, with `url` on the line below `text`, and with it `text` is what the turn rewrites and what the thread falls back to when that turn cannot deliver.
   A narrated reply carries `url` the same way: trusted code closes it with the link, so the model never retypes it.
+- `verbatim: true` posts the milestone as given even when `narration` is configured: the reply is `text` with the redaction every bot reply gets, the tags and the link on the line below, posted with `chat.postMessage` in the task's thread and no narration turn, and its answer carries that reply's `ts`.
 - `mentions` is an optional list of up to 10 members of the destination channel to tag, each a user ID, a display or real name, or one word of it.
   The tags close the reply next to `url`, whether the reply is narrated or posted as given.
   Resolving them reads `users.list`, so it needs the `users:read` scope the `read` option adds.
-- `title`, `text`, `id`, `task`, `channel` and `url` are bounded, `url` must be HTTPS, and `channel` names the destination as an id or as a name.
+- `title`, `text`, `id`, `task`, `channel`, `url` and `threadTs` are bounded, `url` must be HTTPS, `threadTs` must be a Slack ts, and `channel` names the destination as an id or as a name.
   A name may carry its leading `#` and is compared case-insensitively against the admitted channels, so either form must already carry the admission an allowlisted user's invitation wrote.
 
-The refusals are `401` for a missing or wrong bearer, `400` for a body that is not a milestone, `403` for a channel the admission does not cover, and `409` for a name several admitted channels answer to.
+The refusals are `401` for a missing or wrong bearer, `400` for a body that is not a milestone, `403` for a channel the admission does not cover, `409` for a name several admitted channels answer to, `409` `thread_mismatch` for a thread that is not the task's, and `409` `in_flight` for a retry of a milestone that is still posting.
 A mention no channel member matches answers `422` `unknown_mention`, and one several members share answers `409` `ambiguous_mention` with their `candidates`; both name the `mention` and post nothing.
-A Slack failure answers `500` so the sender can retry, and the retry is deduplicated by `id` once a request has succeeded.
+A Slack failure answers `500` so the sender can retry, and the retry is deduplicated by its receipt `id`.
 `chat:write` covers both `chat.postMessage` and `chat.update`, so the option adds no scope.
 Milestone content arrives curated: without `narration` it is posted as given, and with it the bot only restates what the milestone and the thread's earlier milestones already say.
 

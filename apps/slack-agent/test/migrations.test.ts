@@ -13,7 +13,10 @@ import {
   claimEvent,
   releaseEvent,
 } from "../../../packages/core/src/dedup.ts";
-import { createSqlSlackProgressRootStore } from "../../../packages/core/src/progress.ts";
+import {
+  createSqlSlackProgressReceiptStore,
+  createSqlSlackProgressRootStore,
+} from "../../../packages/core/src/progress.ts";
 import * as v from "valibot";
 
 const bindings = v.array(
@@ -153,6 +156,7 @@ describe("D1 migration schema", () => {
       "0004_slack_read_cursors.sql",
       "0005_slack_channel_admissions.sql",
       "0006_slack_progress_roots.sql",
+      "0007_progress_receipts.sql",
     ]);
     expect(
       applyOrder([
@@ -182,6 +186,38 @@ describe("D1 migration schema", () => {
     expect(batches[5]).toContain(
       "CREATE TABLE IF NOT EXISTS slack_progress_roots",
     );
+    expect(batches[6]).toContain("ALTER TABLE slack_progress_roots");
+    expect(batches[6]).toContain(
+      "CREATE TABLE IF NOT EXISTS progress_receipts",
+    );
+    expect(batches[6]).toContain("CREATE INDEX");
+  });
+
+  test("adds the owned column to the roots stored before it", () => {
+    const sqlite = new Database(":memory:");
+    for (const source of migrationSources.slice(0, 6)) {
+      sqlite.run(source);
+    }
+    sqlite.run(
+      "INSERT INTO slack_progress_roots (channel_id, task_id, root_ts, root_text, updated_at) VALUES ('C1', 'task-1', '171.1', 'Release 42 · Started', 1)",
+    );
+    sqlite.run(migrationSources[6] ?? "");
+
+    expect(
+      sqlite
+        .query(
+          "SELECT channel_id, task_id, root_ts, root_text, owned FROM slack_progress_roots",
+        )
+        .all(),
+    ).toEqual([
+      {
+        channel_id: "C1",
+        owned: 1,
+        root_text: "Release 42 · Started",
+        root_ts: "171.1",
+        task_id: "task-1",
+      },
+    ]);
   });
 
   test("indexes created_at and plans the sweep through that index", async () => {
@@ -669,27 +705,29 @@ describe("slack progress root storage", () => {
     await store.save(
       "C1",
       "task-1",
-      { rootText: "Release 42 · Started", rootTs: "171.1" },
+      { owned: true, rootText: "Release 42 · Started", rootTs: "171.1" },
       NOW,
     );
     await store.save(
       "C1",
       "task-2",
-      { rootText: "Release 43 · Started", rootTs: "171.2" },
+      { owned: true, rootText: "Release 43 · Started", rootTs: "171.2" },
       NOW,
     );
     await store.save(
       "C1",
       "task-1",
-      { rootText: "Release 42 · Blocked", rootTs: "171.1" },
+      { owned: true, rootText: "Release 42 · Blocked", rootTs: "171.1" },
       NOW + 60,
     );
 
     expect(await store.load("C1", "task-1")).toEqual({
+      owned: true,
       rootText: "Release 42 · Blocked",
       rootTs: "171.1",
     });
     expect(await store.load("C1", "task-2")).toEqual({
+      owned: true,
       rootText: "Release 43 · Started",
       rootTs: "171.2",
     });
@@ -699,23 +737,137 @@ describe("slack progress root storage", () => {
     await store.drop("C1", "task-9");
     expect(await store.load("C1", "task-1")).toBeUndefined();
     expect(await store.load("C1", "task-2")).toEqual({
+      owned: true,
       rootText: "Release 43 · Started",
       rootTs: "171.2",
     });
 
     const rows = await db
       .prepare(
-        "SELECT channel_id, task_id, root_ts, root_text, updated_at FROM slack_progress_roots ORDER BY channel_id, task_id",
+        "SELECT channel_id, task_id, root_ts, root_text, owned, updated_at FROM slack_progress_roots ORDER BY channel_id, task_id",
       )
       .all();
     expect(rows.results).toEqual([
       {
         channel_id: "C1",
+        owned: 1,
         root_text: "Release 43 · Started",
         root_ts: "171.2",
         task_id: "task-2",
         updated_at: NOW,
       },
+    ]);
+  });
+
+  test("keeps a root a thread the bot does not own adopted", async () => {
+    const { db } = migrated();
+    const store = createSqlSlackProgressRootStore(db);
+
+    await store.save(
+      "C1",
+      "task-1",
+      { owned: false, rootText: "Release 42 · Started", rootTs: "171.1" },
+      NOW,
+    );
+
+    expect(await store.load("C1", "task-1")).toEqual({
+      owned: false,
+      rootText: "Release 42 · Started",
+      rootTs: "171.1",
+    });
+  });
+});
+
+const receiptRows = async (db: D1Database): Promise<unknown[]> => {
+  const { results } = await db
+    .prepare(
+      "SELECT milestone_id, state, ts, claimed_at FROM progress_receipts ORDER BY milestone_id",
+    )
+    .all();
+  return results;
+};
+
+describe("progress receipt storage", () => {
+  test("claims a milestone once, holds the duplicate busy, and settles it with the reply timestamp", async () => {
+    const { db } = migrated();
+    const store = createSqlSlackProgressReceiptStore(db);
+
+    expect(await store.claim("evt-1", NOW)).toEqual({ outcome: "claimed" });
+    expect(await store.claim("evt-1", NOW + 1)).toEqual({ outcome: "busy" });
+
+    await store.complete("evt-1", { state: "posted", ts: "171.1" }, NOW + 2);
+
+    expect(await store.claim("evt-1", NOW + 3)).toEqual({
+      outcome: "settled",
+      receipt: { state: "posted", ts: "171.1" },
+    });
+    expect(await receiptRows(db)).toEqual([
+      { claimed_at: NOW, milestone_id: "evt-1", state: "posted", ts: "171.1" },
+    ]);
+  });
+
+  test("settles a narrated milestone without a timestamp", async () => {
+    const { db } = migrated();
+    const store = createSqlSlackProgressReceiptStore(db);
+
+    await store.complete("evt-1", { state: "narrated" }, NOW);
+
+    expect(await store.claim("evt-1", NOW + 1)).toEqual({
+      outcome: "settled",
+      receipt: { state: "narrated" },
+    });
+    expect(await receiptRows(db)).toEqual([
+      { claimed_at: NOW, milestone_id: "evt-1", state: "narrated", ts: null },
+    ]);
+  });
+
+  test("reclaims a claim older than the lease and refuses a younger one", async () => {
+    const { db } = migrated();
+    const store = createSqlSlackProgressReceiptStore(db);
+
+    await store.claim("evt-1", NOW);
+
+    expect(await store.claim("evt-1", NOW + 299)).toEqual({ outcome: "busy" });
+    expect(await store.claim("evt-1", NOW + 301)).toEqual({
+      outcome: "claimed",
+    });
+    expect(await receiptRows(db)).toEqual([
+      {
+        claimed_at: NOW + 301,
+        milestone_id: "evt-1",
+        state: "in_flight",
+        ts: null,
+      },
+    ]);
+  });
+
+  test("drops a failed milestone so its retry claims it again", async () => {
+    const { db } = migrated();
+    const store = createSqlSlackProgressReceiptStore(db);
+
+    await store.claim("evt-1", NOW);
+    await store.drop("evt-1");
+
+    expect(await store.claim("evt-1", NOW + 1)).toEqual({ outcome: "claimed" });
+  });
+
+  test("sweeps only the receipts that left the retention window", async () => {
+    const { db } = migrated();
+    const store = createSqlSlackProgressReceiptStore(db);
+
+    await store.claim("Ev-stale", NOW - retentionSeconds - 1);
+    await store.claim("Ev-fresh", NOW);
+
+    await store.claim("Ev-trigger", NOW + 1);
+
+    const { results } = await db
+      .prepare(
+        "SELECT milestone_id FROM progress_receipts ORDER BY milestone_id",
+      )
+      .all();
+    expect(results).toEqual([
+      { milestone_id: "Ev-fresh" },
+      { milestone_id: "Ev-trigger" },
     ]);
   });
 });
