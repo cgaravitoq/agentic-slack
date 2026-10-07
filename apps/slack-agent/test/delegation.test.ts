@@ -491,6 +491,10 @@ test("requester-only approval dispatches in waitUntil and started waits for the 
   expect(h.posts).toHaveLength(1);
   const dispatch = h.runnerCalls.find((call) => call.path === "/tasks");
   expect(dispatch?.headers.get("authorization")).toBe(`Bearer ${SECRET}`);
+  expect(dispatch?.headers.get("CF-Access-Client-Id")).toBe("client-id");
+  expect(dispatch?.headers.get("CF-Access-Client-Secret")).toBe(
+    "client-secret",
+  );
   expect(JSON.parse(dispatch?.body ?? "null")).toMatchObject({
     task: {
       id: output.id,
