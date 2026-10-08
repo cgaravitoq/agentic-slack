@@ -798,6 +798,50 @@ describe("slack progress root storage", () => {
       rootTs: "171.1",
     });
   });
+
+  test("keeps the latest status of a root and leaves a root stored without one without a status", async () => {
+    const { db } = migrated();
+    const store = createSqlSlackProgressRootStore(db);
+
+    await store.save(
+      "C1",
+      "task-1",
+      { owned: true, rootText: "Release 42 · Started", rootTs: "171.1" },
+      NOW,
+    );
+    expect(await store.load("C1", "task-1")).toEqual({
+      owned: true,
+      rootText: "Release 42 · Started",
+      rootTs: "171.1",
+    });
+
+    await store.save(
+      "C1",
+      "task-1",
+      {
+        owned: true,
+        rootText: "Release 42 · Started · 2 of 5 landed",
+        rootTs: "171.1",
+        status: "2 of 5 landed",
+      },
+      NOW + 60,
+    );
+    expect(await store.load("C1", "task-1")).toEqual({
+      owned: true,
+      rootText: "Release 42 · Started · 2 of 5 landed",
+      rootTs: "171.1",
+      status: "2 of 5 landed",
+    });
+
+    const { results } = await db
+      .prepare(
+        "SELECT channel_id, task_id, status FROM slack_progress_roots ORDER BY channel_id, task_id",
+      )
+      .all();
+    expect(results).toEqual([
+      { channel_id: "C1", status: "2 of 5 landed", task_id: "task-1" },
+    ]);
+  });
 });
 
 const receiptRows = async (db: D1Database): Promise<unknown[]> => {
