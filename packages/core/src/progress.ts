@@ -786,7 +786,7 @@ export const createSlackProgressEndpoint = (
         ts: await postReply(
           milestone.channel,
           root.rootTs,
-          replyOf(milestone, members),
+          replyOf(milestone, members, redact(milestone.text)),
         ),
       };
     }
@@ -800,10 +800,7 @@ export const createSlackProgressEndpoint = (
   ): Promise<SlackMilestoneOutcome> => {
     const root = await enterRoot(milestone, rootOf(milestone));
     const { narration } = config;
-    const reply =
-      milestone.verbatim === true
-        ? replyOf(milestone, members, redact(milestone.text))
-        : replyOf(milestone, members);
+    const reply = replyOf(milestone, members, redact(milestone.text));
     if (narration === undefined || milestone.verbatim === true) {
       return {
         state: "posted",
