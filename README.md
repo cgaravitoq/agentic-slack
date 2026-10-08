@@ -351,6 +351,7 @@ Joins by other members are ignored, and while `allowedUserIds` is unset any user
 
 The optional `delegation` configuration enables requester-approved tasks for registered runners.
 It takes `repos` (repository names), `authSecret` (the deployment's delegation Worker secret name), and optional `runnerHeaders` mapping header names to Worker secret names.
+Its optional `labels` map (`running`, `failed`, `unknown`) names the word each state notice opens with; a missing or blank value keeps the English default (`Started`, `Failed`, `Outcome unknown`).
 For a runner behind an access gateway, map its service-token headers through `runnerHeaders`; secret values stay out of configuration.
 Only users in `allowedUserIds` receive `delegate_to_conductor({ repo, summary, channel?, threadTs? })`.
 The tool captures the channel's bound thread in code; from an owner's DM it requires an admitted channel and thread.
@@ -370,6 +371,7 @@ Runners authenticate with the delegation bearer on these routes:
 
 Approval sends `{ task }` to the runner's `POST /tasks` with the delegation bearer and configured headers.
 A failed or refused send leaves the task approved and posts a queued notice; only the runner's `running` state posts Started.
+A state notice reads `<label>. <note>` with the redaction every bot message gets, and with `progress.narration` configured it is a narrated turn in the task's thread instead, under the notice's own idempotency key, with that labelled line as the turn's fallback.
 All task transitions compare the expected state and assigned runner in D1.
 A task contains `id`, `repo`, `channel`, `threadTs`, `requester`, `reporters`, `title` (up to 300 characters), `summary`, `rawThread` records (`ts`, `author`, `text`, `permalink`), `state`, and `expiresAt` in epoch milliseconds.
 
