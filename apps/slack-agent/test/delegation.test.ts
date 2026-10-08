@@ -785,6 +785,249 @@ test("task token scopes progress and replies, and verbatim done settles its rece
   ).toBe(401);
 });
 
+const doneAfterCommittedComplete = async (expiryFailures: number) => {
+  const h = await harness();
+  await h.request("/delegation/runners", "POST", JSON.stringify(runner));
+  const { output } = await h.propose();
+  await h.delegation.interaction(click(output.id));
+  await Promise.all(h.background);
+  const response = await h.request(
+    `/delegation/tasks/${output.id}/claim`,
+    "POST",
+    JSON.stringify({ runner: "runner-1" }),
+  );
+  const claim = v.parse(v.object({ token: v.string() }), await response.json());
+  let failures = expiryFailures;
+  const progress = createSlackProgressEndpoint(
+    {
+      authSecret: "PROGRESS_SECRET",
+      labels: {
+        blocked: "Blocked",
+        done: "Done",
+        merged: "Merged",
+        pr: "PR",
+        progress: "Progress",
+        review: "Review",
+        started: "Started",
+      },
+      narration: "Narrate as the owner.",
+    },
+    {
+      bearer: "progress-secret",
+      db: h.db,
+      delegation: {
+        ...h.delegation,
+        async cancelExpiry(stored) {
+          if (failures > 0) {
+            failures -= 1;
+            throw new Error("expiry cancel failed");
+          }
+          await h.delegation.cancelExpiry(stored);
+        },
+      },
+      fetcher: h.fetcher,
+      narrate: async () => {},
+      teamId: "T1",
+      token: "bot-token",
+    },
+  );
+  const answer = await progress.handle(
+    new Request("https://helper.example/progress", {
+      body: JSON.stringify({
+        channel: "C1",
+        id: "done-1",
+        kind: "done",
+        task: `delegation:${output.id}`,
+        text: "Diagnosis",
+        threadTs: "171.1",
+        title: "Fix login",
+        verbatim: true,
+      }),
+      headers: {
+        authorization: `Bearer ${claim.token}`,
+        "content-type": "application/json",
+      },
+      method: "POST",
+    }),
+  );
+  const receipt = await h.db
+    .prepare(
+      "SELECT state, ts FROM progress_receipts WHERE milestone_id = 'done-1'",
+    )
+    .all();
+  const stored = await h.delegation.store.read(output.id);
+  return {
+    receipt: receipt.results,
+    status: answer.status,
+    task: stored?.task.state,
+  };
+};
+
+test("a verbatim done whose first completion pass fails after the commit still finishes the task", async () => {
+  expect(await doneAfterCommittedComplete(1)).toEqual({
+    receipt: [{ state: "posted", ts: "172.1" }],
+    status: 200,
+    task: "done",
+  });
+});
+
+// Both passes failing after the batch committed must not erase the posted ts
+// the batch already stored with the task's done.
+test("a verbatim done whose completion keeps failing after the commit keeps its posted receipt", async () => {
+  expect(await doneAfterCommittedComplete(2)).toEqual({
+    receipt: [{ state: "posted", ts: "172.1" }],
+    status: 500,
+    task: "done",
+  });
+});
+
+const claimedToken = async (
+  h: Awaited<ReturnType<typeof harness>>,
+  summary: string,
+) => {
+  const { output } = await h.propose(summary);
+  await h.delegation.interaction(click(output.id));
+  await Promise.all(h.background);
+  const claimed = await h.request(
+    `/delegation/tasks/${output.id}/claim`,
+    "POST",
+    JSON.stringify({ runner: "runner-1" }),
+  );
+  const { token } = v.parse(
+    v.object({ token: v.string() }),
+    await claimed.json(),
+  );
+  return { output, token };
+};
+
+const claimedDone = async () => {
+  const h = await harness();
+  await h.request("/delegation/runners", "POST", JSON.stringify(runner));
+  const { output, token } = await claimedToken(h, "Fix login");
+  let slackCalls = 0;
+  const progress = createSlackProgressEndpoint(
+    {
+      authSecret: "PROGRESS_SECRET",
+      labels: {
+        blocked: "Blocked",
+        done: "Done",
+        merged: "Merged",
+        pr: "PR",
+        progress: "Progress",
+        review: "Review",
+        started: "Started",
+      },
+    },
+    {
+      bearer: "progress-secret",
+      db: h.db,
+      delegation: h.delegation,
+      fetcher: (input, init) => {
+        slackCalls += 1;
+        const { fetcher } = h;
+        return fetcher(input, init);
+      },
+      narrate: async () => {},
+      teamId: "T1",
+      token: "bot-token",
+    },
+  );
+  const done = {
+    channel: "C1",
+    id: "done-1",
+    kind: "done",
+    task: `delegation:${output.id}`,
+    text: "Diagnosis",
+    threadTs: "171.1",
+    title: "Fix login",
+    verbatim: true,
+  };
+  const post = (body: typeof done, bearer = token) =>
+    progress.handle(
+      new Request("https://helper.example/progress", {
+        body: JSON.stringify(body),
+        headers: {
+          authorization: `Bearer ${bearer}`,
+          "content-type": "application/json",
+        },
+        method: "POST",
+      }),
+    );
+  return { done, h, output, post, slackCalls: () => slackCalls };
+};
+
+// The milestone id is deterministic per text, so a runner whose answer was
+// lost re-posts the same done milestone and must land on its receipt instead
+// of the task token having gone dead with the task.
+test("a repeated verbatim done answers its stored receipt and no new milestone passes the dead token", async () => {
+  const { done, h, post, slackCalls } = await claimedDone();
+  expect(await statusOf(post(done))).toBe(200);
+  const posts = h.posts.length;
+  const calls = slackCalls();
+  const repeat = await post(done);
+  expect(repeat.status).toBe(200);
+  expect(await repeat.json()).toEqual({ ok: true, ts: "172.1" });
+  expect(h.posts).toHaveLength(posts);
+  expect(slackCalls()).toBe(calls);
+  const refused = await post({ ...done, id: "done-2" });
+  expect(refused.status).toBe(401);
+  expect(await refused.json()).toEqual({ error: "unauthorized", ok: false });
+  expect(h.posts).toHaveLength(posts);
+  expect(slackCalls()).toBe(calls);
+  const { results } = await h.db
+    .prepare("SELECT milestone_id FROM progress_receipts ORDER BY milestone_id")
+    .all();
+  expect(results).toEqual([{ milestone_id: "done-1" }]);
+});
+
+// A posted receipt is bound to the task that wrote it, so a task token dead
+// with its own done cannot replay the receipt another task posted.
+test("another task's posted receipt stays unauthorized once its task is done", async () => {
+  const { done, h, post } = await claimedDone();
+  expect(await statusOf(post(done))).toBe(200);
+  const other = await claimedToken(h, "Fix signup");
+  const otherDone = {
+    ...done,
+    id: "done-2",
+    task: `delegation:${other.output.id}`,
+  };
+  expect(await statusOf(post(otherDone, other.token))).toBe(200);
+  const refused = await post(done, other.token);
+  expect(refused.status).toBe(401);
+  expect(await refused.json()).toEqual({ error: "unauthorized", ok: false });
+});
+
+// A completion that runs twice must leave the receipt the first one posted, so
+// a retry after a partial success cannot rewrite the timestamp the thread has.
+test("running the done completion twice converges on one posted receipt and one done task", async () => {
+  const { done, h, output, post, slackCalls } = await claimedDone();
+  expect(await statusOf(post(done))).toBe(200);
+  const posts = h.posts.length;
+  const calls = slackCalls();
+  expect(await statusOf(post(done))).toBe(200);
+  const { results } = await h.db
+    .prepare("SELECT token_hash FROM delegation_tasks WHERE id = ?1")
+    .bind(output.id)
+    .all();
+  const { token_hash: tokenHash } = v.parse(
+    v.object({ token_hash: v.string() }),
+    results[0],
+  );
+  await h.delegation.store.complete(output.id, tokenHash, done.id, "999.9");
+  const receipts = await h.db
+    .prepare(
+      "SELECT milestone_id, state, ts FROM progress_receipts ORDER BY milestone_id",
+    )
+    .all();
+  expect(receipts.results).toEqual([
+    { milestone_id: "done-1", state: "posted", ts: "172.1" },
+  ]);
+  const stored = await h.delegation.store.read(output.id);
+  expect(stored?.task.state).toBe("done");
+  expect(h.posts).toHaveLength(posts);
+  expect(slackCalls()).toBe(calls);
+});
+
 // The narration voice comes from the operator's config and names the owner as
 // the actor, so a delegated milestone's body has to say who actually works.
 test("narrates a delegated milestone as the conductor's work, not the owner's", async () => {
