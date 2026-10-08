@@ -1832,8 +1832,8 @@ describe("narrated progress endpoint", () => {
           "Trusted code closes your reply by linking https://example.com/run, so do not write the tags or the link yourself.",
           "Rewrite this milestone as your reply in that voice: one or two short sentences that use the earlier milestones in this thread as context and say only what this milestone and those earlier milestones say.",
         ].join("\n\n"),
+        idempotencyKey: "progress:evt-1",
         instanceId: "slack:v1:T123:C1:171.1",
-        milestoneId: "evt-1",
       },
     ]);
   });

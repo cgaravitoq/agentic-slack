@@ -1,75 +1,22 @@
 import { expect, spyOn, test } from "bun:test";
-import { Database } from "bun:sqlite";
-import { readdir } from "node:fs/promises";
 import * as v from "valibot";
 import {
   createDelegation,
   createSlackProgressEndpoint,
+  delegationNoticeTurn,
+  defineAgentConfig,
   MODEL_PROVIDER_CLOUDFLARE,
 } from "@agentic-slack/core";
 import type { SlackBlockActionsPayload } from "@agentic-slack/core";
+import type { DelegationLabels } from "../../../packages/core/src/config.ts";
+import type {
+  DelegationNotice,
+  DelegationOptions,
+} from "../../../packages/core/src/delegation.ts";
 import type { SlackProgressTurn } from "../../../packages/core/src/progress.ts";
-import type { DelegationOptions } from "../../../packages/core/src/delegation.ts";
 import { createApp } from "../src/app.ts";
 import { createDelegationStore } from "../../../packages/core/src/delegation-store.ts";
-
-const parameters = v.array(v.union([v.string(), v.number(), v.null()]));
-const isDatabase = (candidate: { prepare: unknown }): candidate is D1Database =>
-  typeof candidate.prepare === "function";
-
-const database = async (): Promise<D1Database> => {
-  const sqlite = new Database(":memory:");
-  const directory = new URL("../migrations/", import.meta.url);
-  const files = await readdir(directory);
-  const sources = await Promise.all(
-    files
-      .filter((name) => name.endsWith(".sql"))
-      .toSorted()
-      .map((file) => Bun.file(new URL(file, directory)).text()),
-  );
-  for (const source of sources) {
-    sqlite.run(source);
-  }
-  const db = {
-    async batch(
-      statements: { run: () => Promise<{ meta: { changes: number } }> }[],
-    ) {
-      sqlite.run("BEGIN");
-      try {
-        const results = await Promise.all(
-          statements.map((statement) => statement.run()),
-        );
-        sqlite.run("COMMIT");
-        return results;
-      } catch (error) {
-        sqlite.run("ROLLBACK");
-        throw error;
-      }
-    },
-    prepare(sql: string) {
-      const statement = sqlite.query(sql);
-      let values: v.InferOutput<typeof parameters> = [];
-      return {
-        all() {
-          return Promise.resolve({ results: statement.all(...values) });
-        },
-        bind(...input: unknown[]) {
-          values = v.parse(parameters, input);
-          return this;
-        },
-        run() {
-          return Promise.resolve({
-            meta: { changes: statement.run(...values).changes },
-          });
-        },
-      };
-    },
-  };
-  if (!isDatabase(db)) {
-    throw new Error("Invalid test database");
-  }
-  return db;
-};
+import { database } from "./d1.ts";
 
 const proposal = {
   channel: "C1",
@@ -178,7 +125,12 @@ const runner = {
   url: "https://runner.example",
 };
 const harness = async (
-  options: { repos?: readonly string[]; thread?: typeof rawThread } = {},
+  options: {
+    labels?: DelegationLabels;
+    narrateNotice?: (notice: DelegationNotice) => Promise<void>;
+    repos?: readonly string[];
+    thread?: typeof rawThread;
+  } = {},
 ) => {
   const db = await database();
   await db
@@ -282,7 +234,11 @@ const harness = async (
     throw new Error(`Unexpected request ${url.pathname}`);
   };
   const delegation = createDelegation(
-    { authSecret: "DELEGATION_SECRET", repos: options.repos ?? ["example"] },
+    {
+      authSecret: "DELEGATION_SECRET",
+      labels: options.labels,
+      repos: options.repos ?? ["example"],
+    },
     {
       bearer: SECRET,
       botToken: "test-bot-token",
@@ -292,6 +248,7 @@ const harness = async (
       },
       db,
       fetcher,
+      narrateNotice: options.narrateNotice,
       runnerHeaders: {
         "CF-Access-Client-Id": "client-id",
         "CF-Access-Client-Secret": "client-secret",
@@ -1313,6 +1270,153 @@ test("a repeated runner state answers 200 once and another runner is still refus
   expect(await report("failed")).toBe(200);
   expect(await report("failed")).toBe(200);
   expect(h.posts.map((post) => post.text)).toEqual(["Started.", "Failed."]);
+});
+
+test("delegation labels resolve from config and fall back when blank or absent", () => {
+  const configured = defineAgentConfig({
+    delegation: {
+      authSecret: "DELEGATION_SECRET",
+      labels: { failed: "  ", running: "Iniciado" },
+      repos: ["example"],
+    },
+    description: "Slack helper",
+    name: "Helper",
+    ownerInstructions: "Help the requester.",
+  });
+  expect(configured.delegation?.labels).toEqual({
+    failed: "Failed",
+    running: "Iniciado",
+    unknown: "Outcome unknown",
+  });
+});
+
+test("a Spanish deployment posts its labelled notice directly, once per state", async () => {
+  const h = await harness({
+    labels: { failed: "Fallido", running: "Iniciado", unknown: "Desconocido" },
+  });
+  await h.delegation.store.register(runner);
+  await h.delegation.store.propose(proposal, "instance-1");
+  await h.delegation.store.approve(proposal.id, runner.name, "U1");
+  await h.delegation.store.claim(proposal.id, runner.name);
+  const report = (state: "failed" | "running" | "unknown", note?: string) =>
+    statusOf(
+      h.request(
+        `/delegation/tasks/${proposal.id}/state`,
+        "POST",
+        JSON.stringify({ note, runner: runner.name, state }),
+      ),
+    );
+  expect(await report("running")).toBe(200);
+  expect(await report("running")).toBe(200);
+  expect(await report("unknown", "Budget ended <!here>")).toBe(200);
+  expect(await report("failed", "Stop confirmed")).toBe(200);
+  expect(h.posts.map((post) => post.text)).toEqual([
+    "Iniciado.",
+    "Desconocido. Budget ended ",
+    "Fallido. Stop confirmed",
+  ]);
+});
+
+test("delegation without labels keeps today's English notice", async () => {
+  const h = await harness();
+  await h.delegation.store.register(runner);
+  await h.delegation.store.propose(proposal, "instance-1");
+  await h.delegation.store.approve(proposal.id, runner.name, "U1");
+  await h.delegation.store.claim(proposal.id, runner.name);
+  const report = (state: "failed" | "running" | "unknown", note?: string) =>
+    statusOf(
+      h.request(
+        `/delegation/tasks/${proposal.id}/state`,
+        "POST",
+        JSON.stringify({ note, runner: runner.name, state }),
+      ),
+    );
+  expect(await report("running")).toBe(200);
+  expect(await report("unknown", "Budget ended")).toBe(200);
+  expect(await report("failed", "Stop confirmed")).toBe(200);
+  expect(h.posts.map((post) => post.text)).toEqual([
+    "Started.",
+    "Outcome unknown. Budget ended",
+    "Failed. Stop confirmed",
+  ]);
+});
+
+test("a narrated deployment hands the labelled notice to the narration turn and posts nothing itself", async () => {
+  const notices: DelegationNotice[] = [];
+  const turns: SlackProgressTurn[] = [];
+  const h = await harness({
+    labels: { running: "Iniciado" },
+    narrateNotice: (notice) => {
+      notices.push(notice);
+      turns.push(
+        delegationNoticeTurn(notice, "Write in Spanish, warm and brief.", "T1"),
+      );
+      return Promise.resolve();
+    },
+  });
+  await h.delegation.store.register(runner);
+  await h.delegation.store.propose(proposal, "instance-1");
+  await h.delegation.store.approve(proposal.id, runner.name, "U1");
+  await h.delegation.store.claim(proposal.id, runner.name);
+  const posted = h.posts.length;
+  expect(
+    await statusOf(
+      h.request(
+        `/delegation/tasks/${proposal.id}/state`,
+        "POST",
+        JSON.stringify({
+          note: "Budget ended <!here>",
+          runner: runner.name,
+          state: "running",
+        }),
+      ),
+    ),
+  ).toBe(200);
+  await Promise.all(h.background);
+  expect(h.posts.length).toBe(posted);
+  expect(notices).toHaveLength(1);
+  expect(notices[0]?.conductor).toBe("runner-1");
+  expect(notices[0]?.label).toBe("Iniciado");
+  expect(notices[0]?.note).toBe("Budget ended ");
+  expect(notices[0]?.state).toBe("running");
+  expect(notices[0]?.task.id).toBe(proposal.id);
+  expect(turns[0]?.idempotencyKey).toBe(`delegation:${proposal.id}:running`);
+  expect(turns[0]?.binding.fallbackText).toBe("Iniciado. Budget ended ");
+  expect(turns[0]?.binding.threadTs).toBe("171.1");
+  expect(turns[0]?.body).toContain("Status: Iniciado");
+  expect(turns[0]?.body).toContain("Milestone: Iniciado. Budget ended ");
+  expect(turns[0]?.body).toContain(
+    "Delegation: the conductor runner-1 is doing this task on the owner's behalf",
+  );
+  expect(turns[0]?.body).toContain(
+    "Rewrite this milestone as your reply in that voice",
+  );
+});
+
+test("a notice whose narration turn cannot start still posts the labelled line", async () => {
+  const h = await harness({
+    labels: { running: "Iniciado" },
+    narrateNotice: () => Promise.reject(new Error("agent unavailable")),
+  });
+  await h.delegation.store.register(runner);
+  await h.delegation.store.propose(proposal, "instance-1");
+  await h.delegation.store.approve(proposal.id, runner.name, "U1");
+  await h.delegation.store.claim(proposal.id, runner.name);
+  expect(
+    await statusOf(
+      h.request(
+        `/delegation/tasks/${proposal.id}/state`,
+        "POST",
+        JSON.stringify({
+          note: "Budget ended",
+          runner: runner.name,
+          state: "running",
+        }),
+      ),
+    ),
+  ).toBe(200);
+  await Promise.all(h.background);
+  expect(h.posts.map((post) => post.text)).toEqual(["Iniciado. Budget ended"]);
 });
 
 test("expiry survives a refused Slack notice and leaves the task expired", async () => {

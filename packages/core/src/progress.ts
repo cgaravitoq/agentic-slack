@@ -2,7 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import type { SlackThreadRef } from "@flue/slack";
 import * as v from "valibot";
 import { createSqlSlackChannelAdmissionStore } from "./admission.ts";
-import type { Delegation } from "./delegation.ts";
+import type { Delegation, DelegationNotice } from "./delegation.ts";
 import type { StoredDelegationTask } from "./delegation-store.ts";
 import { closingMrkdwn, MAX_SLACK_MESSAGE_LENGTH, redact } from "./delivery.ts";
 import type { SlackDeliveryBinding } from "./delivery.ts";
@@ -423,8 +423,8 @@ interface SlackProgressChannel {
 export interface SlackProgressTurn {
   readonly binding: SlackDeliveryBinding;
   readonly body: string;
+  readonly idempotencyKey: string;
   readonly instanceId: string;
-  readonly milestoneId: string;
 }
 
 export interface SlackProgressEndpointOptions {
@@ -520,6 +520,16 @@ const attachedOf = (
       ];
 };
 
+const conductorOf = (conductor: string | undefined): string[] =>
+  conductor === undefined
+    ? []
+    : [
+        `Delegation: the conductor ${conductor} is doing this task on the owner's behalf; name the conductor, never the owner, as the one working.`,
+      ];
+
+const noticeLine = (label: string, note: string): string =>
+  `${label}.${note === "" ? "" : ` ${note}`}`;
+
 const narrationBody = (
   milestone: SlackProgressReplyMilestone,
   members: readonly SlackMember[],
@@ -530,16 +540,48 @@ const narrationBody = (
   [
     narration,
     `Task: ${milestone.task}`,
-    ...(conductor === undefined
-      ? []
-      : [
-          `Delegation: the conductor ${conductor} is doing this task on the owner's behalf; name the conductor, never the owner, as the one working.`,
-        ]),
+    ...conductorOf(conductor),
     `Status: ${labels[milestone.kind]}`,
     `Milestone: ${milestone.text}`,
     ...attachedOf(milestone, members),
     NARRATION_RULE,
   ].join("\n\n");
+
+// A delegated task's notice is the runner's own evidence, so it narrates with
+// the milestone instruction instead of a second prompt, under a key of its own
+// so a retried notice of the same state never reaches the thread twice.
+export const delegationNoticeTurn = (
+  notice: DelegationNotice,
+  narration: string,
+  teamId: string,
+): SlackProgressTurn => {
+  const text = noticeLine(notice.label, notice.note);
+  return {
+    binding: {
+      channelId: notice.task.channel,
+      fallbackText: text,
+      recipientTeamId: teamId,
+      recipientUserId: notice.task.requester,
+      surface: "channel",
+      taskUpdates: "hidden",
+      threadTs: notice.task.threadTs,
+    },
+    body: [
+      narration,
+      `Task: delegation:${notice.task.id}`,
+      ...conductorOf(notice.conductor),
+      `Status: ${notice.label}`,
+      `Milestone: ${text}`,
+      NARRATION_RULE,
+    ].join("\n\n"),
+    idempotencyKey: `delegation:${notice.task.id}:${notice.state}`,
+    instanceId: slackInstanceId({
+      channelId: notice.task.channel,
+      teamId,
+      threadTs: notice.task.threadTs,
+    }),
+  };
+};
 
 const milestoneFrom = async (
   request: Request,
@@ -858,12 +900,12 @@ export const createSlackProgressEndpoint = (
           config.labels,
           conductor,
         ),
+        idempotencyKey: `progress:${milestone.id}`,
         instanceId: slackInstanceId({
           channelId: milestone.channel,
           teamId: options.teamId,
           threadTs: root.rootTs,
         }),
-        milestoneId: milestone.id,
       });
       return { state: "narrated" };
     } catch (error: unknown) {

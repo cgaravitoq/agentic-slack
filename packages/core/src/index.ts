@@ -40,7 +40,10 @@ export type { SlackDeliveryBinding, SlackDeliveryStore } from "./delivery.ts";
 export { generateSlackManifest } from "./manifest.ts";
 export { createSlackMentionTool } from "./mention.ts";
 export { composeInstructions } from "./prompt.ts";
-export { createSlackProgressEndpoint } from "./progress.ts";
+export {
+  createSlackProgressEndpoint,
+  delegationNoticeTurn,
+} from "./progress.ts";
 export type { SlackProgressEndpoint, SlackProgressTurn } from "./progress.ts";
 export {
   createSlackReadTools,
@@ -70,4 +73,4 @@ export type {
 export type { SlackBlockActionsPayload } from "@flue/slack";
 
 export { createDelegation } from "./delegation.ts";
-export type { Delegation } from "./delegation.ts";
+export type { Delegation, DelegationNotice } from "./delegation.ts";
