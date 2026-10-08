@@ -185,15 +185,29 @@ export const createDelegationStore = (db: D1Database) => {
       await db.batch([
         db
           .prepare(
-            "UPDATE progress_receipts SET state = 'posted', ts = ?2, updated_at = ?3 WHERE milestone_id = ?1 AND state = 'in_flight'",
+            "UPDATE progress_receipts SET state = 'posted', ts = ?2, updated_at = ?3, task_id = ?4 WHERE milestone_id = ?1 AND state = 'in_flight'",
           )
-          .bind(milestoneId, ts, now),
+          .bind(milestoneId, ts, now, id),
         db
           .prepare(
             "UPDATE delegation_tasks SET state = 'done' WHERE id = ?1 AND token_hash = ?2 AND state IN ('claimed', 'running', 'unknown') AND EXISTS (SELECT 1 FROM progress_receipts WHERE milestone_id = ?3 AND state = 'posted' AND ts = ?4)",
           )
           .bind(id, tokenHash, milestoneId, ts),
       ]);
+    },
+    async completedTask(
+      token: string,
+      milestoneId: string,
+    ): Promise<StoredDelegationTask | undefined> {
+      const { results } = await db
+        .prepare(
+          "SELECT * FROM delegation_tasks WHERE token_hash = ?1 AND state = 'done' AND EXISTS (SELECT 1 FROM progress_receipts WHERE milestone_id = ?2 AND state = 'posted' AND task_id = delegation_tasks.id)",
+        )
+        .bind(hashToken(token), milestoneId)
+        .all();
+      return results[0] === undefined
+        ? undefined
+        : storedTask(v.parse(rowSchema, results[0]));
     },
     async expire(id: string, now = Date.now()): Promise<boolean> {
       const result = await db

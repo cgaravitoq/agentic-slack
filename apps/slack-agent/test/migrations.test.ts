@@ -158,6 +158,7 @@ describe("D1 migration schema", () => {
       "0006_slack_progress_roots.sql",
       "0007_progress_receipts.sql",
       "0008_delegation.sql",
+      "0010_progress_receipts_task.sql",
     ]);
     expect(
       applyOrder([
@@ -192,6 +193,7 @@ describe("D1 migration schema", () => {
       "CREATE TABLE IF NOT EXISTS progress_receipts",
     );
     expect(batches[6]).toContain("CREATE INDEX");
+    expect(batches[8]).toContain("ALTER TABLE progress_receipts");
   });
 
   test("adds the owned column to the roots stored before it", () => {
