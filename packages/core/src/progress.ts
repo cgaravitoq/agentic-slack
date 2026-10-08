@@ -487,6 +487,11 @@ const replyOf = (
   return closing === "" ? text : `${text}\n${closing}`;
 };
 
+const bearerToken = (request: Request): string =>
+  /^Bearer (?<token>[A-Za-z0-9_-]+)$/u.exec(
+    request.headers.get("authorization") ?? "",
+  )?.groups?.token ?? "";
+
 // The progress route reaches a conversation without an ingress channel object,
 // so it spells the canonical id out; worker-stream.test.ts pins it to the id a
 // mention in the same thread gets.
@@ -607,6 +612,31 @@ const scopeMatches = (
   (channel === task.task.channel &&
     taskId === `delegation:${task.task.id}` &&
     (threadTs === undefined || threadTs === task.task.threadTs));
+
+const milestoneRefusal = (
+  milestone: SlackProgressMilestone,
+  taskToken: StoredDelegationTask | undefined,
+): Response | undefined => {
+  if (
+    milestone.status !== undefined &&
+    milestone.status.length > STATUS_LIMIT
+  ) {
+    return refusal(400, "status_too_long");
+  }
+  if (
+    taskToken !== undefined &&
+    (milestone.threadTs === undefined ||
+      !scopeMatches(
+        taskToken,
+        milestone.channel,
+        milestone.task,
+        milestone.threadTs,
+      ))
+  ) {
+    return refusal(403, "token_scope");
+  }
+  return undefined;
+};
 
 export const createSlackProgressEndpoint = (
   config: ResolvedSlackProgressConfig,
@@ -929,6 +959,7 @@ export const createSlackProgressEndpoint = (
     outcome: SlackMilestoneOutcome,
     taskToken: StoredDelegationTask | undefined,
   ): Promise<void> => {
+    let committed = false;
     const write = async (): Promise<void> => {
       const { delegation } = options;
       if (
@@ -945,6 +976,7 @@ export const createSlackProgressEndpoint = (
           milestone.id,
           outcome.ts,
         );
+        committed = true;
         const stored = await delegation.store.read(taskToken.task.id);
         if (stored?.task.state === "done") {
           await delegation.cancelExpiry(stored);
@@ -952,6 +984,7 @@ export const createSlackProgressEndpoint = (
         return;
       }
       await receipts.complete(milestone.id, outcome);
+      committed = true;
     };
     try {
       await write();
@@ -959,7 +992,7 @@ export const createSlackProgressEndpoint = (
       try {
         await write();
       } catch (error: unknown) {
-        if (outcome.state === "posted") {
+        if (outcome.state === "posted" && !committed) {
           // A receipt left in flight after the post is reclaimed and posts the
           // milestone twice, so a last resort settles it without its ts.
           try {
@@ -979,49 +1012,40 @@ export const createSlackProgressEndpoint = (
   const bearerTask = async (
     request: Request,
   ): Promise<StoredDelegationTask | undefined> =>
-    await options.delegation?.store.tokenTask(
-      /^Bearer (?<token>[A-Za-z0-9_-]+)$/u.exec(
-        request.headers.get("authorization") ?? "",
-      )?.groups?.token ?? "",
-    );
+    await options.delegation?.store.tokenTask(bearerToken(request));
 
   const authorizeTask = async (
     request: Request,
+    milestoneId?: string,
   ): Promise<StoredDelegationTask | Response | undefined> => {
     if (authorized(request)) {
       return undefined;
     }
-    return (await bearerTask(request)) ?? refusal(401, "unauthorized");
+    const task =
+      (await bearerTask(request)) ??
+      (milestoneId === undefined
+        ? undefined
+        : await options.delegation?.store.completedTask(
+            bearerToken(request),
+            milestoneId,
+          ));
+    return task ?? refusal(401, "unauthorized");
   };
 
   return {
     authSecret: config.authSecret,
     async handle(request) {
-      const taskToken = await authorizeTask(request);
+      const milestone = await milestoneFrom(request);
+      const taskToken = await authorizeTask(request, milestone?.id);
       if (taskToken instanceof Response) {
         return taskToken;
       }
-      const milestone = await milestoneFrom(request);
       if (milestone === undefined) {
         return refusal(400, "invalid_request");
       }
-      if (
-        milestone.status !== undefined &&
-        milestone.status.length > STATUS_LIMIT
-      ) {
-        return refusal(400, "status_too_long");
-      }
-      if (
-        taskToken !== undefined &&
-        (milestone.threadTs === undefined ||
-          !scopeMatches(
-            taskToken,
-            milestone.channel,
-            milestone.task,
-            milestone.threadTs,
-          ))
-      ) {
-        return refusal(403, "token_scope");
+      const invalid = milestoneRefusal(milestone, taskToken);
+      if (invalid !== undefined) {
+        return invalid;
       }
       try {
         const claim = await receipts.claim(milestone.id);

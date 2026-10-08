@@ -159,6 +159,7 @@ describe("D1 migration schema", () => {
       "0007_progress_receipts.sql",
       "0008_delegation.sql",
       "0009_progress_root_status.sql",
+      "0010_progress_receipts_task.sql",
     ]);
     expect(
       applyOrder([
@@ -196,6 +197,7 @@ describe("D1 migration schema", () => {
     expect(batches[8]).toContain(
       "ALTER TABLE slack_progress_roots ADD COLUMN status",
     );
+    expect(batches[9]).toContain("ALTER TABLE progress_receipts");
   });
 
   test("adds the owned column to the roots stored before it", () => {
