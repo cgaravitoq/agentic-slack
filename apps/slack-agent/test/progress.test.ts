@@ -38,7 +38,7 @@ class FakeD1 {
   >();
   readonly roots = new Map<
     string,
-    { owned: number; root_text: string; root_ts: string }
+    { owned: number; root_text: string; root_ts: string; status: string | null }
   >();
   readonly seen = new Set<string>();
   private values: unknown[] = [];
@@ -83,10 +83,12 @@ class FakeD1 {
             this.roots.delete(this.rootKey());
             return Promise.resolve({ meta: { changes: 1 } });
           }
+          const status = v.safeParse(v.nullable(v.string()), this.values[5]);
           this.roots.set(this.rootKey(), {
             owned: Number(this.values[4]),
             root_text: String(this.values[3]),
             root_ts: String(this.values[2]),
+            status: status.success ? status.output : null,
           });
           return Promise.resolve({ meta: { changes: 1 } });
         }
@@ -344,8 +346,9 @@ interface Milestone {
   readonly id: string;
   readonly kind: string;
   readonly mentions?: readonly string[];
+  readonly status?: string;
   readonly task: string;
-  readonly text: string;
+  readonly text: string | undefined;
   readonly threadTs?: string;
   readonly title: string;
   readonly url?: string;
@@ -608,7 +611,12 @@ describe("progress endpoint", () => {
       },
     ]);
     expect([...db.roots.values()]).toEqual([
-      { owned: 1, root_text: "Release 42 · Started", root_ts: "171.1" },
+      {
+        owned: 1,
+        root_text: "Release 42 · Started",
+        root_ts: "171.1",
+        status: null,
+      },
     ]);
     expect(
       turns.map((turn) => [turn.binding.channelId, turn.instanceId]),
@@ -757,7 +765,12 @@ describe("progress endpoint", () => {
     expect(await response.json()).toEqual({ ok: true, ts: "171.1" });
     expect(calls).toEqual(rootCalls);
     expect([...db.roots.values()]).toEqual([
-      { owned: 1, root_text: "Release 42 · Started", root_ts: "171.1" },
+      {
+        owned: 1,
+        root_text: "Release 42 · Started",
+        root_ts: "171.1",
+        status: null,
+      },
     ]);
     expect(db.receipts.get("evt-1")).toMatchObject({
       state: "posted",
@@ -1061,7 +1074,12 @@ describe("progress endpoint", () => {
       "555.000",
     ]);
     expect([...db.roots.values()]).toEqual([
-      { owned: 0, root_text: "Release 42 · Started", root_ts: "555.000" },
+      {
+        owned: 0,
+        root_text: "Release 42 · Started",
+        root_ts: "555.000",
+        status: null,
+      },
     ]);
   });
 
@@ -1091,8 +1109,18 @@ describe("progress endpoint", () => {
     expect([blocked.status, renamed.status]).toEqual([200, 200]);
     expect(calls.map((call) => call.method)).not.toContain("chat.update");
     expect([...db.roots.values()]).toEqual([
-      { owned: 0, root_text: "Release 42 · Started", root_ts: "555.000" },
-      { owned: 0, root_text: "Release 42 · Started", root_ts: "555.000" },
+      {
+        owned: 0,
+        root_text: "Release 42 · Started",
+        root_ts: "555.000",
+        status: null,
+      },
+      {
+        owned: 0,
+        root_text: "Release 42 · Started",
+        root_ts: "555.000",
+        status: null,
+      },
     ]);
   });
 
@@ -1200,7 +1228,12 @@ describe("progress endpoint", () => {
       method: "chat.postMessage",
     });
     expect([...db.roots.values()]).toEqual([
-      { owned: 1, root_text: "Release 42 · Started", root_ts: "171.1" },
+      {
+        owned: 1,
+        root_text: "Release 42 · Started",
+        root_ts: "171.1",
+        status: null,
+      },
     ]);
   });
 
@@ -1238,8 +1271,375 @@ describe("progress endpoint", () => {
       method: "chat.postMessage",
     });
     expect([...db.roots.values()]).toEqual([
-      { owned: 1, root_text: "Release 42 · Blocked", root_ts: "171.1" },
+      {
+        owned: 1,
+        root_text: "Release 42 · Blocked",
+        root_ts: "171.1",
+        status: null,
+      },
     ]);
+  });
+});
+
+const ROOT_TS = "171.1";
+const REPLY_TS = "171.2";
+
+describe("progress root status", () => {
+  const statusRecorder =
+    (
+      calls: RecordedCall[],
+      refusals: readonly (string | undefined)[] = [],
+    ): Fetcher =>
+    (input, init) => {
+      const url = v.parse(v.string(), input);
+      const method = url.slice(url.lastIndexOf("/") + 1);
+      const attempt = calls.length;
+      const body = callBody(init);
+      calls.push({ body, method });
+      const refusal = refusals[attempt];
+      if (refusal !== undefined) {
+        return Promise.resolve(Response.json({ error: refusal, ok: false }));
+      }
+      // Slack answers the root and each reply with its own ts, so a test can
+      // tell the root's receipt from the reply's.
+      return Promise.resolve(
+        Response.json({
+          ok: true,
+          ts: body.thread_ts === undefined ? ROOT_TS : REPLY_TS,
+        }),
+      );
+    };
+
+  const statusEndpoint = (
+    db: FakeD1,
+    calls: RecordedCall[],
+    refusals: readonly (string | undefined)[] = [],
+  ) => {
+    db.admissions.set("C1", ADMITTED_BY);
+    return endpointFor(db, calls, {
+      fetcher: strictFetch(statusRecorder(calls, refusals)),
+    });
+  };
+
+  const rootStatus = (
+    status: string,
+    overrides: Partial<Milestone> = {},
+  ): Request => postMilestone({ ...overrides, status, text: undefined });
+
+  test("edits the owned root for a root-only milestone and answers that root without a reply", async () => {
+    const db = new FakeD1();
+    const calls: RecordedCall[] = [];
+    const endpoint = statusEndpoint(db, calls);
+
+    const started = await endpoint.handle(postMilestone());
+    const status = await endpoint.handle(
+      rootStatus("2 of 5 landed", { id: "evt-2" }),
+    );
+
+    expect(await started.json()).toEqual({ ok: true, ts: REPLY_TS });
+    expect(status.status).toBe(200);
+    expect(await status.json()).toEqual({ ok: true, ts: ROOT_TS });
+    expect(calls).toEqual([
+      {
+        body: { channel: "C1", text: "Release 42 · Started" },
+        method: "chat.postMessage",
+      },
+      {
+        body: {
+          channel: "C1",
+          text: "Kicked off\n<https://example.com/run>",
+          thread_ts: ROOT_TS,
+        },
+        method: "chat.postMessage",
+      },
+      {
+        body: {
+          channel: "C1",
+          text: "Release 42 · Started · 2 of 5 landed",
+          ts: ROOT_TS,
+        },
+        method: "chat.update",
+      },
+    ]);
+    expect(db.roots.get("C1\u0000release-42")).toEqual({
+      owned: 1,
+      root_text: "Release 42 · Started · 2 of 5 landed",
+      root_ts: ROOT_TS,
+      status: "2 of 5 landed",
+    });
+    expect(db.receipts.get("evt-2")).toMatchObject({
+      state: "posted",
+      ts: ROOT_TS,
+    });
+  });
+
+  test("answers the replay of a root-only milestone from its receipt without a Slack call", async () => {
+    const db = new FakeD1();
+    const calls: RecordedCall[] = [];
+    const endpoint = statusEndpoint(db, calls);
+
+    await endpoint.handle(postMilestone());
+    const first = await endpoint.handle(rootStatus("Halfway", { id: "evt-2" }));
+    const retryCalls: RecordedCall[] = [];
+    const retried = await endpointFor(db, retryCalls, {
+      fetcher: strictFetch(statusRecorder(retryCalls)),
+    }).handle(rootStatus("Halfway", { id: "evt-2" }));
+
+    expect(await first.json()).toEqual({ ok: true, ts: ROOT_TS });
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual({ ok: true, ts: ROOT_TS });
+    expect(retryCalls).toEqual([]);
+    expect(calls).toHaveLength(3);
+  });
+
+  test("renders the stored status on a later milestone that sends none", async () => {
+    const db = new FakeD1();
+    const calls: RecordedCall[] = [];
+    const endpoint = statusEndpoint(db, calls);
+
+    const first = await endpoint.handle(rootStatus("2 of 5 landed"));
+    const later = await endpoint.handle(
+      postMilestone({
+        id: "evt-2",
+        kind: "blocked",
+        text: "Waiting on review",
+      }),
+    );
+
+    expect(await first.json()).toEqual({ ok: true, ts: ROOT_TS });
+    expect(await later.json()).toEqual({ ok: true, ts: REPLY_TS });
+    expect(calls).toEqual([
+      {
+        body: {
+          channel: "C1",
+          text: "Release 42 · Started · 2 of 5 landed",
+        },
+        method: "chat.postMessage",
+      },
+      {
+        body: {
+          channel: "C1",
+          text: "Release 42 · Blocked · 2 of 5 landed",
+          ts: ROOT_TS,
+        },
+        method: "chat.update",
+      },
+      {
+        body: {
+          channel: "C1",
+          text: "Waiting on review\n<https://example.com/run>",
+          thread_ts: ROOT_TS,
+        },
+        method: "chat.postMessage",
+      },
+    ]);
+  });
+
+  test("updates the root before replying when a milestone carries a status and text", async () => {
+    const db = new FakeD1();
+    const calls: RecordedCall[] = [];
+    const endpoint = statusEndpoint(db, calls);
+
+    await endpoint.handle(postMilestone());
+    const both = await endpoint.handle(
+      postMilestone({
+        id: "evt-2",
+        kind: "pr",
+        status: "1 of 5 landed",
+        text: "Opened the pull request",
+      }),
+    );
+
+    expect(await both.json()).toEqual({ ok: true, ts: REPLY_TS });
+    expect(calls.map((call) => call.method)).toEqual([
+      "chat.postMessage",
+      "chat.postMessage",
+      "chat.update",
+      "chat.postMessage",
+    ]);
+    expect(calls[2]).toEqual({
+      body: {
+        channel: "C1",
+        text: "Release 42 · Pull request · 1 of 5 landed",
+        ts: ROOT_TS,
+      },
+      method: "chat.update",
+    });
+    expect(db.receipts.get("evt-2")).toMatchObject({
+      state: "posted",
+      ts: REPLY_TS,
+    });
+  });
+
+  test("stores the status of a root-only milestone on a thread it does not own and leaves it alone", async () => {
+    const db = new FakeD1();
+    const calls: RecordedCall[] = [];
+    const endpoint = statusEndpoint(db, calls);
+
+    await endpoint.handle(postMilestone({ threadTs: "555.000" }));
+    const status = await endpoint.handle(
+      rootStatus("2 of 5 landed", { id: "evt-2", threadTs: "555.000" }),
+    );
+    const later = await endpoint.handle(
+      postMilestone({
+        id: "evt-3",
+        kind: "blocked",
+        text: "Waiting on review",
+        threadTs: "555.000",
+      }),
+    );
+
+    expect(await status.json()).toEqual({ ok: true, ts: "555.000" });
+    expect(await later.json()).toEqual({ ok: true, ts: REPLY_TS });
+    expect(calls.map((call) => call.method)).not.toContain("chat.update");
+    expect(calls.filter((call) => call.body.thread_ts === "555.000")).toEqual([
+      {
+        body: {
+          channel: "C1",
+          text: "Kicked off\n<https://example.com/run>",
+          thread_ts: "555.000",
+        },
+        method: "chat.postMessage",
+      },
+      {
+        body: {
+          channel: "C1",
+          text: "Waiting on review\n<https://example.com/run>",
+          thread_ts: "555.000",
+        },
+        method: "chat.postMessage",
+      },
+    ]);
+    expect(db.roots.get("C1\u0000release-42")).toEqual({
+      owned: 0,
+      root_text: "Release 42 · Started",
+      root_ts: "555.000",
+      status: "2 of 5 landed",
+    });
+    expect(db.receipts.get("evt-2")).toMatchObject({
+      state: "posted",
+      ts: "555.000",
+    });
+  });
+
+  test("refuses a status longer than 300 characters after redaction without clamping it", async () => {
+    const db = new FakeD1();
+    const calls: RecordedCall[] = [];
+    const endpoint = statusEndpoint(db, calls);
+
+    const refused = await endpoint.handle(rootStatus("x".repeat(301)));
+    const boundary = await endpoint.handle(
+      rootStatus("x".repeat(300), { id: "evt-2" }),
+    );
+    const redacted = await endpoint.handle(
+      rootStatus(`xoxb-${"x".repeat(400)}`, { id: "evt-3" }),
+    );
+
+    expect(refused.status).toBe(400);
+    expect(await refused.json()).toEqual({
+      error: "status_too_long",
+      ok: false,
+    });
+    expect(db.receipts.has("evt-1")).toBe(false);
+    expect(boundary.status).toBe(200);
+    expect(redacted.status).toBe(200);
+    expect(calls).toEqual([
+      {
+        body: {
+          channel: "C1",
+          text: `Release 42 · Started · ${"x".repeat(300)}`,
+        },
+        method: "chat.postMessage",
+      },
+      {
+        body: {
+          channel: "C1",
+          text: "Release 42 · Started · [secret]",
+          ts: ROOT_TS,
+        },
+        method: "chat.update",
+      },
+    ]);
+  });
+
+  test("answers 500 when Slack refuses the root edit a root-only milestone is, and lets the retry through", async () => {
+    const db = new FakeD1();
+    const calls: RecordedCall[] = [];
+    await statusEndpoint(db, calls).handle(postMilestone());
+
+    const refusedCalls: RecordedCall[] = [];
+    const refused = await statusEndpoint(db, refusedCalls, [
+      "edit_window_closed",
+    ]).handle(rootStatus("Halfway", { id: "evt-2" }));
+
+    expect(refused.status).toBe(500);
+    expect(await refused.json()).toEqual({ error: "slack_failed", ok: false });
+    expect(refusedCalls.map((call) => call.method)).toEqual(["chat.update"]);
+    expect(db.receipts.has("evt-2")).toBe(false);
+    expect(db.roots.get("C1\u0000release-42")?.root_text).toBe(
+      "Release 42 · Started",
+    );
+
+    const retriedCalls: RecordedCall[] = [];
+    const retried = await statusEndpoint(db, retriedCalls).handle(
+      rootStatus("Halfway", { id: "evt-2" }),
+    );
+
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toEqual({ ok: true, ts: ROOT_TS });
+    expect(retriedCalls).toEqual([
+      {
+        body: {
+          channel: "C1",
+          text: "Release 42 · Started · Halfway",
+          ts: ROOT_TS,
+        },
+        method: "chat.update",
+      },
+    ]);
+    expect(db.roots.get("C1\u0000release-42")?.status).toBe("Halfway");
+  });
+
+  test("keeps the status of a replied milestone whose root edit Slack refuses, and renders it on the next one", async () => {
+    const db = new FakeD1();
+    const calls: RecordedCall[] = [];
+    await statusEndpoint(db, calls).handle(postMilestone());
+
+    const refusedCalls: RecordedCall[] = [];
+    const replied = await statusEndpoint(db, refusedCalls, [
+      "edit_window_closed",
+    ]).handle(
+      postMilestone({
+        id: "evt-2",
+        kind: "pr",
+        status: "1 of 5 landed",
+        text: "Opened the pull request",
+      }),
+    );
+
+    expect(await replied.json()).toEqual({ ok: true, ts: REPLY_TS });
+    expect(refusedCalls.map((call) => call.method)).toEqual([
+      "chat.update",
+      "chat.postMessage",
+    ]);
+
+    const laterCalls: RecordedCall[] = [];
+    await statusEndpoint(db, laterCalls).handle(
+      postMilestone({
+        id: "evt-3",
+        kind: "blocked",
+        text: "Waiting on review",
+      }),
+    );
+
+    expect(laterCalls[0]).toEqual({
+      body: {
+        channel: "C1",
+        text: "Release 42 · Blocked · 1 of 5 landed",
+        ts: ROOT_TS,
+      },
+      method: "chat.update",
+    });
   });
 });
 
@@ -1667,6 +2067,7 @@ const repliesEndpoint = (db: FakeD1, calls: RecordedCall[]) => {
     owned: 1,
     root_text: "Release 42 · Started",
     root_ts: "171.1",
+    status: null,
   });
   return endpointFor(db, calls, {
     fetcher: strictFetch(threadReader(calls)),
@@ -1728,6 +2129,7 @@ const longThreadEndpoint = (calls: RecordedCall[], replies: number) => {
     owned: 1,
     root_text: "Release 42 · Started",
     root_ts: LONG_ROOT_TS,
+    status: null,
   });
   return endpointFor(db, calls, {
     fetcher: strictFetch(pagedThreadReader(calls, longThread(replies))),
