@@ -20,11 +20,14 @@ import type {
   FlueObservationSubscriber,
 } from "@flue/runtime";
 import * as v from "valibot";
+import { createDelegationStore } from "../../../packages/core/src/delegation-store.ts";
+import { database } from "./d1.ts";
 import {
   mockCloudflareWorkers,
   mockWorkersAi,
   workerWaitUntil,
 } from "./module-mocks.ts";
+import type { MockedWorkerEnv } from "./module-mocks.ts";
 
 const BOT_TOKEN = "xoxb-worker-token";
 const SIGNING_SECRET = "signing-secret-for-tests-1234567890";
@@ -120,7 +123,7 @@ const toolOutputError = (
   type: "tool-output-error",
 });
 
-await mockCloudflareWorkers({
+const workerEnv: MockedWorkerEnv = {
   AI: {},
   FLUE_SLACK_AGENT_AGENT: {
     getByName: (id: string) => ({
@@ -134,7 +137,8 @@ await mockCloudflareWorkers({
   SLACK_BOT_TOKEN: BOT_TOKEN,
   SLACK_SIGNING_SECRET: SIGNING_SECRET,
   SLACK_TEAM_ID: "T123",
-});
+};
+await mockCloudflareWorkers(workerEnv);
 const runtime = await import("@flue/runtime");
 // The alarm path is the agent's own wiring, so these tests drive it through
 // SlackAgent and the hooks it registers rather than reimplementing the seam.
@@ -1473,5 +1477,109 @@ test("a narrated milestone turns in the thread its conversation already holds", 
   ]);
   expect(retentionRefreshes).toEqual([
     { id: mention.instanceId, surface: "channel" },
+  ]);
+});
+
+test("a narrated deployment turns a delegation state notice in the task's thread and posts nothing itself", async () => {
+  const { default: shipped } = await import("../agent.config.ts");
+  await mock.module("../agent.config.ts", () => ({
+    default: defineAgentConfig({
+      delegation: {
+        authSecret: "DELEGATION_SECRET",
+        labels: { running: "Iniciado" },
+        repos: ["example"],
+      },
+      description: "Answers Slack conversations.",
+      name: "Delegating Agent",
+      ownerInstructions: "Prefer short answers.",
+      progress: {
+        authSecret: "DELEGATION_SECRET",
+        labels: {
+          blocked: "Blocked",
+          done: "Done",
+          merged: "Merged",
+          pr: "Pull request",
+          progress: "Progress",
+          review: "Review",
+          started: "Started",
+        },
+        narration: "Write in Spanish, warm and brief.",
+      },
+    }),
+  }));
+  const db = await database();
+  const store = createDelegationStore(db);
+  await store.register({
+    capacity: 1,
+    name: "runner-1",
+    repos: ["example"],
+    url: "https://runner.example",
+  });
+  await store.propose(
+    {
+      channel: "C777",
+      expiresAt: Date.now() + 86_400_000,
+      id: "task-1",
+      rawThread: [],
+      repo: "example",
+      reporters: [],
+      requester: "U777",
+      state: "proposed",
+      summary: "Fix login",
+      threadTs: "171.0",
+      title: "Fix login",
+    },
+    "instance-1",
+  );
+  await store.approve("task-1", "runner-1", "U777");
+  await store.claim("task-1", "runner-1");
+  workerEnv.DB = db;
+  workerEnv.DELEGATION_SECRET = "delegation-secret";
+  const specifier = "../src/index.ts?delegation-narration";
+  let entry: unknown;
+  try {
+    entry = await import(specifier);
+  } finally {
+    await mock.module("../agent.config.ts", () => ({ default: shipped }));
+    delete workerEnv.DB;
+    delete workerEnv.DELEGATION_SECRET;
+  }
+  const worker = v.parse(
+    v.object({ default: v.object({ request: v.function() }) }),
+    entry,
+  ).default;
+  const response: unknown = await worker.request(
+    new Request("https://helper.example/delegation/tasks/task-1/state", {
+      body: JSON.stringify({
+        note: "Budget ended",
+        runner: "runner-1",
+        state: "running",
+      }),
+      headers: { authorization: "Bearer delegation-secret" },
+      method: "POST",
+    }),
+    undefined,
+    testBindings(),
+  );
+  expect(v.parse(v.instance(Response), response).status).toBe(200);
+  await Promise.all(workerWaitUntil);
+
+  expect(slackCalls).toEqual([]);
+  expect(
+    dispatched.map(({ instanceId, request }) => ({
+      fallbackText: request.message.attributes?.fallbackText,
+      idempotencyKey: request.idempotencyKey,
+      instanceId,
+    })),
+  ).toEqual([
+    {
+      fallbackText: "Iniciado. Budget ended",
+      idempotencyKey: "delegation:task-1:running",
+      instanceId: slackInstanceId({
+        channelId: "C777",
+        teamId: "T123",
+        threadTs: "171.0",
+      }),
+    },
   ]);
 });
