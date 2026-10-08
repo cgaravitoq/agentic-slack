@@ -2,11 +2,14 @@ import { describe, expect, spyOn, test } from "bun:test";
 import {
   createSlackProgressEndpoint,
   defineAgentConfig,
+  finishSlackDelivery,
   MODEL_PROVIDER_CLOUDFLARE,
+  openSlackDelivery,
 } from "@agentic-slack/core";
 import type {
   ModelBrokerBinding,
   SlackCoreBindings,
+  SlackDeliveryStore,
 } from "@agentic-slack/core";
 import type {
   ResolvedSlackProgressConfig,
@@ -412,6 +415,34 @@ const narrations = () => {
     turns,
   };
 };
+
+const deliveryStore = (): SlackDeliveryStore => {
+  const rows = new Map<string, ReturnType<SlackDeliveryStore["load"]>>();
+  return {
+    load: (instanceId) => rows.get(instanceId),
+    save: (instanceId, record) => {
+      rows.set(instanceId, record);
+    },
+  };
+};
+
+interface DeliveredCall {
+  readonly body: string;
+  readonly method: string;
+}
+
+// A streamed delivery sends chunked bodies, which the progress recorder above
+// cannot parse, so the delivery path records its bodies raw.
+const deliveryRecorder =
+  (calls: DeliveredCall[]): Fetcher =>
+  (input, init) => {
+    const url = v.parse(v.string(), input);
+    calls.push({
+      body: v.parse(v.string(), init?.body),
+      method: url.slice(url.lastIndexOf("/") + 1),
+    });
+    return Promise.resolve(Response.json({ ok: true, ts: "171.1" }));
+  };
 
 describe("progress endpoint", () => {
   test("refuses a missing, wrong, or unconfigured bearer without calling Slack", async () => {
@@ -1675,6 +1706,81 @@ describe("narrated progress endpoint", () => {
     expect(calls[0]?.body.text).toBe(
       "Bearer [secret]\n<https://example.com/run>",
     );
+  });
+
+  test("redacts what a direct milestone would carry", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+
+    const response = await endpointFor(db, calls).handle(
+      postMilestone({ text: "<!here> Bearer xoxb-1234-not-a-real-token" }),
+    );
+
+    expect(response.status).toBe(200);
+    const posted = calls.at(-1)?.body.text ?? "";
+    expect(posted).not.toContain("<!here>");
+    expect(posted).not.toContain("xoxb-");
+    expect(posted).toContain("[secret]");
+  });
+
+  test("redacts what the narration fallback would carry", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+
+    const response = await endpointFor(db, calls, {
+      narrate: () => Promise.reject(new Error("agent unavailable")),
+      narration: "Write in Spanish, warm and brief.",
+    }).handle(
+      postMilestone({ text: "<!here> Bearer xoxb-1234-not-a-real-token" }),
+    );
+
+    expect(response.status).toBe(200);
+    const posted = calls.at(-1)?.body.text ?? "";
+    expect(posted).not.toContain("<!here>");
+    expect(posted).not.toContain("xoxb-");
+    expect(posted).toContain("[secret]");
+  });
+
+  test("redacts the fallback text the delivery path owes the thread", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const { narrate, turns } = narrations();
+
+    await endpointFor(db, calls, {
+      narrate,
+      narration: "Write in Spanish, warm and brief.",
+    }).handle(
+      postMilestone({ text: "<!here> Bearer xoxb-1234-not-a-real-token" }),
+    );
+
+    const binding = turns[0]?.binding;
+    if (binding === undefined) {
+      throw new Error("the narration turn carries the milestone binding");
+    }
+    const delivered: DeliveredCall[] = [];
+    const store = deliveryStore();
+    const fetcher = deliveryRecorder(delivered);
+    openSlackDelivery(
+      store,
+      "progress-fallback",
+      binding,
+      trusted.botToken,
+      fetcher,
+    );
+    await finishSlackDelivery(
+      store,
+      "progress-fallback",
+      trusted.botToken,
+      fetcher,
+    );
+
+    const posted = JSON.stringify(delivered);
+    expect(posted).not.toContain("<!here>");
+    expect(posted).not.toContain("xoxb-");
+    expect(posted).toContain("[secret]");
   });
 
   test("narrates a milestone as one turn in its thread and posts no reply itself", async () => {
