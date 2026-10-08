@@ -1449,12 +1449,12 @@ test("a narrated milestone turns in the thread its conversation already holds", 
   await workerModule.narrateProgressTurn({
     binding,
     body: "Rewrite this milestone in that voice.",
+    idempotencyKey: "progress:evt-narration",
     instanceId: slackInstanceId({
       channelId: binding.channelId,
       teamId: binding.recipientTeamId,
       threadTs: binding.threadTs,
     }),
-    milestoneId: "evt-narration",
   });
 
   expect(dispatched).toEqual([
