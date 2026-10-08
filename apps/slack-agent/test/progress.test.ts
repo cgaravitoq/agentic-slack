@@ -1568,6 +1568,48 @@ describe("progress root status", () => {
     ]);
     expect(db.roots.get("C1\u0000release-42")?.status).toBe("Halfway");
   });
+
+  test("keeps the status of a replied milestone whose root edit Slack refuses, and renders it on the next one", async () => {
+    const db = new FakeD1();
+    const calls: RecordedCall[] = [];
+    await statusEndpoint(db, calls).handle(postMilestone());
+
+    const refusedCalls: RecordedCall[] = [];
+    const replied = await statusEndpoint(db, refusedCalls, [
+      "edit_window_closed",
+    ]).handle(
+      postMilestone({
+        id: "evt-2",
+        kind: "pr",
+        status: "1 of 5 landed",
+        text: "Opened the pull request",
+      }),
+    );
+
+    expect(await replied.json()).toEqual({ ok: true, ts: REPLY_TS });
+    expect(refusedCalls.map((call) => call.method)).toEqual([
+      "chat.update",
+      "chat.postMessage",
+    ]);
+
+    const laterCalls: RecordedCall[] = [];
+    await statusEndpoint(db, laterCalls).handle(
+      postMilestone({
+        id: "evt-3",
+        kind: "blocked",
+        text: "Waiting on review",
+      }),
+    );
+
+    expect(laterCalls[0]).toEqual({
+      body: {
+        channel: "C1",
+        text: "Release 42 · Blocked · 1 of 5 landed",
+        ts: ROOT_TS,
+      },
+      method: "chat.update",
+    });
+  });
 });
 
 describe("narrated progress endpoint", () => {

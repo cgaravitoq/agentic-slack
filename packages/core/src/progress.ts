@@ -742,6 +742,13 @@ export const createSlackProgressEndpoint = (
       console.error("Slack progress root edit failed", error);
       if (error instanceof Error && isMissingMessage(error)) {
         await roots.drop(milestone.channel, milestone.task);
+      } else if (stored.status !== status) {
+        await roots.save(
+          milestone.channel,
+          milestone.task,
+          { ...stored, status },
+          Date.now(),
+        );
       }
       if (milestone.text === undefined) {
         throw error;
