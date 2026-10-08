@@ -158,6 +158,7 @@ describe("D1 migration schema", () => {
       "0006_slack_progress_roots.sql",
       "0007_progress_receipts.sql",
       "0008_delegation.sql",
+      "0009_progress_root_status.sql",
     ]);
     expect(
       applyOrder([
@@ -192,6 +193,9 @@ describe("D1 migration schema", () => {
       "CREATE TABLE IF NOT EXISTS progress_receipts",
     );
     expect(batches[6]).toContain("CREATE INDEX");
+    expect(batches[8]).toContain(
+      "ALTER TABLE slack_progress_roots ADD COLUMN status",
+    );
   });
 
   test("adds the owned column to the roots stored before it", () => {
@@ -219,6 +223,23 @@ describe("D1 migration schema", () => {
         task_id: "task-1",
       },
     ]);
+  });
+
+  test("leaves the status of the roots stored before it null", () => {
+    const sqlite = new Database(":memory:");
+    for (const source of migrationSources.slice(0, 8)) {
+      sqlite.run(source);
+    }
+    sqlite.run(
+      "INSERT INTO slack_progress_roots (channel_id, task_id, root_ts, root_text, owned, updated_at) VALUES ('C1', 'task-1', '171.1', 'Release 42 · Started', 1, 1)",
+    );
+    sqlite.run(migrationSources[8] ?? "");
+
+    expect(
+      sqlite
+        .query("SELECT channel_id, task_id, status FROM slack_progress_roots")
+        .all(),
+    ).toEqual([{ channel_id: "C1", status: null, task_id: "task-1" }]);
   });
 
   test("indexes created_at and plans the sweep through that index", async () => {
