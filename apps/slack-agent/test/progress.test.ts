@@ -442,6 +442,22 @@ describe("progress endpoint", () => {
     expect(db.receipts.size).toBe(0);
   });
 
+  test("refuses a wrong bearer before it reads the body", async () => {
+    const db = new FakeD1();
+    const calls: RecordedCall[] = [];
+    const endpoint = endpointFor(db, calls);
+
+    const statuses = await Promise.all(
+      authorizationRefusals.map(async (authorization) => {
+        const response = await endpoint.handle(post("{", authorization));
+        return response.status;
+      }),
+    );
+
+    expect(statuses).toEqual([401, 401, 401]);
+    expect(calls).toEqual([]);
+  });
+
   test("refuses a body that is not a milestone without calling Slack", async () => {
     const db = new FakeD1();
     db.admissions.set("C1", ADMITTED_BY);

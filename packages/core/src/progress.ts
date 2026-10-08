@@ -906,12 +906,12 @@ export const createSlackProgressEndpoint = (
     authSecret: config.authSecret,
     async handle(request) {
       const milestone = await milestoneFrom(request);
-      if (milestone === undefined) {
-        return refusal(400, "invalid_request");
-      }
-      const taskToken = await authorizeTask(request, milestone.id);
+      const taskToken = await authorizeTask(request, milestone?.id);
       if (taskToken instanceof Response) {
         return taskToken;
+      }
+      if (milestone === undefined) {
+        return refusal(400, "invalid_request");
       }
       if (
         taskToken !== undefined &&
