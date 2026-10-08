@@ -2,6 +2,7 @@ import { env, waitUntil } from "cloudflare:workers";
 import {
   CLOUDFLARE_TRACING_CONTENT,
   createSlackProgressEndpoint,
+  delegationNoticeTurn,
   refreshRetention,
   requiresApproval,
   slackDeliveryBinding,
@@ -39,7 +40,7 @@ export const narrateProgressTurn = async (
     "channel",
   );
   await init(SlackAgent, { id: turn.instanceId }).dispatch({
-    idempotencyKey: `progress:${turn.milestoneId}`,
+    idempotencyKey: turn.idempotencyKey,
     message: {
       attributes: turn.binding,
       body: turn.body,
@@ -49,7 +50,17 @@ export const narrateProgressTurn = async (
   });
 };
 
-const delegation = configuredDelegation(bindings, trusted.botToken);
+const narration = config.progress?.narration;
+const delegation = configuredDelegation(
+  bindings,
+  trusted.botToken,
+  narration === undefined
+    ? undefined
+    : (notice) =>
+        narrateProgressTurn(
+          delegationNoticeTurn(notice, narration, trusted.teamId),
+        ),
+);
 const progress =
   config.progress === undefined && delegation === undefined
     ? undefined

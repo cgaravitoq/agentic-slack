@@ -1,11 +1,16 @@
 import { waitUntil } from "cloudflare:workers";
 import { createDelegation, workerSecretValue } from "@agentic-slack/core";
-import type { Delegation, SlackCoreBindings } from "@agentic-slack/core";
+import type {
+  Delegation,
+  DelegationNotice,
+  SlackCoreBindings,
+} from "@agentic-slack/core";
 import config from "../agent.config.ts";
 
 export const configuredDelegation = (
   bindings: SlackCoreBindings,
   botToken: string,
+  narrateNotice?: (notice: DelegationNotice) => Promise<void>,
 ): Delegation | undefined => {
   if (config.delegation === undefined) {
     return undefined;
@@ -23,6 +28,7 @@ export const configuredDelegation = (
         instanceId,
       ).cancelDelegationExpiry(taskId),
     db: bindings.DB,
+    narrateNotice,
     runnerHeaders,
     schedule: (instanceId, task) =>
       bindings.FLUE_SLACK_AGENT_AGENT.getByName(

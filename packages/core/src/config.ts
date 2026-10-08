@@ -46,9 +46,37 @@ interface McpServerConfig {
   requireApproval?: readonly string[];
 }
 
+export const DELEGATION_STATES = ["running", "failed", "unknown"] as const;
+
+export type DelegationState = (typeof DELEGATION_STATES)[number];
+
+export type DelegationLabels = Partial<Record<DelegationState, string>>;
+
+const DEFAULT_DELEGATION_LABELS: Readonly<Record<DelegationState, string>> =
+  Object.freeze({
+    failed: "Failed",
+    running: "Started",
+    unknown: "Outcome unknown",
+  });
+
+export const resolveDelegationLabels = (
+  labels: DelegationLabels | undefined,
+): Readonly<Record<DelegationState, string>> => {
+  const labelOf = (state: DelegationState): string => {
+    const label = labels?.[state]?.trim() ?? "";
+    return label === "" ? DEFAULT_DELEGATION_LABELS[state] : label;
+  };
+  return Object.freeze({
+    failed: labelOf("failed"),
+    running: labelOf("running"),
+    unknown: labelOf("unknown"),
+  });
+};
+
 export interface DelegationConfig {
   repos: readonly string[];
   authSecret: string;
+  labels?: DelegationLabels;
   runnerHeaders?: Readonly<Record<string, string>>;
 }
 
@@ -77,6 +105,7 @@ const resolveDelegation = (
   }
   return Object.freeze({
     authSecret: config.authSecret.trim(),
+    labels: resolveDelegationLabels(config.labels),
     repos: Object.freeze(repos),
     runnerHeaders: config.runnerHeaders,
   });

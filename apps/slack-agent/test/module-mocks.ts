@@ -49,6 +49,7 @@ export interface MockedWorkerEnv {
   AI?: unknown;
   CRM_MCP_TOKEN?: string;
   DB?: unknown;
+  DELEGATION_SECRET?: string;
   EXTENSION_SECRET?: string;
   FLUE_SLACK_AGENT_AGENT?: unknown;
   SLACK_APP_ID?: string;

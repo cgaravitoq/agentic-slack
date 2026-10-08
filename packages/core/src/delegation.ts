@@ -3,7 +3,8 @@ import { defineTool } from "@flue/runtime";
 import type { SlackBlockActionsPayload } from "@flue/slack";
 import * as v from "valibot";
 import { createSqlSlackChannelAdmissionStore } from "./admission.ts";
-import type { DelegationConfig } from "./config.ts";
+import { DELEGATION_STATES, resolveDelegationLabels } from "./config.ts";
+import type { DelegationConfig, DelegationState } from "./config.ts";
 import { createDelegationStore, runnerSchema } from "./delegation-store.ts";
 import type {
   DelegationRunner,
@@ -14,12 +15,21 @@ import { redact } from "./delivery.ts";
 import { readRawSlackThread } from "./read.ts";
 import type { SlackReadBinding } from "./read.ts";
 
+export interface DelegationNotice {
+  conductor: string;
+  label: string;
+  note: string;
+  state: DelegationState;
+  task: DelegationTask;
+}
+
 export interface DelegationOptions {
   db: D1Database;
   bearer: string;
   botToken: string;
   runnerHeaders: Readonly<Record<string, string>>;
   fetcher?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  narrateNotice?: (notice: DelegationNotice) => Promise<void>;
   schedule: (instanceId: string, task: DelegationTask) => Promise<void>;
   cancelSchedule: (instanceId: string, taskId: string) => Promise<void>;
   waitUntil: (work: Promise<void>) => void;
@@ -40,7 +50,7 @@ const runnerInput = v.object({ runner: v.pipe(v.string(), v.nonEmpty()) });
 const stateInput = v.object({
   ...runnerInput.entries,
   note: v.optional(v.pipe(v.string(), v.maxLength(500))),
-  state: v.picklist(["running", "failed", "unknown"]),
+  state: v.picklist(DELEGATION_STATES),
 });
 const interactionSchema = v.object({
   actions: v.array(
@@ -79,6 +89,7 @@ export const createDelegation = (
 ) => {
   const store = createDelegationStore(options.db);
   const fetcher = options.fetcher ?? fetch;
+  const labels = resolveDelegationLabels(config.labels);
   const proposal = proposalInput(config.repos);
   const proposalDescription = `Propose delegation only when the requester explicitly asks. Capture the bound thread and request their approval for a configured repo and runner. The configured repos are ${config.repos.join(", ")}. In an owner's DM, supply an admitted channel and threadTs.`;
   const slack = async (
@@ -112,6 +123,33 @@ export const createDelegation = (
       await slack(task, text);
     } catch (error: unknown) {
       console.error("Slack delegation notice failed", error);
+    }
+  };
+  const notice = async (
+    task: DelegationTask,
+    state: DelegationState,
+    note: string | undefined,
+    conductor: string,
+  ): Promise<void> => {
+    const redactedNote = note === undefined ? "" : redact(note);
+    const label = labels[state];
+    const text = `${label}.${redactedNote === "" ? "" : ` ${redactedNote}`}`;
+    if (options.narrateNotice === undefined) {
+      await notify(task, text);
+      return;
+    }
+    try {
+      await options.narrateNotice({
+        conductor,
+        label,
+        note: redactedNote,
+        state,
+        task,
+      });
+    } catch (error: unknown) {
+      // The turn never reached the thread, so the notice still must.
+      console.error("Slack delegation notice narration failed", error);
+      await notify(task, text);
     }
   };
   const runnerRequest = (
@@ -211,9 +249,11 @@ export const createDelegation = (
       }
       if (changed && stored !== undefined) {
         options.waitUntil(
-          notify(
+          notice(
             stored.task,
-            `${{ failed: "Failed", running: "Started", unknown: "Outcome unknown" }[input.output.state]}.${input.output.note === undefined ? "" : ` ${redact(input.output.note)}`}`,
+            input.output.state,
+            input.output.note,
+            input.output.runner,
           ),
         );
       }
