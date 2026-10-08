@@ -571,6 +571,31 @@ const scopeMatches = (
     taskId === `delegation:${task.task.id}` &&
     (threadTs === undefined || threadTs === task.task.threadTs));
 
+const milestoneRefusal = (
+  milestone: SlackProgressMilestone,
+  taskToken: StoredDelegationTask | undefined,
+): Response | undefined => {
+  if (
+    milestone.status !== undefined &&
+    milestone.status.length > STATUS_LIMIT
+  ) {
+    return refusal(400, "status_too_long");
+  }
+  if (
+    taskToken !== undefined &&
+    (milestone.threadTs === undefined ||
+      !scopeMatches(
+        taskToken,
+        milestone.channel,
+        milestone.task,
+        milestone.threadTs,
+      ))
+  ) {
+    return refusal(403, "token_scope");
+  }
+  return undefined;
+};
+
 export const createSlackProgressEndpoint = (
   config: ResolvedSlackProgressConfig,
   options: SlackProgressEndpointOptions,
@@ -976,23 +1001,9 @@ export const createSlackProgressEndpoint = (
       if (milestone === undefined) {
         return refusal(400, "invalid_request");
       }
-      if (
-        milestone.status !== undefined &&
-        milestone.status.length > STATUS_LIMIT
-      ) {
-        return refusal(400, "status_too_long");
-      }
-      if (
-        taskToken !== undefined &&
-        (milestone.threadTs === undefined ||
-          !scopeMatches(
-            taskToken,
-            milestone.channel,
-            milestone.task,
-            milestone.threadTs,
-          ))
-      ) {
-        return refusal(403, "token_scope");
+      const invalid = milestoneRefusal(milestone, taskToken);
+      if (invalid !== undefined) {
+        return invalid;
       }
       try {
         const claim = await receipts.claim(milestone.id);
