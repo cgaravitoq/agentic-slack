@@ -294,7 +294,7 @@ curl --fail https://your-worker.example.com/progress \
   --data '{"id":"evt-9f2c","task":"release-42","title":"Release 42","channel":"C0123456789","kind":"pr","text":"Opened the release pull request","url":"https://github.com/you/repo/pull/7"}'
 ```
 
-A success answers `200 {"ok":true,"ts":"<the reply's Slack ts>"}` when the milestone posted as a reply itself, `200 {"ok":true,"narrated":true}` when it went to a narration turn, and `200` with the stored receipt when the id already posted; a refusal answers a 4xx with `{"ok":false,"error":"..."}` and calls Slack not at all.
+A success answers `200 {"ok":true,"ts":"<the reply's Slack ts>"}` when the milestone posted as a reply itself, `200 {"ok":true,"ts":"<the root's Slack ts>"}` when it edited only the task's root, `200 {"ok":true,"narrated":true}` when it went to a narration turn, and `200` with the stored receipt when the id already posted; a refusal answers a 4xx with `{"ok":false,"error":"..."}` and calls Slack not at all.
 
 A client that would rather not store an id lists the channels the bot may post to:
 
@@ -312,18 +312,21 @@ It takes the same bearer and answers `401` without it.
 - `task` identifies the task inside the channel; its first event posts the root and stores the root timestamp in D1 (`slack_progress_roots`, migration `0006_slack_progress_roots.sql`), and later events reply in that thread.
 - `threadTs` is the ts of a thread the sender already owns: the first milestone of a task stores it as an unowned root, nothing is posted for that root and its text is never edited, and every milestone of the task becomes a reply in the named thread.
   A `threadTs` that differs from the root the task already holds answers `409` `thread_mismatch`.
-- `kind` is one of `started`, `progress`, `blocked`, `pr`, `review`, `merged`, `done`; the root reads `<title> · <label of the kind>` and is edited whenever that text changes, so the root always shows the task's current status.
-  A root Slack refuses to edit is logged and the milestone still gets its reply; when Slack answers that the root is gone, the next milestone posts a fresh one.
-- `text` and its optional `url` are the milestone: without `narration` they post as the reply, with `url` on the line below `text`, and with it `text` is what the turn rewrites and what the thread falls back to when that turn cannot deliver.
+- `kind` is one of `started`, `progress`, `blocked`, `pr`, `review`, `merged`, `done`; the root reads `<title> · <label of the kind>`, or `<title> · <label of the kind> · <status>` once the task carries one, and is edited whenever that text changes, so the root always shows the task's current status.
+  A root Slack refuses to edit is logged and the milestone still gets its reply, unless it is root-only, where the edit is the milestone and the answer is `500` so the retry runs again; when Slack answers that the root is gone, the next milestone posts a fresh one.
+- `text` is the milestone and is required unless the milestone carries a `status`: without `narration` it posts as the reply, with its optional `url` on the line below, and with it `text` is what the turn rewrites and what the thread falls back to when that turn cannot deliver.
   A narrated reply carries `url` the same way: trusted code closes it with the link, so the model never retypes it.
+- `status` is an optional line the task's root carries: at most 300 characters after redaction, refused `400` `status_too_long` rather than clamped, stored with the root (`slack_progress_roots`, migration `0009_progress_root_status.sql`), and rendered by every later milestone of the task whether or not it sends one.
+  A milestone with a `status` and no `text` is root-only: it edits the owned root, posts no reply and never narrates, and its answer carries that root's `ts`.
+  An unowned root stores the `status` and is never edited; a root edit that fails answers `500` so the sender's retry runs again.
 - `verbatim: true` posts the milestone as given even when `narration` is configured: the reply is `text` with the redaction every bot reply gets, the tags and the link on the line below, posted with `chat.postMessage` in the task's thread and no narration turn, and its answer carries that reply's `ts`.
 - `mentions` is an optional list of up to 10 members of the destination channel to tag, each a user ID, a display or real name, or one word of it.
   The tags close the reply next to `url`, whether the reply is narrated or posted as given.
   Resolving them reads `users.list`, so it needs the `users:read` scope the `read` option adds.
-- `title`, `text`, `id`, `task`, `channel`, `url` and `threadTs` are bounded, `url` must be HTTPS, `threadTs` must be a Slack ts, and `channel` names the destination as an id or as a name.
+- `title`, `text`, `id`, `task`, `channel`, `url`, `status` and `threadTs` are bounded, `url` must be HTTPS, `threadTs` must be a Slack ts, and `channel` names the destination as an id or as a name.
   A name may carry its leading `#` and is compared case-insensitively against the admitted channels, so either form must already carry the admission an allowlisted user's invitation wrote.
 
-The refusals are `401` for a missing or wrong bearer, `400` for a body that is not a milestone, `403` for a channel the admission does not cover, `409` for a name several admitted channels answer to, `409` `thread_mismatch` for a thread that is not the task's, and `409` `in_flight` for a retry of a milestone that is still posting.
+The refusals are `401` for a missing or wrong bearer, `400` for a body that is not a milestone, `400` `status_too_long` for a status past its bound, `403` for a channel the admission does not cover, `409` for a name several admitted channels answer to, `409` `thread_mismatch` for a thread that is not the task's, and `409` `in_flight` for a retry of a milestone that is still posting.
 A mention no channel member matches answers `422` `unknown_mention`, and one several members share answers `409` `ambiguous_mention` with their `candidates`; both name the `mention` and post nothing.
 A Slack failure answers `500` so the sender can retry, and the retry is deduplicated by its receipt `id`.
 `chat:write` covers both `chat.postMessage` and `chat.update`, so the option adds no scope.
