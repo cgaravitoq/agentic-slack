@@ -1,0 +1,420 @@
+import { mkdir, rm } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import * as v from "valibot";
+import { findOrCreateDatabase, verifyDatabase } from "./d1.ts";
+import {
+  generateAgentConfigModule,
+  generateWranglerConfig,
+  readInstance,
+} from "./instance.ts";
+import type { AgentInstance } from "./instance.ts";
+import {
+  lockFileName,
+  readLock,
+  withLockEnvironment,
+  withoutLockEnvironment,
+  writeLock,
+} from "./lock.ts";
+import type { InstanceLock, LockEnvironment } from "./lock.ts";
+import { readAnswer, readSecret } from "./terminal.ts";
+import { runWrangler, wranglerJson } from "./wrangler.ts";
+
+const text = v.pipe(v.string(), v.minLength(1, "Expected a non-empty string"));
+
+const HEALTH_ATTEMPTS = 5;
+const HEALTH_DELAY_MS = 2000;
+
+export interface PrepareOptions {
+  directory: string;
+  environment: string;
+  instance: AgentInstance;
+  lock: InstanceLock;
+  migrationsDirectory: string;
+}
+
+export interface EnvironmentPreparation {
+  agentConfig: string;
+  directory: string;
+  environment: string;
+  output: string;
+  worker: string;
+  wranglerConfig: string;
+}
+
+export interface UpOptions {
+  directory: string;
+  environment: string;
+  migrationsDirectory: string;
+  rotate?: readonly string[];
+}
+
+export interface DownOptions {
+  directory: string;
+  environment: string;
+}
+
+const generatedDirectory = (directory: string): string =>
+  path.join(directory, ".agentic-slack");
+
+const skillFiles = async (
+  directory: string,
+  skills: readonly string[],
+): Promise<readonly string[]> =>
+  await Promise.all(
+    skills.map(async (skill) => {
+      const file = path.resolve(directory, skill, "SKILL.md");
+      if (!(await Bun.file(file).exists())) {
+        throw new Error(`agent.yaml: ${skill} has no SKILL.md`);
+      }
+      return file;
+    }),
+  );
+
+export const prepareEnvironment = async (
+  options: PrepareOptions,
+): Promise<EnvironmentPreparation> => {
+  const { directory, environment, instance, lock, migrationsDirectory } =
+    options;
+  const named = instance.environments[environment];
+  if (named === undefined) {
+    throw new Error(`agent.yaml has no environment ${environment}`);
+  }
+  const generated = generatedDirectory(directory);
+  const agentConfig = path.join(generated, "agent.config.ts");
+  await mkdir(generated, { recursive: true });
+  await Bun.write(
+    agentConfig,
+    generateAgentConfigModule(
+      instance,
+      await skillFiles(directory, instance.agent.skills ?? []),
+      generated,
+    ),
+  );
+  const wranglerConfig = path.join(generated, "wrangler.jsonc");
+  await Bun.write(
+    wranglerConfig,
+    generateWranglerConfig(
+      instance,
+      environment,
+      migrationsDirectory,
+      generated,
+      lock,
+    ),
+  );
+  return {
+    agentConfig,
+    directory,
+    environment,
+    output: path.join(generated, environment),
+    worker: named.worker,
+    wranglerConfig,
+  };
+};
+
+export const buildEnvironment = async (
+  preparation: EnvironmentPreparation,
+): Promise<string> => {
+  const { directory, environment, agentConfig, output, wranglerConfig } =
+    preparation;
+  // Vite leaves the output of a previous build of another Worker in place, and
+  // the deploy step must see exactly the Worker just built.
+  await rm(output, { force: true, recursive: true });
+  const vite = path.join(
+    path.dirname(fileURLToPath(import.meta.resolve("vite/package.json"))),
+    "bin/vite.js",
+  );
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      vite,
+      "build",
+      "--config",
+      path.resolve(
+        import.meta.dirname,
+        "../../../apps/slack-agent/vite.config.ts",
+      ),
+    ],
+    {
+      cwd: directory,
+      env: {
+        ...process.env,
+        AGENT_CONFIG: agentConfig,
+        CLOUDFLARE_ENV: environment,
+        WORKER_CONFIG: wranglerConfig,
+        WORKER_OUT_DIR: output,
+      },
+      stderr: "inherit",
+      stdin: "inherit",
+      stdout: "inherit",
+    },
+  );
+  const exitCode = await child.exited;
+  if (exitCode !== 0) {
+    throw new Error(
+      `vite build of ${preparation.worker} failed with exit code ${exitCode}`,
+    );
+  }
+  const configs = await Array.fromAsync(
+    new Bun.Glob("*/wrangler.json").scan({ absolute: true, cwd: output }),
+  );
+  if (configs.length !== 1) {
+    throw new Error(`Expected one generated wrangler.json in ${output}`);
+  }
+  return configs[0];
+};
+
+const present = (value: string | undefined): string | undefined =>
+  value === undefined || value === "" ? undefined : value;
+
+const databaseFor = async (
+  directory: string,
+  environmentName: string,
+  name: string,
+  declaredId: string | undefined,
+  lock: InstanceLock,
+): Promise<LockEnvironment["d1"]> => {
+  const locked = lock.environments[environmentName]?.d1;
+  if (locked !== undefined) {
+    return locked;
+  }
+  const declared = present(declaredId);
+  if (declared !== undefined) {
+    await verifyDatabase({ id: declared, name }, directory);
+    return { id: declared, name };
+  }
+  const database = await findOrCreateDatabase(name, directory);
+  return { id: database.id, name: database.name };
+};
+
+const secretList = v.array(v.object({ name: text }));
+
+const secretValue = async (name: string): Promise<string> => {
+  const fromEnvironment = process.env[name];
+  if (fromEnvironment !== undefined && fromEnvironment !== "") {
+    return fromEnvironment;
+  }
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      `${name} is not a Worker secret and the environment does not set it: export ${name} or run this command from a terminal to be prompted`,
+    );
+  }
+  const answer = await readSecret(`${name}: `);
+  if (answer === "") {
+    throw new Error(`${name} needs a non-empty value`);
+  }
+  return answer;
+};
+
+interface SecretReport {
+  kept: readonly string[];
+  set: readonly string[];
+}
+
+const putSecret = async (
+  directory: string,
+  worker: string,
+  name: string,
+): Promise<void> => {
+  const value = await secretValue(name);
+  await runWrangler(["secret", "put", name, "--name", worker], {
+    cwd: directory,
+    input: `${value}\n`,
+  });
+};
+
+const ensureSecrets = async (
+  directory: string,
+  worker: string,
+  declared: readonly string[],
+  rotate: readonly string[],
+): Promise<SecretReport> => {
+  const listed = await wranglerJson(
+    secretList,
+    ["secret", "list", "--name", worker, "--format", "json"],
+    { cwd: directory },
+  );
+  const existing = new Set(listed.map((secret) => secret.name));
+  const kept: string[] = [];
+  const set: string[] = [];
+  for (const name of declared) {
+    if (existing.has(name) && !rotate.includes(name)) {
+      kept.push(name);
+      continue;
+    }
+    // oxlint-disable-next-line no-await-in-loop
+    await putSecret(directory, worker, name);
+    set.push(name);
+  }
+  return { kept, set };
+};
+
+const healthSchema = v.object({
+  missing: v.optional(v.array(v.string())),
+  status: v.string(),
+});
+
+const readReadiness = async (
+  url: string,
+): Promise<v.InferOutput<typeof healthSchema> | undefined> => {
+  try {
+    const response = await fetch(url);
+    const parsed = v.safeParse(healthSchema, await response.json());
+    return parsed.success ? parsed.output : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const waitForHealth = async (domain: string): Promise<void> => {
+  const url = `https://${domain}/health`;
+  for (let attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt += 1) {
+    // oxlint-disable-next-line no-await-in-loop
+    const health = await readReadiness(url);
+    if (health !== undefined) {
+      if (health.status === "ready") {
+        console.log(`${url} is ready`);
+        return;
+      }
+      throw new Error(
+        `${url} is not ready: missing ${health.missing?.join(", ") ?? "bindings"}`,
+      );
+    }
+    if (attempt < HEALTH_ATTEMPTS) {
+      // oxlint-disable-next-line no-await-in-loop
+      await Bun.sleep(HEALTH_DELAY_MS);
+    }
+  }
+  throw new Error(
+    `${url} did not answer /health: check that ${domain} resolves to the deployed Worker`,
+  );
+};
+
+// The Slack phase that follows this row creates, updates and installs the app,
+// and deletes it; until it lands both commands only report what the lock holds.
+const slackAppPhase = (
+  entry: LockEnvironment | undefined,
+  verb: string,
+): string =>
+  entry?.slack === undefined
+    ? `Slack app: none recorded, the Slack phase will ${verb} it`
+    : `Slack app ${entry.slack.appId}: the Slack phase will ${verb} it`;
+
+export const up = async (options: UpOptions): Promise<string> => {
+  const {
+    directory,
+    environment: environmentName,
+    migrationsDirectory,
+    rotate = [],
+  } = options;
+  const instance = await readInstance(directory);
+  const named = instance.environments[environmentName];
+  if (named === undefined) {
+    throw new Error(`agent.yaml has no environment ${environmentName}`);
+  }
+  const declared = new Set(instance.secrets);
+  const unknown = rotate.filter((name) => !declared.has(name));
+  if (unknown.length > 0) {
+    throw new Error(
+      `--rotate names secrets agent.yaml does not declare: ${unknown.join(", ")}`,
+    );
+  }
+
+  const lock = await readLock(directory);
+  const d1 = await databaseFor(
+    directory,
+    environmentName,
+    named.d1.name,
+    named.d1.id,
+    lock,
+  );
+  const entry: LockEnvironment = {
+    d1,
+    slack: lock.environments[environmentName]?.slack,
+    worker: named.worker,
+  };
+  const updated = withLockEnvironment(lock, environmentName, entry);
+  await writeLock(directory, updated);
+  console.log(`D1 ${d1.name} (${d1.id})`);
+
+  const preparation = await prepareEnvironment({
+    directory,
+    environment: environmentName,
+    instance,
+    lock: updated,
+    migrationsDirectory,
+  });
+  await runWrangler(
+    [
+      "d1",
+      "migrations",
+      "apply",
+      "DB",
+      "--config",
+      preparation.wranglerConfig,
+      "--env",
+      environmentName,
+      "--remote",
+    ],
+    { cwd: directory },
+  );
+  console.log(`Applied the D1 migrations to ${d1.name}`);
+
+  const configPath = await buildEnvironment(preparation);
+  console.log(`Built ${named.worker}`);
+
+  await runWrangler(["deploy", "--config", configPath], { cwd: directory });
+  console.log(`Deployed ${named.worker} to https://${named.domain}`);
+
+  const secrets = await ensureSecrets(
+    directory,
+    named.worker,
+    instance.secrets,
+    rotate,
+  );
+  const described = [
+    ...(secrets.set.length === 0 ? [] : [`set ${secrets.set.join(", ")}`]),
+    ...(secrets.kept.length === 0 ? [] : [`kept ${secrets.kept.join(", ")}`]),
+  ];
+  console.log(
+    `Worker secrets: ${described.length === 0 ? "none declared" : described.join("; ")}`,
+  );
+
+  console.log(slackAppPhase(entry, "create or update"));
+  await waitForHealth(named.domain);
+  return `Provisioned ${environmentName}: https://${named.domain}`;
+};
+
+export const down = async (options: DownOptions): Promise<string> => {
+  const { directory, environment: environmentName } = options;
+  const instance = await readInstance(directory);
+  const named = instance.environments[environmentName];
+  if (named === undefined) {
+    throw new Error(`agent.yaml has no environment ${environmentName}`);
+  }
+  const lock = await readLock(directory);
+  const entry = lock.environments[environmentName];
+  if (entry === undefined) {
+    throw new Error(
+      `${lockFileName} has no ${environmentName} environment: nothing to delete`,
+    );
+  }
+  const expected = `${instance.agent.name}/${environmentName}`;
+  console.log(`Deleting the ${environmentName} environment of ${expected}:`);
+  console.log(`  Worker ${entry.worker}`);
+  console.log(`  D1 ${entry.d1.name} (${entry.d1.id})`);
+  console.log(`  Custom domain https://${named.domain}`);
+  const answer = await readAnswer(`Type ${expected} to delete: `);
+  if (answer !== expected) {
+    throw new Error(
+      `Nothing deleted: expected the exact text ${expected} and read ${answer === "" ? "an empty line" : answer}`,
+    );
+  }
+  await runWrangler(["delete", entry.worker, "--force"], { cwd: directory });
+  await runWrangler(["d1", "delete", entry.d1.name, "--skip-confirmation"], {
+    cwd: directory,
+  });
+  console.log(slackAppPhase(entry, "delete"));
+  await writeLock(directory, withoutLockEnvironment(lock, environmentName));
+  return `Deleted the ${environmentName} environment and removed it from ${lockFileName}`;
+};

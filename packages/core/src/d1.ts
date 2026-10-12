@@ -34,3 +34,23 @@ export const verifyDatabase = async (
     );
   }
 };
+
+export const findOrCreateDatabase = async (
+  name: string,
+  directory: string,
+): Promise<Database> => {
+  const listed = await listDatabases(directory);
+  const existing = listed.find((candidate) => candidate.name === name);
+  if (existing !== undefined) {
+    return { id: existing.uuid, name: existing.name };
+  }
+  await runWrangler(["d1", "create", name], { cwd: directory });
+  const created = await listDatabases(directory);
+  const database = created.find((candidate) => candidate.name === name);
+  if (database === undefined) {
+    throw new Error(
+      `wrangler d1 create did not create a database named ${name}: run wrangler d1 list`,
+    );
+  }
+  return { id: database.uuid, name: database.name };
+};

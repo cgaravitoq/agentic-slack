@@ -56,3 +56,8 @@ export const readSecret = async (label: string): Promise<string> => {
   process.stderr.write("\n");
   return value;
 };
+
+export const readAnswer = async (label: string): Promise<string> => {
+  process.stderr.write(label);
+  return await readLine();
+};
