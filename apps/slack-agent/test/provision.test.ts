@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -7,6 +7,9 @@ import { lockFileName, readLock } from "../../../packages/core/src/lock.ts";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../../..");
 const cli = path.join(repositoryRoot, "bin/agentic-slack.ts");
+// Every test here spawns the CLI, which builds and deploys through stubbed
+// wrangler; a slow runner needs more than the five-second default.
+setDefaultTimeout(60_000);
 
 const d1Id = "33333333-3333-3333-3333-333333333333";
 const botToken = "xoxb-provision-fixture-bot";
@@ -162,11 +165,17 @@ fail("unexpected wrangler " + args.join(" "));
 `;
 
 const preload = `import { appendFileSync } from "node:fs";
+import { Readable } from "node:stream";
 
 if (process.env.STUB_TTY === "1") {
-  Object.defineProperty(process.stdin, "isTTY", { value: true });
-  process.stdin.setRawMode = () => {};
+  const stdin = new Readable({ read() {} });
+  stdin.push(process.env.STUB_STDIN_INPUT ?? "");
+  stdin.push(null);
+  Object.defineProperty(stdin, "isTTY", { value: true });
+  stdin.setRawMode = () => {};
+  Object.defineProperty(process, "stdin", { configurable: true, value: stdin });
 }
+
 globalThis.fetch = async (input) => {
   const url = String(input instanceof Request ? input.url : input);
   appendFileSync(process.env.STUB_FETCH_LOG, url + "\\n");
@@ -247,6 +256,7 @@ const runCli = async (
         SLACK_BOT_TOKEN: "",
         SLACK_SIGNING_SECRET: "",
         STUB_FETCH_LOG: path.join(directory, "fetch.log"),
+        STUB_STDIN_INPUT: options.input ?? "",
         STUB_WRANGLER_D1_ID: d1Id,
         STUB_WRANGLER_LOG: path.join(directory, "wrangler.log"),
         STUB_WRANGLER_STATE: path.join(directory, "wrangler-state.json"),
