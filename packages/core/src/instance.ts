@@ -130,7 +130,7 @@ const instanceSchema = v.strictObject({
 
 export type AgentInstance = v.InferOutput<typeof instanceSchema>;
 
-export type InstanceEnvironment = AgentInstance["environments"][string];
+type InstanceEnvironment = AgentInstance["environments"][string];
 
 interface InstanceProblem {
   message: string;

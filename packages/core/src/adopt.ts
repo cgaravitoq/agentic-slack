@@ -1,8 +1,8 @@
 import path from "node:path";
 import * as v from "valibot";
 import { defineAgentConfig } from "./config.ts";
+import { verifyDatabase } from "./d1.ts";
 import { readInstance } from "./instance.ts";
-import type { InstanceEnvironment } from "./instance.ts";
 import {
   lockFileName,
   manifestSha256,
@@ -11,6 +11,8 @@ import {
   writeLock,
 } from "./lock.ts";
 import { generateSlackManifest } from "./manifest.ts";
+import { readSecret } from "./terminal.ts";
+import { runWrangler } from "./wrangler.ts";
 
 export interface AdoptOptions {
   appId?: string;
@@ -19,66 +21,14 @@ export interface AdoptOptions {
   environment: string;
 }
 
-const text = v.pipe(v.string(), v.minLength(1, "Expected a non-empty string"));
-
-const wrangler = async (args: readonly string[]): Promise<string> => {
-  const child = Bun.spawn(["wrangler", ...args], {
-    stderr: "pipe",
-    stdin: "ignore",
-    stdout: "pipe",
-  });
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ]);
-  if (exitCode !== 0) {
-    throw new Error(
-      `wrangler ${args.join(" ")} failed:\n${stderr.trim() || stdout.trim()}`,
-    );
-  }
-  return stdout;
-};
-
-const wranglerJson = async <T>(
-  schema: v.GenericSchema<T>,
-  args: readonly string[],
-): Promise<T> => {
-  const stdout = await wrangler(args);
-  let data: unknown;
-  try {
-    data = JSON.parse(stdout);
-  } catch (error) {
-    throw new Error(`wrangler ${args.join(" ")} did not print JSON`, {
-      cause: error,
-    });
-  }
-  return v.parse(schema, data);
-};
-
-const d1Databases = v.array(v.object({ name: text, uuid: text }));
-
-const verifyD1 = async (
-  environment: InstanceEnvironment,
-  d1Id: string,
+const verifyWorker = async (
+  worker: string,
+  directory: string,
 ): Promise<void> => {
-  const databases = await wranglerJson(d1Databases, ["d1", "list", "--json"]);
-  const database = databases.find((candidate) => candidate.uuid === d1Id);
-  if (database === undefined) {
-    throw new Error(
-      `Cloudflare has no D1 database ${d1Id} in this account: check --d1-id or run wrangler d1 list`,
-    );
-  }
-  if (database.name !== environment.d1.name) {
-    throw new Error(
-      `D1 database ${d1Id} is named ${database.name}, but agent.yaml names it ${environment.d1.name}`,
-    );
-  }
-};
-
-const verifyWorker = async (worker: string): Promise<void> => {
   try {
-    await wrangler(["deployments", "list", "--name", worker, "--json"]);
+    await runWrangler(["deployments", "list", "--name", worker, "--json"], {
+      cwd: directory,
+    });
   } catch (error) {
     throw new Error(
       `Cloudflare has no Worker ${worker} in this account: ${error instanceof Error ? error.message : String(error)}`,
@@ -86,37 +36,6 @@ const verifyWorker = async (worker: string): Promise<void> => {
     );
   }
 };
-
-const readSecret = async (label: string): Promise<string> => {
-  process.stderr.write(label);
-  const raw = process.stdin.isTTY;
-  if (raw) {
-    process.stdin.setRawMode(true);
-  }
-  let value = "";
-  let done = false;
-  for await (const chunk of process.stdin) {
-    for (const character of String(chunk)) {
-      if (character === "\r" || character === "\n") {
-        done = true;
-        break;
-      }
-      value =
-        character === "\u007F" || character === "\b"
-          ? value.slice(0, -1)
-          : `${value}${character}`;
-    }
-    if (done) {
-      break;
-    }
-  }
-  if (raw) {
-    process.stdin.setRawMode(false);
-  }
-  process.stderr.write("\n");
-  return value.trim();
-};
-
 const configToken = async (): Promise<string> => {
   const fromEnvironment = process.env.SLACK_CONFIG_TOKEN;
   if (fromEnvironment !== undefined && fromEnvironment !== "") {
@@ -267,14 +186,14 @@ export const adopt = async (options: AdoptOptions): Promise<string> => {
     );
   }
   const appId =
-    options.appId ?? locked?.slack.appId ?? environment.vars.SLACK_APP_ID;
+    options.appId ?? locked?.slack?.appId ?? environment.vars.SLACK_APP_ID;
   if (appId === undefined) {
     throw new Error(
       `agent.yaml has no environments.${environmentName}.vars.SLACK_APP_ID: pass --app-id <id>`,
     );
   }
-  await verifyD1(environment, d1Id);
-  await verifyWorker(environment.worker);
+  await verifyDatabase({ id: d1Id, name: environment.d1.name }, directory);
+  await verifyWorker(environment.worker, directory);
   const manifest = generateSlackManifest(
     defineAgentConfig({ ...instance.agent, skills: undefined }),
     `https://${environment.domain}`,
