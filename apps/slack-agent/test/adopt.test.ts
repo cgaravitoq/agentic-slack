@@ -320,4 +320,41 @@ describe("adopt", () => {
     }
     expect(await lockFile(directory)).toBe(false);
   });
+
+  test("refuses an enabled interactivity request URL that differs", async () => {
+    const directory = await prepared();
+    await writeFile(
+      path.join(directory, "agent.yaml"),
+      agentYaml.replace(
+        "  ownerInstructions: Answer with the adopted configuration.\n",
+        [
+          "  ownerInstructions: Answer with the adopted configuration.",
+          "  mcpServers:",
+          "    - name: tracker",
+          "      url: https://mcp.example.com",
+          "      requireApproval:",
+          "        - create_issue",
+          "",
+        ].join("\n"),
+      ),
+    );
+
+    const run = await runAdopt(directory, {
+      manifest: liveManifest({
+        settings: {
+          ...liveManifest().settings,
+          interactivity: {
+            is_enabled: true,
+            request_url: "https://old.example.com/channels/slack/interactions",
+          },
+        },
+      }),
+    });
+
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain(
+      "interactivity request URL: the app has https://old.example.com/channels/slack/interactions, the manifest asks for https://package-fixture-staging.example.com/channels/slack/interactions",
+    );
+    expect(await lockFile(directory)).toBe(false);
+  });
 });
