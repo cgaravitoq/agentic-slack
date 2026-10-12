@@ -44,11 +44,14 @@ const readLine = async (): Promise<string> => {
       character === "\u007F" || character === "\b"
         ? value.slice(0, -1)
         : `${value}${character}`;
+    if (
+      value.endsWith(bracketedPasteStart) ||
+      value.endsWith(bracketedPasteEnd)
+    ) {
+      value = value.slice(0, -bracketedPasteStart.length);
+    }
   }
-  return value
-    .replaceAll(bracketedPasteStart, "")
-    .replaceAll(bracketedPasteEnd, "")
-    .trim();
+  return value.trim();
 };
 
 export const readSecret = async (label: string): Promise<string> => {

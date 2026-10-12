@@ -708,6 +708,24 @@ describe("up", () => {
     });
   });
 
+  test("erases the last pasted character on a backspace after a paste", async () => {
+    const directory = await prepared();
+    const pasted = "\u001B[200~";
+    const ended = "\u001B[201~";
+
+    const run = await runCli(directory, upArguments(directory), {
+      environment: { SLACK_CONFIG_TOKEN: configToken, STUB_TTY: "1" },
+      input: `${pasted}pasted-progressX${ended}\u007F\n${pasted}pasted-bot-token${ended}\n`,
+    });
+
+    expect(run.exitCode).toBe(0);
+    expect(run.state.put).toEqual({
+      "provision-fixture-staging PROGRESS_BEARER": "pasted-progress",
+      "provision-fixture-staging SLACK_BOT_TOKEN": "pasted-bot-token",
+      "provision-fixture-staging SLACK_SIGNING_SECRET": signingSecret,
+    });
+  });
+
   test("resumes after a failed deploy without creating a second D1", async () => {
     const directory = await prepared();
 
