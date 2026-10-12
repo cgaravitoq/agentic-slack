@@ -384,8 +384,9 @@ const environmentConfig = (
 const present = (value: string | undefined): string | undefined =>
   value === undefined || value === "" ? undefined : value;
 
-// Adopted IDs in the lock win over the agent.yaml placeholder, and a missing
-// ID in both stops the build instead of deploying against an undefined id.
+// Adopted IDs in the lock win over the agent.yaml placeholder: a missing D1 id
+// stops the build, and the Slack app id the Slack phase creates is added to the
+// vars only once it exists.
 const resolvedEnvironment = (
   name: string,
   environment: InstanceEnvironment,
@@ -400,17 +401,15 @@ const resolvedEnvironment = (
   }
   const appId =
     present(entry?.slack?.appId) ?? present(environment.vars.SLACK_APP_ID);
-  if (appId === undefined) {
-    throw new Error(
-      `agent.yaml has no environments.${name}.vars.SLACK_APP_ID and agentic-slack.lock.json has none: run agentic-slack adopt --dir . --env ${name} --app-id <id>`,
-    );
-  }
   return {
     databaseId,
-    environment: {
-      ...environment,
-      vars: { ...environment.vars, SLACK_APP_ID: appId },
-    },
+    environment:
+      appId === undefined
+        ? environment
+        : {
+            ...environment,
+            vars: { ...environment.vars, SLACK_APP_ID: appId },
+          },
   };
 };
 
@@ -500,7 +499,6 @@ environments:
     domain: slack-agent-staging.example.com
     vars:
       SLACK_TEAM_ID: T00000000
-      SLACK_APP_ID: A00000000
     d1:
       name: slack-agent-staging
       id: "00000000-0000-0000-0000-000000000000"

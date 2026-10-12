@@ -438,25 +438,29 @@ ${minimalEnvironment}`),
     ).toThrow(/environments\.staging\.d1\.id .*agentic-slack adopt/u);
   });
 
-  test("stops when neither the lock nor agent.yaml has SLACK_APP_ID", () => {
+  test("builds an environment that has no Slack app yet", () => {
     const source =
       agentHeader +
       minimalEnvironment.replace("      SLACK_APP_ID: A0000000001\n", "");
 
-    expect(() =>
-      generateWranglerConfig(
-        parseInstance(source),
-        "staging",
-        migrationsDirectory,
-        outputDirectory,
-        emptyLock(),
+    const generated = v.parse(
+      generatedWranglerSchema,
+      JSON.parse(
+        generateWranglerConfig(
+          parseInstance(source),
+          "staging",
+          migrationsDirectory,
+          outputDirectory,
+          emptyLock(),
+        ),
       ),
-    ).toThrow(
-      /environments\.staging\.vars\.SLACK_APP_ID .*agentic-slack adopt/u,
     );
+
+    expect(generated.env.staging.vars.SLACK_APP_ID).toBeUndefined();
+    expect(generated.env.staging.vars.SLACK_TEAM_ID).toBe("T0000000001");
   });
 
-  test("treats an empty SLACK_APP_ID as missing", () => {
+  test("takes the Slack app id of the lock over an empty agent.yaml var", () => {
     const source =
       agentHeader +
       minimalEnvironment.replace(
@@ -464,17 +468,31 @@ ${minimalEnvironment}`),
         'SLACK_APP_ID: ""',
       );
 
-    expect(() =>
-      generateWranglerConfig(
-        parseInstance(source),
-        "staging",
-        migrationsDirectory,
-        outputDirectory,
-        emptyLock(),
+    const generated = v.parse(
+      generatedWranglerSchema,
+      JSON.parse(
+        generateWranglerConfig(
+          parseInstance(source),
+          "staging",
+          migrationsDirectory,
+          outputDirectory,
+          {
+            environments: {
+              staging: {
+                d1: {
+                  id: "11111111-1111-1111-1111-111111111111",
+                  name: "instance-staging",
+                },
+                slack: { appId: "A9999999999", manifestSha256: "a".repeat(64) },
+              },
+            },
+            version: 1,
+          },
+        ),
       ),
-    ).toThrow(
-      /environments\.staging\.vars\.SLACK_APP_ID .*agentic-slack adopt/u,
     );
+
+    expect(generated.env.staging.vars.SLACK_APP_ID).toBe("A9999999999");
   });
 });
 
@@ -569,7 +587,7 @@ describe("scaffoldFiles", () => {
       routes: [
         { custom_domain: true, pattern: "slack-agent-staging.example.com" },
       ],
-      vars: { SLACK_APP_ID: "A00000000", SLACK_TEAM_ID: "T00000000" },
+      vars: { SLACK_TEAM_ID: "T00000000" },
       workers_dev: false,
     });
   });

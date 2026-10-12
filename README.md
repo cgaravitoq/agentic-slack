@@ -553,7 +553,6 @@ environments:
     domain: slack-agent-staging.example.com
     vars:
       SLACK_TEAM_ID: T00000000
-      SLACK_APP_ID: A00000000
     d1:
       name: slack-agent-staging
       id: 00000000-0000-0000-0000-000000000000
@@ -561,7 +560,7 @@ environments:
 
 `agent` holds the behavior, and its `skills` are paths to directories holding a `SKILL.md`, relative to `agent.yaml`.
 `environments` holds one Worker name, custom domain, `vars` and D1 database per environment.
-`d1.id` and the `SLACK_APP_ID` var are optional once `agentic-slack.lock.json` holds them.
+`d1.id` and the `SLACK_APP_ID` var are optional once `agentic-slack.lock.json` holds them: an app id in `vars` is the one `adopt` verified, and `up` writes the id its Slack phase creates into the lock, which the build prefers.
 A `cloudflare/<model>` model builds on Workers AI and binds `AI`, with no broker.
 A `broker/<model>` model binds `MODEL_BROKER`, and then every environment needs its own `broker` service and entrypoint, because the model credential stays with the operator's broker.
 `secrets` declares the Worker secrets you create with `wrangler secret put`; the build rejects a configuration that names a secret the list does not declare.
@@ -570,10 +569,10 @@ Every rejected configuration stops the build with the YAML path of each problem.
 ### agentic-slack.lock.json
 
 `agentic-slack.lock.json` sits beside `agent.yaml` and is committed with it.
-It holds the non-secret IDs provisioning assigned, so `agent.yaml` stays user input: per environment the Worker name, the D1 database name and id, and the Slack app id with the sha256 of the manifest generated for it.
+It holds the non-secret IDs provisioning assigned, so `agent.yaml` stays user input: per environment the custom domain, the D1 database name and id, the Worker name, and the Slack app id with the sha256 of the manifest generated for it.
 The build reads an id from the lock first and falls back to `agent.yaml`; a build that finds neither stops with the command to run.
 The lock holds no token and no secret.
-An entry gains its `slack` block once a Slack app is verified for it, so an environment that is still being provisioned can hold its D1 and Worker alone.
+An entry holds what exists so far: the D1 from the moment it is created, the Worker and its domain once it deploys, and the `slack` block once the app is created or adopted.
 
 ### Provision an environment
 
@@ -587,23 +586,32 @@ Every phase is idempotent, so a rerun after a failure resumes instead of startin
 
 1. **D1**: it reuses the id in the lock, verifies an id `agent.yaml` declares, or creates the database named after the environment, writes the id to the lock, and applies the D1 migrations to that remote database.
 2. **Build**: it builds that environment only, so an environment still missing its ids does not block the one you asked for.
-3. **Deploy**: it deploys the generated configuration, including the custom domain, and records the Worker in the lock.
+3. **Deploy**: it deploys the generated configuration, including the custom domain, and records the Worker and its domain in the lock.
 4. **Secrets**: for every name in `secrets` the Worker does not have yet, it reads the environment variable of that name or prompts for the value on a terminal without echoing it, and it never prints the value.
    Secrets the Worker already has are kept, unless `--rotate <NAME>` names them; the flag can be repeated.
-5. **Health**: it GETs `https://<domain>/health` and reports the missing bindings, exiting non-zero when the Worker is not ready.
+   `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET` are the Slack app's own and belong to the next phase, so this one never asks for them.
+5. **Slack app**: it generates the app manifest for that environment's domain and compares its sha256 with the one the lock holds for the environment.
+   With no app in the lock it creates the app from the manifest, writes its id and the sha256 of the manifest Slack accepted to the lock, and deploys the Worker once more so `SLACK_APP_ID` reaches it.
+   With a different sha256 it updates the app in place and records the new sha256.
+   With the same sha256 it leaves Slack alone and never asks for a token.
+   It then stores the signing secret a newly created app answers as the `SLACK_SIGNING_SECRET` Worker secret, unless the Worker already carries one, and, when `SLACK_BOT_TOKEN` is not a Worker secret yet, prints the app's install page and reads the token from `SLACK_BOT_TOKEN` or prompts for it once without echoing it.
+   Every Slack call is retried with backoff while Slack rate limits it.
+   An update that changes the bot scopes needs the app reinstalled in the workspace before Slack carries them.
+6. **Health**: it GETs `https://<domain>/health` and reports the missing bindings, exiting non-zero when the Worker is not ready.
 
-The Slack phase that creates, updates and installs the app is not in this command yet: `up` reports the lock's Slack entry and changes nothing in Slack.
+A first `up` therefore asks the operator for two things: a Slack configuration token, which the Slack app calls need and which is read from `SLACK_CONFIG_TOKEN` or a no-echo prompt the first time it is needed, and one click on the install page followed by one paste of the bot token.
 
 ### Tear down an environment
 
-`down` prints the Worker, the D1 database and the custom domain that the environment's lock entry holds, and requires typing the confirmation it prints:
+`down` prints the D1 database, the Worker, the custom domain and the Slack app that the environment's lock entry holds, and requires typing the confirmation it prints:
 
 ```sh
 bunx agentic-slack down --dir . --env staging
 ```
 
 It deletes only those locked resources and then removes the environment from the lock, keeping every other entry.
-It leaves the Slack app alone, because deleting it belongs to the Slack phase.
+It deletes the Slack app with the same configuration token `up` uses, so export `SLACK_CONFIG_TOKEN` or answer the prompt.
+A Worker that is already gone is reported and skipped, and the D1 is deleted either way, so an environment whose `up` never deployed can still be torn down.
 
 ### Adopt an existing deployment
 
@@ -617,7 +625,7 @@ bunx agentic-slack adopt --dir . --env staging --d1-id 00000000-0000-0000-0000-0
 It compares bot scopes, bot events, the events request URL, and interactivity, and it refuses with a diff when they differ.
 It creates, updates and deletes nothing in Cloudflare or Slack.
 On success it writes that environment's entry into `agentic-slack.lock.json`.
-The manifest export needs a Slack configuration token with `configurations:read` and `configurations:write`: set `SLACK_CONFIG_TOKEN` or answer the prompt.
+The manifest export needs a Slack configuration token with `app_configurations:read`; creating, updating and deleting apps need `app_configurations:write`: set `SLACK_CONFIG_TOKEN` or answer the prompt.
 An environment the lock already holds can be re-adopted without `--d1-id` and `--app-id`.
 
 ## Consume a pinned copy

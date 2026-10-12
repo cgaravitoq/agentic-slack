@@ -221,6 +221,7 @@ describe("adopt", () => {
     const instance = parseInstance(agentYaml);
     expect(lock.environments.staging).toEqual({
       d1: { id: d1Id, name: "package-fixture-staging" },
+      domain: "package-fixture-staging.example.com",
       slack: {
         appId,
         manifestSha256: manifestSha256(

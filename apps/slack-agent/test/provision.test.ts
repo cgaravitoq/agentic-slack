@@ -3,7 +3,14 @@ import { chmod, mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as v from "valibot";
-import { lockFileName, readLock } from "../../../packages/core/src/lock.ts";
+import { defineAgentConfig } from "../../../packages/core/src/config.ts";
+import { parseInstance } from "../../../packages/core/src/instance.ts";
+import {
+  lockFileName,
+  manifestSha256,
+  readLock,
+} from "../../../packages/core/src/lock.ts";
+import { generateSlackManifest } from "../../../packages/core/src/manifest.ts";
 
 const repositoryRoot = path.resolve(import.meta.dirname, "../../..");
 const cli = path.join(repositoryRoot, "bin/agentic-slack.ts");
@@ -12,8 +19,12 @@ const cli = path.join(repositoryRoot, "bin/agentic-slack.ts");
 setDefaultTimeout(60_000);
 
 const d1Id = "33333333-3333-3333-3333-333333333333";
+const appId = "A0000000PROV";
 const botToken = "xoxb-provision-fixture-bot";
+const configToken = "xoxe-provision-fixture-config";
+const progressBearer = "provision-fixture-progress";
 const signingSecret = "provision-fixture-signing";
+const domain = "provision-fixture-staging.example.com";
 
 const agentYaml = `agent:
   name: Provision Fixture
@@ -22,13 +33,13 @@ const agentYaml = `agent:
 secrets:
   - SLACK_BOT_TOKEN
   - SLACK_SIGNING_SECRET
+  - PROGRESS_BEARER
 environments:
   staging:
     worker: provision-fixture-staging
-    domain: provision-fixture-staging.example.com
+    domain: ${domain}
     vars:
       SLACK_TEAM_ID: T0000000001
-      SLACK_APP_ID: A0000000001
     d1:
       name: provision-fixture-staging
   prod:
@@ -41,20 +52,39 @@ environments:
       name: provision-fixture
 `;
 
-const stagingLockEntry = {
+const stagingSlack = { appId, manifestSha256: "1".repeat(64) };
+
+const prodEntry = {
+  d1: { id: "22222222-2222-2222-2222-222222222222", name: "instance" },
+  domain: "provision-fixture.example.com",
+  slack: { appId: "A0000000002", manifestSha256: "2".repeat(64) },
+  worker: "provision-fixture",
+};
+
+const stagingEntry = {
   d1: { id: "11111111-1111-1111-1111-111111111111", name: "adopted-staging" },
+  domain,
+  slack: stagingSlack,
   worker: "provision-fixture-staging",
 };
 
 const lockSource = `${JSON.stringify(
+  { environments: { prod: prodEntry, staging: stagingEntry }, version: 1 },
+  null,
+  2,
+)}\n`;
+
+const lockWithoutSlackApp = `${JSON.stringify(
   {
     environments: {
-      prod: {
-        d1: { id: "22222222-2222-2222-2222-222222222222", name: "instance" },
-        slack: { appId: "A0000000002", manifestSha256: "2".repeat(64) },
-        worker: "provision-fixture",
+      staging: {
+        d1: {
+          id: "11111111-1111-1111-1111-111111111111",
+          name: "adopted-staging",
+        },
+        domain,
+        worker: "provision-fixture-staging",
       },
-      staging: stagingLockEntry,
     },
     version: 1,
   },
@@ -68,20 +98,24 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 const args = process.argv.slice(2);
 appendFileSync(process.env.STUB_WRANGLER_LOG, args.join(" ") + "\\n");
 const statePath = process.env.STUB_WRANGLER_STATE;
+const seededSecrets = () => {
+  const names = (process.env.STUB_WRANGLER_SECRETS ?? "")
+    .split(",")
+    .filter((name) => name !== "");
+  return names.length === 0 ? {} : { "provision-fixture-staging": names };
+};
 const existing = existsSync(statePath);
 const state = existing
   ? JSON.parse(readFileSync(statePath, "utf8"))
   : {
       databases: [],
       deleted: [],
-      deployed: [],
+      deploys: [],
       put: {},
-      secrets: Object.fromEntries(
-        (process.env.STUB_WRANGLER_SECRETS ?? "")
-          .split(",")
-          .filter((name) => name !== "")
-          .map((name) => ["provision-fixture-staging", [name]]),
-      ),
+      secrets: seededSecrets(),
+      workers: (process.env.STUB_WRANGLER_WORKERS ?? "")
+        .split(",")
+        .filter((name) => name !== ""),
     };
 const save = () => writeFileSync(statePath, JSON.stringify(state, null, 2));
 const fail = (message) => {
@@ -146,17 +180,29 @@ if (group === "secret" && command === "put") {
   console.log("Success! Uploaded secret " + args[2]);
   process.exit(0);
 }
+if (group === "deployments" && command === "list") {
+  const worker = named("--name");
+  if (!state.workers.includes(worker)) {
+    fail("Worker " + worker + " not found");
+  }
+  console.log(JSON.stringify([{ id: "deployment", name: worker }]));
+  process.exit(0);
+}
 if (group === "deploy") {
   if (process.env.STUB_WRANGLER_FAIL_DEPLOY === "1") {
     fail("deploy failed");
   }
-  state.deployed.push(named("--config"));
+  const configPath = named("--config");
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  state.deploys.push({ config: configPath, name: config.name, vars: config.vars ?? {} });
+  state.workers = [...new Set([...state.workers, config.name])];
   save();
-  console.log("Deployed");
+  console.log("Deployed " + config.name);
   process.exit(0);
 }
 if (group === "delete") {
   state.deleted.push("worker " + args[1]);
+  state.workers = state.workers.filter((worker) => worker !== args[1]);
   save();
   console.log("Successfully deleted " + args[1]);
   process.exit(0);
@@ -176,9 +222,50 @@ if (process.env.STUB_TTY === "1") {
   Object.defineProperty(process, "stdin", { configurable: true, value: stdin });
 }
 
-globalThis.fetch = async (input) => {
+let slackCalls = 0;
+
+globalThis.fetch = async (input, init) => {
   const url = String(input instanceof Request ? input.url : input);
   appendFileSync(process.env.STUB_FETCH_LOG, url + "\\n");
+  if (url.startsWith("https://slack.com/api/")) {
+    const method = url.slice("https://slack.com/api/".length);
+    slackCalls += 1;
+    appendFileSync(
+      process.env.STUB_SLACK_LOG,
+      JSON.stringify({
+        method,
+        params: Object.fromEntries(
+          new URLSearchParams(String(init?.body ?? "")),
+        ),
+        token: String(init?.headers?.authorization ?? ""),
+      }) + "\\n",
+    );
+    if (process.env.STUB_SLACK_RATELIMIT === "1" && slackCalls === 1) {
+      return Response.json(
+        { error: "ratelimited", ok: false },
+        { status: 429 },
+      );
+    }
+    if (method === "apps.manifest.create") {
+      return Response.json({
+        app_id: process.env.STUB_SLACK_APP_ID,
+        credentials: { signing_secret: process.env.STUB_SLACK_SIGNING_SECRET },
+        oauth_authorize_url: "https://slack.com/oauth/v2/authorize?client_id=stub",
+        ok: true,
+      });
+    }
+    if (method === "apps.manifest.update") {
+      return Response.json({
+        app_id: process.env.STUB_SLACK_APP_ID,
+        ok: true,
+        permissions_updated: false,
+      });
+    }
+    if (method === "apps.manifest.delete") {
+      return Response.json({ ok: true });
+    }
+    return Response.json({ error: "unknown_method", ok: false });
+  }
   if (process.env.STUB_HEALTH === "missing") {
     return Response.json(
       { missing: ["SLACK_BOT_TOKEN", "DB"], status: "not_ready" },
@@ -189,18 +276,32 @@ globalThis.fetch = async (input) => {
 };
 `;
 
+interface Deploy {
+  name: string;
+  vars: Record<string, string>;
+}
+
+interface SlackCall {
+  method: string;
+  params: Record<string, string>;
+  token: string;
+}
+
 interface StubState {
   databases: readonly { name: string; uuid: string }[];
   deleted: readonly string[];
-  deployed: readonly string[];
+  deploys: readonly Deploy[];
   put: Record<string, string>;
   secrets: Record<string, readonly string[]>;
+  workers: readonly string[];
 }
 
 interface CliRun {
   calls: readonly string[];
+  deploys: readonly Deploy[];
   exitCode: number;
   fetchLog: readonly string[];
+  slack: readonly SlackCall[];
   state: StubState;
   stderr: string;
   stdout: string;
@@ -222,6 +323,7 @@ const prepared = async (): Promise<string> => {
   await writeFile(path.join(directory, "preload.ts"), preload);
   await writeFile(path.join(directory, "wrangler.log"), "");
   await writeFile(path.join(directory, "fetch.log"), "");
+  await writeFile(path.join(directory, "slack.log"), "");
   return directory;
 };
 
@@ -239,6 +341,7 @@ const runCli = async (
   }
   await writeFile(path.join(directory, "wrangler.log"), "");
   await writeFile(path.join(directory, "fetch.log"), "");
+  await writeFile(path.join(directory, "slack.log"), "");
   const child = Bun.spawn(
     [
       process.execPath,
@@ -253,9 +356,14 @@ const runCli = async (
         ...process.env,
         CI: "true",
         PATH: `${path.join(directory, "stubs")}:${process.env.PATH ?? ""}`,
+        PROGRESS_BEARER: "",
         SLACK_BOT_TOKEN: "",
+        SLACK_CONFIG_TOKEN: "",
         SLACK_SIGNING_SECRET: "",
         STUB_FETCH_LOG: path.join(directory, "fetch.log"),
+        STUB_SLACK_APP_ID: appId,
+        STUB_SLACK_LOG: path.join(directory, "slack.log"),
+        STUB_SLACK_SIGNING_SECRET: signingSecret,
         STUB_STDIN_INPUT: options.input ?? "",
         STUB_WRANGLER_D1_ID: d1Id,
         STUB_WRANGLER_LOG: path.join(directory, "wrangler.log"),
@@ -278,76 +386,147 @@ const runCli = async (
     return contents.split("\n").filter((line) => line !== "");
   };
   const stateFile = path.join(directory, "wrangler-state.json");
+  const state = (await Bun.file(stateFile).exists())
+    ? v.parse(
+        v.object({
+          databases: v.array(v.object({ name: v.string(), uuid: v.string() })),
+          deleted: v.array(v.string()),
+          deploys: v.array(
+            v.object({
+              config: v.string(),
+              name: v.string(),
+              vars: v.record(v.string(), v.string()),
+            }),
+          ),
+          put: v.record(v.string(), v.string()),
+          secrets: v.record(v.string(), v.array(v.string())),
+          workers: v.array(v.string()),
+        }),
+        await Bun.file(stateFile).json(),
+      )
+    : {
+        databases: [],
+        deleted: [],
+        deploys: [],
+        put: {},
+        secrets: {},
+        workers: [],
+      };
+  const slackLines = await lines("slack.log");
   return {
     calls: await lines("wrangler.log"),
+    deploys: state.deploys,
     exitCode,
     fetchLog: await lines("fetch.log"),
-    state: (await Bun.file(stateFile).exists())
-      ? v.parse(
-          v.object({
-            databases: v.array(
-              v.object({ name: v.string(), uuid: v.string() }),
-            ),
-            deleted: v.array(v.string()),
-            deployed: v.array(v.string()),
-            put: v.record(v.string(), v.string()),
-            secrets: v.record(v.string(), v.array(v.string())),
-          }),
-          await Bun.file(stateFile).json(),
-        )
-      : { databases: [], deleted: [], deployed: [], put: {}, secrets: {} },
+    slack: slackLines.map((line) =>
+      v.parse(
+        v.object({
+          method: v.string(),
+          params: v.record(v.string(), v.string()),
+          token: v.string(),
+        }),
+        JSON.parse(line),
+      ),
+    ),
+    state,
     stderr,
     stdout,
   };
 };
 
-const secrets = {
+const upArguments = (directory: string): readonly string[] => [
+  "up",
+  "--dir",
+  directory,
+  "--env",
+  "staging",
+];
+
+const downArguments = (directory: string): readonly string[] => [
+  "down",
+  "--dir",
+  directory,
+  "--env",
+  "staging",
+];
+
+const manifestSchema = v.object({
+  settings: v.object({
+    event_subscriptions: v.object({ request_url: v.string() }),
+  }),
+});
+
+const configured = {
+  PROGRESS_BEARER: progressBearer,
   SLACK_BOT_TOKEN: botToken,
-  SLACK_SIGNING_SECRET: signingSecret,
+  SLACK_CONFIG_TOKEN: configToken,
 };
 
 describe("up", () => {
-  test("creates the D1, migrates, deploys and pushes the declared secrets", async () => {
+  test("creates the app, redeploys its id and sets the Slack secrets", async () => {
     const directory = await prepared();
 
-    const run = await runCli(
-      directory,
-      ["up", "--dir", directory, "--env", "staging"],
-      {
-        environment: secrets,
-      },
-    );
+    const run = await runCli(directory, upArguments(directory), {
+      environment: configured,
+    });
 
-    expect(run.stderr).not.toContain(botToken);
     expect(run.exitCode).toBe(0);
     expect(run.stdout).toContain(`D1 provision-fixture-staging (${d1Id})`);
-    expect(run.stdout).toContain("Deployed provision-fixture-staging");
-    expect(run.stdout).toContain("Slack app: none recorded");
     expect(run.stdout).toContain(
-      "https://provision-fixture-staging.example.com/health is ready",
+      `Deployed provision-fixture-staging to https://${domain}`,
     );
+    expect(run.stdout).toContain(`Created Slack app ${appId}`);
+    expect(run.stdout).toContain(
+      `https://api.slack.com/apps/${appId}/install-on-team`,
+    );
+    expect(run.stdout).toContain(`https://${domain}/health is ready`);
     expect(run.stdout).not.toContain(botToken);
     expect(run.stdout).not.toContain(signingSecret);
-    expect(run.calls).toContain("d1 create provision-fixture-staging");
-    expect(
-      run.calls.some((call) =>
-        call.startsWith("d1 migrations apply DB --config"),
-      ),
-    ).toBe(true);
-    expect(run.calls.some((call) => call.startsWith("deploy --config"))).toBe(
-      true,
+    expect(run.stderr).not.toContain(configToken);
+
+    expect(run.slack.map((call) => call.method)).toEqual([
+      "apps.manifest.create",
+    ]);
+    const [created] = run.slack;
+    expect(created.token).toBe(`Bearer ${configToken}`);
+    expect(created.params.manifest).toBeDefined();
+    const manifest = v.parse(
+      manifestSchema,
+      JSON.parse(created.params.manifest),
     );
+    expect(manifest.settings.event_subscriptions.request_url).toBe(
+      `https://${domain}/channels/slack/events`,
+    );
+
+    expect(run.calls.some((call) => call.startsWith("d1 create"))).toBe(true);
+    expect(
+      run.calls.some((call) => call.startsWith("d1 migrations apply DB")),
+    ).toBe(true);
+    expect(run.deploys.map((deploy) => deploy.name)).toEqual([
+      "provision-fixture-staging",
+      "provision-fixture-staging",
+    ]);
+    expect(run.deploys[0].vars.SLACK_APP_ID).toBeUndefined();
+    expect(run.deploys[1].vars.SLACK_APP_ID).toBe(appId);
+    expect(run.deploys[1].vars.SLACK_TEAM_ID).toBe("T0000000001");
     expect(run.state.put).toEqual({
+      "provision-fixture-staging PROGRESS_BEARER": progressBearer,
       "provision-fixture-staging SLACK_BOT_TOKEN": botToken,
       "provision-fixture-staging SLACK_SIGNING_SECRET": signingSecret,
     });
     expect(run.fetchLog).toEqual([
-      "https://provision-fixture-staging.example.com/health",
+      "https://slack.com/api/apps.manifest.create",
+      `https://${domain}/health`,
     ]);
     expect(await readLock(directory)).toEqual({
       environments: {
         staging: {
           d1: { id: d1Id, name: "provision-fixture-staging" },
+          domain,
+          slack: {
+            appId,
+            manifestSha256: manifestSha256(created.params.manifest),
+          },
           worker: "provision-fixture-staging",
         },
       },
@@ -355,59 +534,163 @@ describe("up", () => {
     });
   });
 
-  test("reruns without creating the D1 again or rewriting its secrets", async () => {
+  test("reruns without creating the D1 again, calling Slack or rewriting secrets", async () => {
     const directory = await prepared();
-    await runCli(directory, ["up", "--dir", directory, "--env", "staging"], {
-      environment: secrets,
+    await runCli(directory, upArguments(directory), {
+      environment: configured,
     });
 
-    const run = await runCli(
-      directory,
-      ["up", "--dir", directory, "--env", "staging"],
-      { environment: secrets },
-    );
+    const run = await runCli(directory, upArguments(directory), {
+      environment: configured,
+    });
 
     expect(run.exitCode).toBe(0);
     expect(run.calls.some((call) => call.startsWith("d1 create"))).toBe(false);
     expect(run.calls.some((call) => call.startsWith("secret put"))).toBe(false);
+    expect(run.slack).toEqual([]);
+    expect(run.stderr).not.toContain("SLACK_BOT_TOKEN: ");
     expect(run.stdout).toContain(
-      "Worker secrets: kept SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET",
+      `Slack app ${appId} matches the generated manifest`,
     );
+    expect(run.stdout).not.toContain("install-on-team");
+    expect(run.stdout).toContain("Worker secrets: kept PROGRESS_BEARER");
+    expect(run.deploys.at(-1)?.vars.SLACK_APP_ID).toBe(appId);
     expect(run.state.databases).toHaveLength(1);
+  });
+
+  test("updates the app when the generated manifest changed", async () => {
+    const directory = await prepared();
+
+    const run = await runCli(directory, upArguments(directory), {
+      environment: {
+        ...configured,
+        STUB_WRANGLER_SECRETS: "SLACK_BOT_TOKEN,SLACK_SIGNING_SECRET",
+      },
+      lock: lockSource,
+    });
+
+    expect(run.exitCode).toBe(0);
+    expect(run.slack.map((call) => call.method)).toEqual([
+      "apps.manifest.update",
+    ]);
+    expect(run.slack[0].params.app_id).toBe(appId);
+    expect(run.slack[0].token).toBe(`Bearer ${configToken}`);
+    expect(run.stdout).toContain(`Updated Slack app ${appId}`);
+    expect(run.stdout).not.toContain("install-on-team");
+    expect(run.deploys).toHaveLength(1);
+    expect(run.state.put).toEqual({
+      "provision-fixture-staging PROGRESS_BEARER": progressBearer,
+    });
+    const lock = await readLock(directory);
+    expect(lock.environments.staging?.slack?.manifestSha256).toBe(
+      manifestSha256(run.slack[0].params.manifest),
+    );
+  });
+
+  test("skips an app whose manifest matches without asking for a token", async () => {
+    const directory = await prepared();
+    const instance = parseInstance(agentYaml);
+    const manifest = generateSlackManifest(
+      defineAgentConfig({ ...instance.agent, skills: undefined }),
+      `https://${domain}`,
+    );
+    const skipped = {
+      ...stagingEntry,
+      slack: { appId, manifestSha256: manifestSha256(manifest) },
+    };
+    const lock = `${JSON.stringify(
+      { environments: { staging: skipped }, version: 1 },
+      null,
+      2,
+    )}\n`;
+
+    const run = await runCli(directory, upArguments(directory), {
+      environment: {
+        PROGRESS_BEARER: progressBearer,
+        STUB_WRANGLER_SECRETS: "SLACK_BOT_TOKEN,SLACK_SIGNING_SECRET",
+      },
+      lock,
+    });
+
+    expect(run.exitCode).toBe(0);
+    expect(run.slack).toEqual([]);
+    expect(run.state.put).toEqual({
+      "provision-fixture-staging PROGRESS_BEARER": progressBearer,
+    });
+    expect(run.stderr).not.toContain("configuration token");
+    expect(run.stdout).toContain(
+      `Slack app ${appId} matches the generated manifest`,
+    );
+    expect(await readLock(directory)).toEqual({
+      environments: { staging: skipped },
+      version: 1,
+    });
+  });
+
+  test("retries a Slack call Slack is rate limiting", async () => {
+    const directory = await prepared();
+
+    const run = await runCli(directory, upArguments(directory), {
+      environment: { ...configured, STUB_SLACK_RATELIMIT: "1" },
+    });
+
+    expect(run.exitCode).toBe(0);
+    expect(run.slack.map((call) => call.method)).toEqual([
+      "apps.manifest.create",
+      "apps.manifest.create",
+    ]);
+    expect(run.stdout).toContain("Slack is rate limiting apps.manifest.create");
+    const lock = await readLock(directory);
+    expect(lock.environments.staging?.slack?.appId).toBe(appId);
+  });
+
+  test("prompts on a tty for the missing secrets and never prints them", async () => {
+    const directory = await prepared();
+
+    const run = await runCli(directory, upArguments(directory), {
+      environment: { SLACK_CONFIG_TOKEN: configToken, STUB_TTY: "1" },
+      input: "prompted-progress\nprompted-bot-token\n",
+    });
+
+    expect(run.exitCode).toBe(0);
+    expect(run.stderr).toContain("PROGRESS_BEARER: ");
+    expect(run.stderr).toContain("SLACK_BOT_TOKEN: ");
+    expect(run.stderr).not.toContain("SLACK_SIGNING_SECRET: ");
+    expect(run.state.put).toEqual({
+      "provision-fixture-staging PROGRESS_BEARER": "prompted-progress",
+      "provision-fixture-staging SLACK_BOT_TOKEN": "prompted-bot-token",
+      "provision-fixture-staging SLACK_SIGNING_SECRET": signingSecret,
+    });
+    expect(`${run.stdout}${run.stderr}`).not.toContain("prompted-progress");
+    expect(`${run.stdout}${run.stderr}`).not.toContain("prompted-bot-token");
   });
 
   test("resumes after a failed deploy without creating a second D1", async () => {
     const directory = await prepared();
 
-    const failed = await runCli(
-      directory,
-      ["up", "--dir", directory, "--env", "staging"],
-      { environment: { ...secrets, STUB_WRANGLER_FAIL_DEPLOY: "1" } },
-    );
+    const failed = await runCli(directory, upArguments(directory), {
+      environment: { ...configured, STUB_WRANGLER_FAIL_DEPLOY: "1" },
+    });
 
     expect(failed.exitCode).toBe(1);
     expect(failed.stderr).toContain("wrangler deploy --config");
+    expect(failed.slack).toEqual([]);
     expect(await readLock(directory)).toEqual({
       environments: {
-        staging: {
-          d1: { id: d1Id, name: "provision-fixture-staging" },
-          worker: "provision-fixture-staging",
-        },
+        staging: { d1: { id: d1Id, name: "provision-fixture-staging" } },
       },
       version: 1,
     });
 
-    const resumed = await runCli(
-      directory,
-      ["up", "--dir", directory, "--env", "staging"],
-      { environment: secrets },
-    );
+    const resumed = await runCli(directory, upArguments(directory), {
+      environment: configured,
+    });
 
     expect(resumed.exitCode).toBe(0);
     expect(resumed.calls.some((call) => call.startsWith("d1 create"))).toBe(
       false,
     );
-    expect(resumed.calls.some((call) => call.startsWith("deploy"))).toBe(true);
+    expect(resumed.deploys).toHaveLength(2);
     expect(resumed.state.databases).toHaveLength(1);
   });
 
@@ -416,94 +699,50 @@ describe("up", () => {
 
     const run = await runCli(
       directory,
-      [
-        "up",
-        "--dir",
-        directory,
-        "--env",
-        "staging",
-        "--rotate",
-        "SLACK_BOT_TOKEN",
-      ],
+      [...upArguments(directory), "--rotate", "PROGRESS_BEARER"],
       {
         environment: {
-          ...secrets,
-          STUB_WRANGLER_SECRETS: "SLACK_BOT_TOKEN,SLACK_SIGNING_SECRET",
+          ...configured,
+          STUB_WRANGLER_SECRETS: "PROGRESS_BEARER",
         },
       },
     );
 
     expect(run.exitCode).toBe(0);
     expect(run.calls).toContain(
-      "secret put SLACK_BOT_TOKEN --name provision-fixture-staging",
-    );
-    expect(run.calls).not.toContain(
-      "secret put SLACK_SIGNING_SECRET --name provision-fixture-staging",
+      "secret put PROGRESS_BEARER --name provision-fixture-staging",
     );
     expect(run.state.put).toEqual({
+      "provision-fixture-staging PROGRESS_BEARER": progressBearer,
       "provision-fixture-staging SLACK_BOT_TOKEN": botToken,
+      "provision-fixture-staging SLACK_SIGNING_SECRET": signingSecret,
     });
-    expect(run.stdout).toContain(
-      "Worker secrets: set SLACK_BOT_TOKEN; kept SLACK_SIGNING_SECRET",
-    );
-  });
-
-  test("prompts on a tty and never prints the value", async () => {
-    const directory = await prepared();
-
-    const run = await runCli(
-      directory,
-      ["up", "--dir", directory, "--env", "staging"],
-      {
-        environment: { STUB_TTY: "1" },
-        input: "prompted-bot-token\nprompted-signing-secret\n",
-      },
-    );
-
-    expect(run.exitCode).toBe(0);
-    expect(run.stderr).toContain("SLACK_BOT_TOKEN: ");
-    expect(run.stderr).toContain("SLACK_SIGNING_SECRET: ");
-    expect(run.state.put).toEqual({
-      "provision-fixture-staging SLACK_BOT_TOKEN": "prompted-bot-token",
-      "provision-fixture-staging SLACK_SIGNING_SECRET":
-        "prompted-signing-secret",
-    });
-    expect(`${run.stdout}${run.stderr}`).not.toContain("prompted-bot-token");
-    expect(`${run.stdout}${run.stderr}`).not.toContain(
-      "prompted-signing-secret",
-    );
+    expect(run.stdout).toContain("Worker secrets: set PROGRESS_BEARER");
   });
 
   test("reports the missing bindings when the Worker is not ready", async () => {
     const directory = await prepared();
 
-    const run = await runCli(
-      directory,
-      ["up", "--dir", directory, "--env", "staging"],
-      { environment: { ...secrets, STUB_HEALTH: "missing" } },
-    );
+    const run = await runCli(directory, upArguments(directory), {
+      environment: { ...configured, STUB_HEALTH: "missing" },
+    });
 
     expect(run.exitCode).toBe(1);
     expect(run.stderr).toContain(
-      "https://provision-fixture-staging.example.com/health is not ready: missing SLACK_BOT_TOKEN, DB",
+      `https://${domain}/health is not ready: missing SLACK_BOT_TOKEN, DB`,
     );
   });
 
   test("refuses a secret the environment does not carry", async () => {
     const directory = await prepared();
 
-    const run = await runCli(directory, [
-      "up",
-      "--dir",
-      directory,
-      "--env",
-      "staging",
-    ]);
+    const run = await runCli(directory, upArguments(directory));
 
     expect(run.exitCode).toBe(1);
     expect(run.stderr).toContain(
-      "SLACK_BOT_TOKEN is not a Worker secret and the environment does not set it",
+      "PROGRESS_BEARER is not a Worker secret and the environment does not set it",
     );
+    expect(run.slack).toEqual([]);
     expect(run.calls.some((call) => call.startsWith("deploy"))).toBe(true);
   });
 
@@ -512,16 +751,8 @@ describe("up", () => {
 
     const run = await runCli(
       directory,
-      [
-        "up",
-        "--dir",
-        directory,
-        "--env",
-        "staging",
-        "--rotate",
-        "NOT_DECLARED",
-      ],
-      { environment: secrets },
+      [...upArguments(directory), "--rotate", "NOT_DECLARED"],
+      { environment: configured },
     );
 
     expect(run.exitCode).toBe(1);
@@ -536,11 +767,10 @@ describe("down", () => {
   test("aborts on a confirmation that does not match, deleting nothing", async () => {
     const directory = await prepared();
 
-    const run = await runCli(
-      directory,
-      ["down", "--dir", directory, "--env", "staging"],
-      { input: "provision-fixture/staging\n", lock: lockSource },
-    );
+    const run = await runCli(directory, downArguments(directory), {
+      input: "provision-fixture/staging\n",
+      lock: lockSource,
+    });
 
     expect(run.exitCode).toBe(1);
     expect(run.stderr).toContain(
@@ -550,57 +780,127 @@ describe("down", () => {
     expect(run.stdout).toContain(
       "D1 adopted-staging (11111111-1111-1111-1111-111111111111)",
     );
+    expect(run.stdout).toContain(`Custom domain https://${domain}`);
+    expect(run.stdout).toContain(`Slack app ${appId}`);
     expect(run.calls).toEqual([]);
+    expect(run.slack).toEqual([]);
     expect(await readLock(directory)).toEqual({
-      environments: {
-        prod: {
-          d1: { id: "22222222-2222-2222-2222-222222222222", name: "instance" },
-          slack: { appId: "A0000000002", manifestSha256: "2".repeat(64) },
-          worker: "provision-fixture",
-        },
-        staging: stagingLockEntry,
-      },
+      environments: { prod: prodEntry, staging: stagingEntry },
       version: 1,
     });
   });
 
-  test("deletes the locked Worker and D1 and keeps the other entries", async () => {
+  test("deletes the locked Worker, Slack app and D1 and keeps the other entries", async () => {
     const directory = await prepared();
 
-    const run = await runCli(
-      directory,
-      ["down", "--dir", directory, "--env", "staging"],
-      { input: "Provision Fixture/staging\n", lock: lockSource },
-    );
+    const run = await runCli(directory, downArguments(directory), {
+      environment: {
+        SLACK_CONFIG_TOKEN: configToken,
+        STUB_WRANGLER_WORKERS: "provision-fixture-staging",
+      },
+      input: "Provision Fixture/staging\n",
+      lock: lockSource,
+    });
 
     expect(run.exitCode).toBe(0);
     expect(run.calls).toEqual([
+      "deployments list --name provision-fixture-staging --json",
       "delete provision-fixture-staging --force",
       "d1 delete adopted-staging --skip-confirmation",
     ]);
-    expect(run.stdout).toContain("Slack app: none recorded");
+    expect(run.slack.map((call) => call.method)).toEqual([
+      "apps.manifest.delete",
+    ]);
+    expect(run.slack[0].params.app_id).toBe(appId);
+    expect(run.slack[0].token).toBe(`Bearer ${configToken}`);
+    expect(run.stdout).toContain(`Deleted Slack app ${appId}`);
+    expect(run.stderr).not.toContain(configToken);
     const lock = await readLock(directory);
     expect(Object.keys(lock.environments)).toEqual(["prod"]);
-    expect(lock.environments.prod).toEqual({
-      d1: { id: "22222222-2222-2222-2222-222222222222", name: "instance" },
-      slack: { appId: "A0000000002", manifestSha256: "2".repeat(64) },
-      worker: "provision-fixture",
+    expect(lock.environments.prod).toEqual(prodEntry);
+  });
+
+  test("continues when the Worker is already gone and still deletes the D1", async () => {
+    const directory = await prepared();
+
+    const run = await runCli(directory, downArguments(directory), {
+      environment: { SLACK_CONFIG_TOKEN: configToken },
+      input: "Provision Fixture/staging\n",
+      lock: lockSource,
     });
+
+    expect(run.exitCode).toBe(0);
+    expect(run.stdout).toContain(
+      "Worker provision-fixture-staging is already gone",
+    );
+    expect(run.calls).toEqual([
+      "deployments list --name provision-fixture-staging --json",
+      "d1 delete adopted-staging --skip-confirmation",
+    ]);
+    expect(run.slack.map((call) => call.method)).toEqual([
+      "apps.manifest.delete",
+    ]);
+    expect(await readLock(directory)).toEqual({
+      environments: { prod: prodEntry },
+      version: 1,
+    });
+  });
+
+  test("deletes the D1 of an environment whose deploy never happened", async () => {
+    const directory = await prepared();
+    const failed = await runCli(directory, upArguments(directory), {
+      environment: { ...configured, STUB_WRANGLER_FAIL_DEPLOY: "1" },
+    });
+    expect(failed.exitCode).toBe(1);
+
+    const run = await runCli(directory, downArguments(directory), {
+      input: "Provision Fixture/staging\n",
+    });
+
+    expect(run.exitCode).toBe(0);
+    expect(run.calls).toEqual([
+      "d1 delete provision-fixture-staging --skip-confirmation",
+    ]);
+    expect(run.slack).toEqual([]);
+    expect(run.stdout).not.toContain("Worker");
+    expect(await readLock(directory)).toEqual({
+      environments: {},
+      version: 1,
+    });
+  });
+
+  test("asks Slack for nothing when the lock records no app", async () => {
+    const directory = await prepared();
+
+    const run = await runCli(directory, downArguments(directory), {
+      environment: { STUB_WRANGLER_WORKERS: "provision-fixture-staging" },
+      input: "Provision Fixture/staging\n",
+      lock: lockWithoutSlackApp,
+    });
+
+    expect(run.exitCode).toBe(0);
+    expect(run.slack).toEqual([]);
+    expect(run.stderr).not.toContain("configuration token");
+    expect(run.stdout).not.toContain("Slack app");
+    expect(run.calls).toEqual([
+      "deployments list --name provision-fixture-staging --json",
+      "delete provision-fixture-staging --force",
+      "d1 delete adopted-staging --skip-confirmation",
+    ]);
   });
 
   test("refuses an environment the lock does not hold", async () => {
     const directory = await prepared();
 
-    const run = await runCli(
-      directory,
-      ["down", "--dir", directory, "--env", "staging"],
-      { input: "Provision Fixture/staging\n" },
-    );
+    const run = await runCli(directory, downArguments(directory), {
+      input: "Provision Fixture/staging\n",
+    });
 
     expect(run.exitCode).toBe(1);
     expect(run.stderr).toContain(
       `${lockFileName} has no staging environment: nothing to delete`,
     );
     expect(run.calls).toEqual([]);
+    expect(run.slack).toEqual([]);
   });
 });
