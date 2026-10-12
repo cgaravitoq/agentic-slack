@@ -504,6 +504,25 @@ Protect your integration branch with the `verify` status check.
 This repository currently develops on `staging`; there is no tagged stable release yet.
 Do not use `main` as a substitute for a tested release without comparing its revision.
 
+## Install as a package
+
+With Bun installed, pin the package in your instance folder:
+
+```sh
+bun add --exact agentic-slack@0.0.0
+bunx agentic-slack --help
+bunx agentic-slack --version
+bunx agentic-slack build --dir . --env staging
+```
+
+Keep `agent.config.ts` and `wrangler.jsonc` in that folder.
+Import `defineAgentConfig` from `agentic-slack` in your agent configuration and declare the selected environment in `wrangler.jsonc`.
+The build prints its generated `wrangler.json` path under `.agentic-slack/staging/<worker-name>/`, outside the installed package.
+Add `.agentic-slack/` to your instance's `.gitignore`.
+The package includes D1 migrations at `node_modules/agentic-slack/apps/slack-agent/migrations`.
+This package shape is not yet published to npm; `init`, YAML configuration, `up`, and `down` are not implemented yet.
+For a local package check, run `bun run test:package` from this repository; it packs the package, installs it without development dependencies in a clean temporary folder, and builds an external fixture.
+
 ## Consume a pinned copy
 
 An operator repository can pin this repository, for example as a git submodule, and keep its own agent configuration, skills, and deployment configuration outside it.

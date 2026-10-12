@@ -6,6 +6,14 @@
     "cloudflare"
   ],
   "workspaces": {
+    ".": {
+      "ignoreDependencies": [
+        "@earendil-works/pi-ai",
+        "@flue/runtime",
+        "@flue/slack",
+        "hono"
+      ]
+    },
     "apps/slack-agent": {
       // The `!` suffix marks a production entry: Flue builds the Worker from
       // the `app` path in flue.config.ts, and wrangler.jsonc has no `main`
