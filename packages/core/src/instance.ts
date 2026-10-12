@@ -7,6 +7,7 @@ import {
   MODEL_PROVIDER_CLOUDFLARE,
   modelProviderOf,
 } from "./config.ts";
+import type { InstanceLock } from "./lock.ts";
 
 const text = v.pipe(v.string(), v.minLength(1, "Expected a non-empty string"));
 
@@ -109,7 +110,7 @@ const agentSchema = v.strictObject({
 
 const environmentSchema = v.strictObject({
   broker: v.optional(v.strictObject({ entrypoint: text, service: text })),
-  d1: v.strictObject({ id: text, name: workerName }),
+  d1: v.strictObject({ id: v.optional(text), name: workerName }),
   domain: hostName,
   vars: v.record(secretName, v.string()),
   worker: workerName,
@@ -127,16 +128,18 @@ const instanceSchema = v.strictObject({
   secrets: v.optional(v.array(secretName), []),
 });
 
-type AgentInstance = v.InferOutput<typeof instanceSchema>;
+export type AgentInstance = v.InferOutput<typeof instanceSchema>;
 
-type InstanceEnvironment = AgentInstance["environments"][string];
+export type InstanceEnvironment = AgentInstance["environments"][string];
 
 interface InstanceProblem {
   message: string;
   path: string;
 }
 
-const issuePath = (items: readonly IssuePathItem[] | undefined): string => {
+export const issuePath = (
+  items: readonly IssuePathItem[] | undefined,
+): string => {
   let dotPath = "";
   for (const item of items ?? []) {
     if (item.type === "array") {
@@ -279,6 +282,16 @@ export const parseInstance = (source: string): AgentInstance => {
   return result.output;
 };
 
+export const readInstance = async (
+  directory: string,
+): Promise<AgentInstance> => {
+  const source = path.join(directory, "agent.yaml");
+  if (!(await Bun.file(source).exists())) {
+    throw new Error(`${source} not found: run agentic-slack init ${directory}`);
+  }
+  return parseInstance(await Bun.file(source).text());
+};
+
 const relativePath = (from: string, to: string): string => {
   const relative = path.relative(from, to).split(path.sep).join("/");
   return relative.startsWith(".") ? relative : `./${relative}`;
@@ -338,13 +351,14 @@ const durableObjectMigration = {
 
 const environmentConfig = (
   environment: InstanceEnvironment,
+  databaseId: string,
   migrationsDirectory: string,
   outputDirectory: string,
 ) => ({
   d1_databases: [
     {
       binding: "DB",
-      database_id: environment.d1.id,
+      database_id: databaseId,
       database_name: environment.d1.name,
       migrations_dir: relativePath(outputDirectory, migrationsDirectory),
     },
@@ -367,19 +381,59 @@ const environmentConfig = (
       }),
 });
 
+// Adopted IDs in the lock win over the agent.yaml placeholder, and a missing
+// ID in both stops the build instead of deploying against an undefined id.
+const resolvedEnvironment = (
+  name: string,
+  environment: InstanceEnvironment,
+  lock: InstanceLock,
+) => {
+  const entry = lock.environments[name];
+  const databaseId = entry?.d1.id ?? environment.d1.id;
+  if (databaseId === undefined) {
+    throw new Error(
+      `agent.yaml has no environments.${name}.d1.id and agentic-slack.lock.json has none: run agentic-slack adopt --dir . --env ${name} --d1-id <id>`,
+    );
+  }
+  const appId = entry?.slack.appId ?? environment.vars.SLACK_APP_ID;
+  if (appId === undefined) {
+    throw new Error(
+      `agent.yaml has no environments.${name}.vars.SLACK_APP_ID and agentic-slack.lock.json has none: run agentic-slack adopt --dir . --env ${name} --app-id <id>`,
+    );
+  }
+  return {
+    databaseId,
+    environment: {
+      ...environment,
+      vars: { ...environment.vars, SLACK_APP_ID: appId },
+    },
+  };
+};
+
+const noLock: InstanceLock = { environments: {}, version: 1 };
+
 export const generateWranglerConfig = (
   instance: AgentInstance,
   migrationsDirectory: string,
   outputDirectory: string,
+  lock: InstanceLock = noLock,
 ): string => {
   const config = {
     compatibility_date: "2026-08-13",
     compatibility_flags: ["nodejs_compat"],
     env: Object.fromEntries(
-      Object.entries(instance.environments).map(([name, environment]) => [
-        name,
-        environmentConfig(environment, migrationsDirectory, outputDirectory),
-      ]),
+      Object.entries(instance.environments).map(([name, environment]) => {
+        const resolved = resolvedEnvironment(name, environment, lock);
+        return [
+          name,
+          environmentConfig(
+            resolved.environment,
+            resolved.databaseId,
+            migrationsDirectory,
+            outputDirectory,
+          ),
+        ];
+      }),
     ),
     limits: { cpu_ms: 30_000 },
     migrations: [durableObjectMigration],
