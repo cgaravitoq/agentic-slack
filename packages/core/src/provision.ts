@@ -348,12 +348,11 @@ const ensureSlackApp = async (options: SlackAppOptions): Promise<void> => {
   const sha256 = manifestSha256(manifest);
   const locked = entry.slack;
 
-  const applyManifest = async (): Promise<{
-    appId: string;
-    signingSecret?: string;
-  }> => {
+  const applyManifest = async (): Promise<string> => {
     if (locked === undefined) {
       const created = await createSlackApp(await configToken(), manifest);
+      await putSecret(directory, worker, SIGNING_SECRET, created.signingSecret);
+      console.log(`Set ${SIGNING_SECRET} from Slack app ${created.appId}`);
       const withApp = withLockEnvironment(lock, environmentName, {
         ...entry,
         slack: { appId: created.appId, manifestSha256: sha256 },
@@ -371,14 +370,11 @@ const ensureSlackApp = async (options: SlackAppOptions): Promise<void> => {
       const configPath = await buildEnvironment(preparation);
       await runWrangler(["deploy", "--config", configPath], { cwd: directory });
       console.log(`Deployed ${worker} with SLACK_APP_ID ${created.appId}`);
-      return {
-        appId: created.appId,
-        signingSecret: created.signingSecret,
-      };
+      return created.appId;
     }
     if (locked.manifestSha256 === sha256) {
       console.log(`Slack app ${locked.appId} matches the generated manifest`);
-      return { appId: locked.appId };
+      return locked.appId;
     }
     // An update replaces the whole manifest and returns no credentials, so a
     // signing secret only ever comes from creating an app.
@@ -391,18 +387,11 @@ const ensureSlackApp = async (options: SlackAppOptions): Promise<void> => {
       }),
     );
     console.log(`Updated Slack app ${locked.appId}`);
-    return { appId: locked.appId };
+    return locked.appId;
   };
-  const { appId, signingSecret } = await applyManifest();
+  const appId = await applyManifest();
 
   const existing = await workerSecretNames(directory, worker);
-  if (
-    signingSecret !== undefined &&
-    (rotate.includes(SIGNING_SECRET) || !existing.has(SIGNING_SECRET))
-  ) {
-    await putSecret(directory, worker, SIGNING_SECRET, signingSecret);
-    console.log(`Set ${SIGNING_SECRET} from Slack app ${appId}`);
-  }
   if (rotate.includes(BOT_TOKEN_SECRET) || !existing.has(BOT_TOKEN_SECRET)) {
     console.log(`Install the app for its bot token: ${installUrl(appId)}`);
     await putSecret(

@@ -627,6 +627,25 @@ describe("up", () => {
     });
   });
 
+  test("replaces a signing secret the Worker kept from an earlier app", async () => {
+    const directory = await prepared();
+
+    const run = await runCli(directory, upArguments(directory), {
+      environment: {
+        ...configured,
+        STUB_WRANGLER_SECRETS: "SLACK_BOT_TOKEN,SLACK_SIGNING_SECRET",
+      },
+    });
+
+    expect(run.exitCode).toBe(0);
+    expect(run.slack.map((call) => call.method)).toEqual([
+      "apps.manifest.create",
+    ]);
+    expect(
+      run.state.put["provision-fixture-staging SLACK_SIGNING_SECRET"],
+    ).toBe(signingSecret);
+  });
+
   test("retries a Slack call Slack is rate limiting", async () => {
     const directory = await prepared();
 
