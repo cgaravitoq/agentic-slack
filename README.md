@@ -506,22 +506,64 @@ Do not use `main` as a substitute for a tested release without comparing its rev
 
 ## Install as a package
 
-With Bun installed, pin the package in your instance folder:
+With Bun installed, scaffold an instance folder:
 
 ```sh
-bun add --exact agentic-slack@0.0.0
-bunx agentic-slack --help
-bunx agentic-slack --version
+mkdir my-agent && cd my-agent
+bunx agentic-slack init .
+```
+
+`init` writes `agent.yaml`, a `package.json` that pins this package, and a `.gitignore` covering `node_modules/` and `.agentic-slack/`.
+Edit `agent.yaml`, then build one environment:
+
+```sh
 bunx agentic-slack build --dir . --env staging
 ```
 
-Keep `agent.config.ts` and `wrangler.jsonc` in that folder.
-Import `defineAgentConfig` from `agentic-slack` in your agent configuration and declare the selected environment in `wrangler.jsonc`.
-The build prints its generated `wrangler.json` path under `.agentic-slack/staging/<worker-name>/`, outside the installed package.
-Add `.agentic-slack/` to your instance's `.gitignore`.
+The build reads `agent.yaml`, generates the agent configuration and the Wrangler configuration under `.agentic-slack/`, and prints the generated `wrangler.json` path to deploy.
+Both generated files are build output: keep `.agentic-slack/` out of version control and never edit it.
 The package includes D1 migrations at `node_modules/agentic-slack/apps/slack-agent/migrations`.
-This package shape is not yet published to npm; `init`, YAML configuration, `up`, and `down` are not implemented yet.
-For a local package check, run `bun run test:package` from this repository; it packs the package, installs it without development dependencies in a clean temporary folder, and builds an external fixture.
+For a local package check, run `bun run test:package` from this repository; it packs the package, installs it without development dependencies in a clean temporary folder, scaffolds an instance, and builds it.
+
+### agent.yaml
+
+One file holds the agent and the infrastructure it runs on.
+
+```yaml
+agent:
+  name: Slack Agent
+  description: A private, self-hosted assistant for Slack conversations.
+  ownerInstructions: Help the owner and their teammates with clear, accurate, concise answers.
+  model: cloudflare/@cf/zai-org/glm-4.7-flash
+  retention:
+    channelDays: 15
+    privateDays: 7
+  suggestedPrompts:
+    - title: Summarize
+      message: Summarize this conversation and list the decisions and next steps.
+  # allowedUserIds, read, progress, delegation, mcpServers and skills are the
+  # remaining agent fields, exactly as AgentConfig declares them.
+secrets:
+  - SLACK_BOT_TOKEN
+  - SLACK_SIGNING_SECRET
+environments:
+  staging:
+    worker: slack-agent-staging
+    domain: slack-agent-staging.example.com
+    vars:
+      SLACK_TEAM_ID: T00000000
+      SLACK_APP_ID: A00000000
+    d1:
+      name: slack-agent-staging
+      id: 00000000-0000-0000-0000-000000000000
+```
+
+`agent` holds the behavior, and its `skills` are paths to directories holding a `SKILL.md`, relative to `agent.yaml`.
+`environments` holds one Worker name, custom domain, `vars` and D1 database per environment.
+A `cloudflare/<model>` model builds on Workers AI and binds `AI`, with no broker.
+A `broker/<model>` model binds `MODEL_BROKER`, and then every environment needs its own `broker` service and entrypoint, because the model credential stays with the operator's broker.
+`secrets` declares the Worker secrets you create with `wrangler secret put`; the build rejects a configuration that names a secret the list does not declare.
+Every rejected configuration stops the build with the YAML path of each problem.
 
 ## Consume a pinned copy
 
