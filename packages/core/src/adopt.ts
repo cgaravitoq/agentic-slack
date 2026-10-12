@@ -11,7 +11,7 @@ import {
   writeLock,
 } from "./lock.ts";
 import { generateSlackManifest } from "./manifest.ts";
-import { readSecret } from "./terminal.ts";
+import { configToken } from "./slack-app.ts";
 import { runWrangler } from "./wrangler.ts";
 
 export interface AdoptOptions {
@@ -36,20 +36,6 @@ const verifyWorker = async (
     );
   }
 };
-const configToken = async (): Promise<string> => {
-  const fromEnvironment = process.env.SLACK_CONFIG_TOKEN;
-  if (fromEnvironment !== undefined && fromEnvironment !== "") {
-    return fromEnvironment;
-  }
-  const answer = await readSecret("Slack configuration token: ");
-  if (answer === "") {
-    throw new Error(
-      "adopt needs a Slack configuration token: set SLACK_CONFIG_TOKEN or answer the prompt",
-    );
-  }
-  return answer;
-};
-
 const manifestSchema = v.object({
   oauth_config: v.optional(
     v.object({
@@ -211,6 +197,7 @@ export const adopt = async (options: AdoptOptions): Promise<string> => {
     directory,
     withLockEnvironment(lock, environmentName, {
       d1: { id: d1Id, name: environment.d1.name },
+      domain: environment.domain,
       slack: { appId, manifestSha256: manifestSha256(manifest) },
       worker: environment.worker,
     }),

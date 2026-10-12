@@ -17,12 +17,14 @@ import type { InstanceLock } from "../../../packages/core/src/lock.ts";
 
 const prod = {
   d1: { id: "22222222-2222-2222-2222-222222222222", name: "instance" },
+  domain: "instance.example.com",
   slack: { appId: "A0000000002", manifestSha256: "2".repeat(64) },
   worker: "instance",
 };
 
 const staging = {
   d1: { id: "11111111-1111-1111-1111-111111111111", name: "instance-staging" },
+  domain: "instance-staging.example.com",
   slack: {
     appId: "A0000000001",
     manifestSha256: "1".repeat(64),
@@ -50,6 +52,7 @@ describe("lock", () => {
         "id": "22222222-2222-2222-2222-222222222222",
         "name": "instance"
       },
+      "domain": "instance.example.com",
       "slack": {
         "appId": "A0000000002",
         "manifestSha256": "${"2".repeat(64)}"
@@ -61,6 +64,7 @@ describe("lock", () => {
         "id": "11111111-1111-1111-1111-111111111111",
         "name": "instance-staging"
       },
+      "domain": "instance-staging.example.com",
       "slack": {
         "appId": "A0000000001",
         "manifestSha256": "${"1".repeat(64)}"
@@ -105,9 +109,11 @@ describe("lock", () => {
       [
         JSON.stringify({
           ...lock,
-          environments: { staging: { d1: staging.d1, slack: staging.slack } },
+          environments: {
+            staging: { ...staging, unexpected: true },
+          },
         }),
-        /environments\.staging\.worker: Invalid key/u,
+        /environments\.staging\.unexpected: Invalid key/u,
       ],
     ];
     for (const [source, expected] of failures) {
@@ -118,7 +124,6 @@ describe("lock", () => {
   test("keeps an entry that has no Slack app yet", () => {
     const provisioned = {
       d1: { id: "33333333-3333-3333-3333-333333333333", name: "instance" },
-      worker: "instance",
     };
     const updated = withLockEnvironment(lock, "preview", provisioned);
 

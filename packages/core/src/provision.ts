@@ -2,6 +2,7 @@ import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as v from "valibot";
+import { defineAgentConfig } from "./config.ts";
 import { findOrCreateDatabase, verifyDatabase } from "./d1.ts";
 import {
   generateAgentConfigModule,
@@ -11,16 +12,35 @@ import {
 import type { AgentInstance } from "./instance.ts";
 import {
   lockFileName,
+  manifestSha256,
   readLock,
   withLockEnvironment,
   withoutLockEnvironment,
   writeLock,
 } from "./lock.ts";
 import type { InstanceLock, LockEnvironment } from "./lock.ts";
+import { generateSlackManifest } from "./manifest.ts";
+import {
+  configToken,
+  createSlackApp,
+  deleteSlackApp,
+  updateSlackApp,
+} from "./slack-app.ts";
 import { readAnswer, readSecret } from "./terminal.ts";
 import { runWrangler, wranglerJson } from "./wrangler.ts";
 
 const text = v.pipe(v.string(), v.minLength(1, "Expected a non-empty string"));
+
+const BOT_TOKEN_SECRET = "SLACK_BOT_TOKEN";
+const SIGNING_SECRET = "SLACK_SIGNING_SECRET";
+
+// The signing secret comes from the app the Slack phase creates and the bot
+// token only exists once the operator installs it, so the general secrets loop
+// cannot read either before that phase has run.
+const slackSuppliedSecrets = new Set([BOT_TOKEN_SECRET, SIGNING_SECRET]);
+
+const installUrl = (appId: string): string =>
+  `https://api.slack.com/apps/${appId}/install-on-team`;
 
 const HEALTH_ATTEMPTS = 5;
 const HEALTH_DELAY_MS = 2000;
@@ -215,12 +235,24 @@ const putSecret = async (
   directory: string,
   worker: string,
   name: string,
+  value: string,
 ): Promise<void> => {
-  const value = await secretValue(name);
   await runWrangler(["secret", "put", name, "--name", worker], {
     cwd: directory,
     input: `${value}\n`,
   });
+};
+
+const workerSecretNames = async (
+  directory: string,
+  worker: string,
+): Promise<ReadonlySet<string>> => {
+  const listed = await wranglerJson(
+    secretList,
+    ["secret", "list", "--name", worker, "--format", "json"],
+    { cwd: directory },
+  );
+  return new Set(listed.map((secret) => secret.name));
 };
 
 const ensureSecrets = async (
@@ -229,12 +261,7 @@ const ensureSecrets = async (
   declared: readonly string[],
   rotate: readonly string[],
 ): Promise<SecretReport> => {
-  const listed = await wranglerJson(
-    secretList,
-    ["secret", "list", "--name", worker, "--format", "json"],
-    { cwd: directory },
-  );
-  const existing = new Set(listed.map((secret) => secret.name));
+  const existing = await workerSecretNames(directory, worker);
   const kept: string[] = [];
   const set: string[] = [];
   for (const name of declared) {
@@ -243,7 +270,7 @@ const ensureSecrets = async (
       continue;
     }
     // oxlint-disable-next-line no-await-in-loop
-    await putSecret(directory, worker, name);
+    await putSecret(directory, worker, name, await secretValue(name));
     set.push(name);
   }
   return { kept, set };
@@ -290,15 +317,92 @@ const waitForHealth = async (domain: string): Promise<void> => {
   );
 };
 
-// The Slack phase that follows this row creates, updates and installs the app,
-// and deletes it; until it lands both commands only report what the lock holds.
-const slackAppPhase = (
-  entry: LockEnvironment | undefined,
-  verb: string,
-): string =>
-  entry?.slack === undefined
-    ? `Slack app: none recorded, the Slack phase will ${verb} it`
-    : `Slack app ${entry.slack.appId}: the Slack phase will ${verb} it`;
+interface SlackAppOptions {
+  directory: string;
+  domain: string;
+  entry: LockEnvironment;
+  environment: string;
+  instance: AgentInstance;
+  lock: InstanceLock;
+  migrationsDirectory: string;
+  rotate: readonly string[];
+  worker: string;
+}
+
+const ensureSlackApp = async (options: SlackAppOptions): Promise<void> => {
+  const {
+    directory,
+    domain,
+    entry,
+    environment: environmentName,
+    instance,
+    lock,
+    migrationsDirectory,
+    rotate,
+    worker,
+  } = options;
+  const manifest = generateSlackManifest(
+    defineAgentConfig({ ...instance.agent, skills: undefined }),
+    `https://${domain}`,
+  );
+  const sha256 = manifestSha256(manifest);
+  const locked = entry.slack;
+
+  const applyManifest = async (): Promise<string> => {
+    if (locked === undefined) {
+      const created = await createSlackApp(await configToken(), manifest);
+      await putSecret(directory, worker, SIGNING_SECRET, created.signingSecret);
+      console.log(`Set ${SIGNING_SECRET} from Slack app ${created.appId}`);
+      const withApp = withLockEnvironment(lock, environmentName, {
+        ...entry,
+        slack: { appId: created.appId, manifestSha256: sha256 },
+      });
+      await writeLock(directory, withApp);
+      console.log(`Created Slack app ${created.appId}`);
+      // The deployed Worker carries SLACK_APP_ID, which did not exist before.
+      const preparation = await prepareEnvironment({
+        directory,
+        environment: environmentName,
+        instance,
+        lock: withApp,
+        migrationsDirectory,
+      });
+      const configPath = await buildEnvironment(preparation);
+      await runWrangler(["deploy", "--config", configPath], { cwd: directory });
+      console.log(`Deployed ${worker} with SLACK_APP_ID ${created.appId}`);
+      return created.appId;
+    }
+    if (locked.manifestSha256 === sha256) {
+      console.log(`Slack app ${locked.appId} matches the generated manifest`);
+      return locked.appId;
+    }
+    // An update replaces the whole manifest and returns no credentials, so a
+    // signing secret only ever comes from creating an app.
+    await updateSlackApp(await configToken(), locked.appId, manifest);
+    await writeLock(
+      directory,
+      withLockEnvironment(lock, environmentName, {
+        ...entry,
+        slack: { appId: locked.appId, manifestSha256: sha256 },
+      }),
+    );
+    console.log(`Updated Slack app ${locked.appId}`);
+    return locked.appId;
+  };
+  const appId = await applyManifest();
+
+  const existing = await workerSecretNames(directory, worker);
+  if (rotate.includes(BOT_TOKEN_SECRET) || !existing.has(BOT_TOKEN_SECRET)) {
+    console.log(`Install the app for its bot token: ${installUrl(appId)}`);
+    await putSecret(
+      directory,
+      worker,
+      BOT_TOKEN_SECRET,
+      await secretValue(BOT_TOKEN_SECRET),
+    );
+    console.log(`Set ${BOT_TOKEN_SECRET}`);
+  }
+};
 
 export const up = async (options: UpOptions): Promise<string> => {
   const {
@@ -321,6 +425,7 @@ export const up = async (options: UpOptions): Promise<string> => {
   }
 
   const lock = await readLock(directory);
+  const previous = lock.environments[environmentName];
   const d1 = await databaseFor(
     directory,
     environmentName,
@@ -328,20 +433,21 @@ export const up = async (options: UpOptions): Promise<string> => {
     named.d1.id,
     lock,
   );
-  const entry: LockEnvironment = {
+  // The D1 exists from this point, so it is recorded before the deploy that may
+  // fail: `down` and a rerun both have to find it instead of creating a second
+  // database.
+  const databaseLock = withLockEnvironment(lock, environmentName, {
     d1,
-    slack: lock.environments[environmentName]?.slack,
-    worker: named.worker,
-  };
-  const updated = withLockEnvironment(lock, environmentName, entry);
-  await writeLock(directory, updated);
+    slack: previous?.slack,
+  });
+  await writeLock(directory, databaseLock);
   console.log(`D1 ${d1.name} (${d1.id})`);
 
   const preparation = await prepareEnvironment({
     directory,
     environment: environmentName,
     instance,
-    lock: updated,
+    lock: databaseLock,
     migrationsDirectory,
   });
   await runWrangler(
@@ -366,10 +472,23 @@ export const up = async (options: UpOptions): Promise<string> => {
   await runWrangler(["deploy", "--config", configPath], { cwd: directory });
   console.log(`Deployed ${named.worker} to https://${named.domain}`);
 
+  const entry: LockEnvironment = {
+    d1,
+    domain: named.domain,
+    slack: previous?.slack,
+    worker: named.worker,
+  };
+  const deployedLock = withLockEnvironment(
+    databaseLock,
+    environmentName,
+    entry,
+  );
+  await writeLock(directory, deployedLock);
+
   const secrets = await ensureSecrets(
     directory,
     named.worker,
-    instance.secrets,
+    instance.secrets.filter((name) => !slackSuppliedSecrets.has(name)),
     rotate,
   );
   const described = [
@@ -380,9 +499,39 @@ export const up = async (options: UpOptions): Promise<string> => {
     `Worker secrets: ${described.length === 0 ? "none declared" : described.join("; ")}`,
   );
 
-  console.log(slackAppPhase(entry, "create or update"));
+  await ensureSlackApp({
+    directory,
+    domain: named.domain,
+    entry,
+    environment: environmentName,
+    instance,
+    lock: deployedLock,
+    migrationsDirectory,
+    rotate,
+    worker: named.worker,
+  });
   await waitForHealth(named.domain);
   return `Provisioned ${environmentName}: https://${named.domain}`;
+};
+
+const workerExists = async (
+  worker: string,
+  directory: string,
+): Promise<boolean> => {
+  try {
+    await runWrangler(["deployments", "list", "--name", worker, "--json"], {
+      cwd: directory,
+    });
+    return true;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      /not found|does not exist|\[code: 10007\]/iu.test(error.message)
+    ) {
+      return false;
+    }
+    throw error;
+  }
 };
 
 export const down = async (options: DownOptions): Promise<string> => {
@@ -401,20 +550,39 @@ export const down = async (options: DownOptions): Promise<string> => {
   }
   const expected = `${instance.agent.name}/${environmentName}`;
   console.log(`Deleting the ${environmentName} environment of ${expected}:`);
-  console.log(`  Worker ${entry.worker}`);
   console.log(`  D1 ${entry.d1.name} (${entry.d1.id})`);
-  console.log(`  Custom domain https://${named.domain}`);
+  if (entry.worker !== undefined) {
+    console.log(`  Worker ${entry.worker}`);
+  }
+  if (entry.domain !== undefined) {
+    console.log(`  Custom domain https://${entry.domain}`);
+  }
+  if (entry.slack !== undefined) {
+    console.log(`  Slack app ${entry.slack.appId}`);
+  }
   const answer = await readAnswer(`Type ${expected} to delete: `);
   if (answer !== expected) {
     throw new Error(
       `Nothing deleted: expected the exact text ${expected} and read ${answer === "" ? "an empty line" : answer}`,
     );
   }
-  await runWrangler(["delete", entry.worker, "--force"], { cwd: directory });
+  if (entry.worker !== undefined) {
+    if (await workerExists(entry.worker, directory)) {
+      await runWrangler(["delete", entry.worker, "--force"], {
+        cwd: directory,
+      });
+      console.log(`Deleted Worker ${entry.worker}`);
+    } else {
+      console.log(`Worker ${entry.worker} is already gone`);
+    }
+  }
+  if (entry.slack !== undefined) {
+    await deleteSlackApp(await configToken(), entry.slack.appId);
+    console.log(`Deleted Slack app ${entry.slack.appId}`);
+  }
   await runWrangler(["d1", "delete", entry.d1.name, "--skip-confirmation"], {
     cwd: directory,
   });
-  console.log(slackAppPhase(entry, "delete"));
   await writeLock(directory, withoutLockEnvironment(lock, environmentName));
   return `Deleted the ${environmentName} environment and removed it from ${lockFileName}`;
 };

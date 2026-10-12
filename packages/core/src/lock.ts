@@ -16,12 +16,14 @@ const lockSlackSchema = v.strictObject({
   ),
 });
 
-// `up` records the D1 and the Worker before any Slack app exists, so an entry
-// gains `slack` only once the Slack phase, or `adopt`, has verified an app.
+// `up` records what exists as it goes, so an entry survives a run that failed
+// before its Worker was deployed: the D1 alone, then the Worker and its domain,
+// then the Slack app once one is verified for it.
 const lockEnvironmentSchema = v.strictObject({
   d1: v.strictObject({ id: text, name: text }),
+  domain: v.optional(text),
   slack: v.optional(lockSlackSchema),
-  worker: text,
+  worker: v.optional(text),
 });
 
 const lockSchema = v.strictObject({
