@@ -496,18 +496,11 @@ Do not include message contents or credentials in public bug reports.
 ## Automated deployment
 
 `.github/workflows/ci.yml` verifies pull requests against `staging` and `main`, including dependency advisories.
-`.github/workflows/deploy.yml` verifies and deploys pushes to `staging`.
-Before enabling deployments in your fork, configure its GitHub `staging` environment:
+`.github/workflows/deploy.yml` runs the same `bun run verify` on every push to `staging` and stops there.
+This repository deploys no Worker of its own, so it needs no Cloudflare credentials and holds no operator configuration.
+Operators deploy their own instance by following [Self-hosting](#self-hosting), under their own Cloudflare account and Slack app.
 
-- Secrets: `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`, scoped to your own account and required resources.
-- Variable: `WRANGLER_CONFIG_JSON`, containing your complete local `wrangler.deploy.json` configuration, without Slack tokens or signing secrets.
-
-The workflow writes that operator configuration to an ignored file only after verification, then migrates D1, deploys, and checks health.
-It fails before migration when the configuration variable is missing.
-Existing operators must preserve their current Worker name, D1 ID, and Durable Object migration when populating it.
-The Slack secrets stay on the Worker and are provisioned separately.
-
-Protect your integration branch with the `verify` status check and restrict the `staging` environment to deployments from `staging`.
+Protect your integration branch with the `verify` status check.
 This repository currently develops on `staging`; there is no tagged stable release yet.
 Do not use `main` as a substitute for a tested release without comparing its revision.
 

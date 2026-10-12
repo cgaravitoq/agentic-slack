@@ -33,7 +33,7 @@ It runs these commands in this order:
 
 Run `bun run verify` before publishing changes.
 That script is the same sequence after install.
-`.github/workflows/deploy.yml` runs `bun run verify` on every push to `staging`.
+`.github/workflows/deploy.yml` runs `bun run verify` on every push to `staging` and deploys nothing; operators deploy their own instance.
 
 ## Git
 
