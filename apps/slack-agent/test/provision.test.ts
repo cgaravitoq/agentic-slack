@@ -218,7 +218,10 @@ import { Readable } from "node:stream";
 
 if (process.env.STUB_TTY === "1") {
   const stdin = new Readable({ read() {} });
-  stdin.push(process.env.STUB_STDIN_INPUT ?? "");
+  const typed = process.env.STUB_STDIN_INPUT ?? "";
+  for (let at = 0; at < typed.length; at += 8) {
+    stdin.push(typed.slice(at, at + 8));
+  }
   stdin.push(null);
   Object.defineProperty(stdin, "isTTY", { value: true });
   stdin.setRawMode = () => {};
@@ -685,6 +688,24 @@ describe("up", () => {
     });
     expect(`${run.stdout}${run.stderr}`).not.toContain("prompted-progress");
     expect(`${run.stdout}${run.stderr}`).not.toContain("prompted-bot-token");
+  });
+
+  test("stores pasted secrets without their bracketed paste markers", async () => {
+    const directory = await prepared();
+    const pasted = "\u001B[200~";
+    const ended = "\u001B[201~";
+
+    const run = await runCli(directory, upArguments(directory), {
+      environment: { SLACK_CONFIG_TOKEN: configToken, STUB_TTY: "1" },
+      input: `${pasted}pasted-progress${ended}\n${pasted}pasted-bot-token${ended}\n`,
+    });
+
+    expect(run.exitCode).toBe(0);
+    expect(run.state.put).toEqual({
+      "provision-fixture-staging PROGRESS_BEARER": "pasted-progress",
+      "provision-fixture-staging SLACK_BOT_TOKEN": "pasted-bot-token",
+      "provision-fixture-staging SLACK_SIGNING_SECRET": signingSecret,
+    });
   });
 
   test("resumes after a failed deploy without creating a second D1", async () => {
