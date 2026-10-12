@@ -1,16 +1,16 @@
 #!/usr/bin/env bun
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import {
-  generateAgentConfigModule,
-  generateWranglerConfig,
-  readInstance,
-  scaffoldFiles,
-} from "../packages/core/src/instance.ts";
-import { readLock } from "../packages/core/src/lock.ts";
 import { adopt } from "../packages/core/src/adopt.ts";
+import { readInstance, scaffoldFiles } from "../packages/core/src/instance.ts";
+import { readLock } from "../packages/core/src/lock.ts";
+import {
+  buildEnvironment,
+  down,
+  prepareEnvironment,
+  up,
+} from "../packages/core/src/provision.ts";
 import { version } from "../package.json";
 
 const help = `Usage: agentic-slack <command>
@@ -18,13 +18,16 @@ const help = `Usage: agentic-slack <command>
 Commands:
   init <dir>                     Scaffold an instance from a template
   build --dir <dir> --env <env>  Build an instance's Worker
+  up --dir <dir> --env <env>     Provision an environment and deploy it
+  down --dir <dir> --env <env>   Delete an environment's locked resources
   adopt --dir <dir> --env <env>  Adopt an existing D1, Worker and Slack app
 
 Options:
-  --d1-id <id>   D1 database id to adopt
-  --app-id <id>  Slack app id to adopt
-  --help         Show this help
-  --version      Show the package version`;
+  --d1-id <id>    D1 database id to adopt
+  --app-id <id>   Slack app id to adopt
+  --rotate <name> Set a Worker secret again even when it already exists
+  --help          Show this help
+  --version       Show the package version`;
 
 const migrationsDirectory = path.resolve(
   import.meta.dirname,
@@ -73,90 +76,45 @@ const init = async (directory: string): Promise<void> => {
 Edit its agent.yaml, then build an environment with: agentic-slack build --dir ${directory} --env staging`);
 };
 
-const skillFiles = async (
-  directory: string,
-  skills: readonly string[],
-): Promise<readonly string[]> =>
-  await Promise.all(
-    skills.map(async (skill) => {
-      const file = path.resolve(directory, skill, "SKILL.md");
-      if (!(await Bun.file(file).exists())) {
-        throw new Error(`agent.yaml: ${skill} has no SKILL.md`);
-      }
-      return file;
-    }),
-  );
+interface EnvironmentArguments {
+  directory: string;
+  environment: string;
+}
 
-const build = async (directory: string, environment: string): Promise<void> => {
-  const instance = await readInstance(directory);
-  if (instance.environments[environment] === undefined) {
-    throw new Error(`agent.yaml has no environment ${environment}`);
+const environmentArguments = (
+  command: string,
+  positionals: readonly string[],
+  values: { dir?: string; env?: string },
+): EnvironmentArguments | undefined => {
+  if (positionals[0] !== command || positionals.length !== 1) {
+    return undefined;
   }
-  const lock = await readLock(directory);
-  const skills = await skillFiles(directory, instance.agent.skills ?? []);
-  const generated = path.join(directory, ".agentic-slack");
-  const agentConfig = path.join(generated, "agent.config.ts");
-  await mkdir(generated, { recursive: true });
-  await Bun.write(
-    agentConfig,
-    generateAgentConfigModule(instance, skills, generated),
-  );
-  await Bun.write(
-    path.join(generated, "wrangler.jsonc"),
-    generateWranglerConfig(instance, migrationsDirectory, generated, lock),
-  );
-
-  const output = path.join(generated, environment);
-  // Vite leaves the output of a previous build of another Worker in place, and
-  // the deploy step must see exactly the Worker just built.
-  await rm(output, { force: true, recursive: true });
-  const vite = path.join(
-    path.dirname(fileURLToPath(import.meta.resolve("vite/package.json"))),
-    "bin/vite.js",
-  );
-  const child = Bun.spawn(
-    [
-      process.execPath,
-      vite,
-      "build",
-      "--config",
-      path.resolve(import.meta.dirname, "../apps/slack-agent/vite.config.ts"),
-    ],
-    {
-      cwd: directory,
-      env: {
-        ...process.env,
-        AGENT_CONFIG: agentConfig,
-        CLOUDFLARE_ENV: environment,
-        WORKER_CONFIG: path.join(generated, "wrangler.jsonc"),
-        WORKER_OUT_DIR: output,
-      },
-      stderr: "inherit",
-      stdin: "inherit",
-      stdout: "inherit",
-    },
-  );
-  const exitCode = await child.exited;
-  if (exitCode !== 0) {
-    process.exitCode = exitCode;
-    return;
+  const directory = nonEmpty(values.dir);
+  const environment = nonEmpty(values.env);
+  if (
+    directory === undefined ||
+    environment === undefined ||
+    !/^[a-zA-Z0-9_-]+$/u.test(environment)
+  ) {
+    return undefined;
   }
-  const configs = await Array.fromAsync(
-    new Bun.Glob("*/wrangler.json").scan({ absolute: true, cwd: output }),
-  );
-  if (configs.length !== 1) {
-    throw new Error(`Expected one generated wrangler.json in ${output}`);
-  }
-  console.log(configs[0]);
+  return { directory: path.resolve(directory), environment };
 };
 
-const adoptCommand = async (
-  directory: string,
-  environment: string,
-  d1Id: string | undefined,
-  appId: string | undefined,
-): Promise<void> => {
-  console.log(await adopt({ appId, d1Id, directory, environment }));
+const build = async ({
+  directory,
+  environment,
+}: EnvironmentArguments): Promise<void> => {
+  const instance = await readInstance(directory);
+  const lock = await readLock(directory);
+  const preparation = await prepareEnvironment({
+    directory,
+    environment,
+    instance,
+    lock,
+    migrationsDirectory,
+  });
+  console.log(await buildEnvironment(preparation));
 };
 
 const main = async (): Promise<void> => {
@@ -169,6 +127,7 @@ const main = async (): Promise<void> => {
       dir: { type: "string" },
       env: { type: "string" },
       help: { type: "boolean" },
+      rotate: { multiple: true, type: "string" },
       version: { type: "boolean" },
     },
   });
@@ -190,32 +149,36 @@ const main = async (): Promise<void> => {
     await init(path.resolve(argument));
     return;
   }
-  if (
-    command === "build" &&
-    positionals.length === 1 &&
-    values.dir !== undefined &&
-    values.dir !== "" &&
-    values.env !== undefined &&
-    /^[a-zA-Z0-9_-]+$/u.test(values.env)
-  ) {
-    await build(path.resolve(values.dir), values.env);
-    return;
-  }
-  if (
-    command === "adopt" &&
-    positionals.length === 1 &&
-    values.dir !== undefined &&
-    values.dir !== "" &&
-    values.env !== undefined &&
-    /^[a-zA-Z0-9_-]+$/u.test(values.env)
-  ) {
-    await adoptCommand(
-      path.resolve(values.dir),
-      values.env,
-      nonEmpty(values["d1-id"]),
-      nonEmpty(values["app-id"]),
-    );
-    return;
+  const named = environmentArguments(command ?? "", positionals, values);
+  if (named !== undefined) {
+    if (command === "build") {
+      await build(named);
+      return;
+    }
+    if (command === "up") {
+      console.log(
+        await up({
+          ...named,
+          migrationsDirectory,
+          rotate: values.rotate ?? [],
+        }),
+      );
+      return;
+    }
+    if (command === "down") {
+      console.log(await down(named));
+      return;
+    }
+    if (command === "adopt") {
+      console.log(
+        await adopt({
+          ...named,
+          appId: nonEmpty(values["app-id"]),
+          d1Id: nonEmpty(values["d1-id"]),
+        }),
+      );
+      return;
+    }
   }
   throw new Error(help);
 };

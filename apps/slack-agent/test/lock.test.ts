@@ -10,6 +10,7 @@ import {
   readLock,
   serializeLock,
   withLockEnvironment,
+  withoutLockEnvironment,
   writeLock,
 } from "../../../packages/core/src/lock.ts";
 import type { InstanceLock } from "../../../packages/core/src/lock.ts";
@@ -112,6 +113,28 @@ describe("lock", () => {
     for (const [source, expected] of failures) {
       expect(() => parseLock(source), source).toThrow(expected);
     }
+  });
+
+  test("keeps an entry that has no Slack app yet", () => {
+    const provisioned = {
+      d1: { id: "33333333-3333-3333-3333-333333333333", name: "instance" },
+      worker: "instance",
+    };
+    const updated = withLockEnvironment(lock, "preview", provisioned);
+
+    const serialized = serializeLock(updated);
+
+    expect(serialized).toContain('"preview"');
+    expect(serialized).not.toContain('"slack": null');
+    expect(parseLock(serialized).environments.preview).toEqual(provisioned);
+  });
+
+  test("drops only the named environment", () => {
+    expect(withoutLockEnvironment(lock, "staging")).toEqual({
+      environments: { prod },
+      version: 1,
+    });
+    expect(withoutLockEnvironment(lock, "absent")).toEqual(lock);
   });
 
   test("writes atomically and reads back what it wrote", async () => {

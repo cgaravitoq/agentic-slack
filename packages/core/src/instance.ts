@@ -130,7 +130,7 @@ const instanceSchema = v.strictObject({
 
 export type AgentInstance = v.InferOutput<typeof instanceSchema>;
 
-export type InstanceEnvironment = AgentInstance["environments"][string];
+type InstanceEnvironment = AgentInstance["environments"][string];
 
 interface InstanceProblem {
   message: string;
@@ -381,6 +381,9 @@ const environmentConfig = (
       }),
 });
 
+const present = (value: string | undefined): string | undefined =>
+  value === undefined || value === "" ? undefined : value;
+
 // Adopted IDs in the lock win over the agent.yaml placeholder, and a missing
 // ID in both stops the build instead of deploying against an undefined id.
 const resolvedEnvironment = (
@@ -389,13 +392,14 @@ const resolvedEnvironment = (
   lock: InstanceLock,
 ) => {
   const entry = lock.environments[name];
-  const databaseId = entry?.d1.id ?? environment.d1.id;
+  const databaseId = present(entry?.d1.id) ?? present(environment.d1.id);
   if (databaseId === undefined) {
     throw new Error(
       `agent.yaml has no environments.${name}.d1.id and agentic-slack.lock.json has none: run agentic-slack adopt --dir . --env ${name} --d1-id <id>`,
     );
   }
-  const appId = entry?.slack.appId ?? environment.vars.SLACK_APP_ID;
+  const appId =
+    present(entry?.slack?.appId) ?? present(environment.vars.SLACK_APP_ID);
   if (appId === undefined) {
     throw new Error(
       `agent.yaml has no environments.${name}.vars.SLACK_APP_ID and agentic-slack.lock.json has none: run agentic-slack adopt --dir . --env ${name} --app-id <id>`,
@@ -414,27 +418,27 @@ const noLock: InstanceLock = { environments: {}, version: 1 };
 
 export const generateWranglerConfig = (
   instance: AgentInstance,
+  environment: string,
   migrationsDirectory: string,
   outputDirectory: string,
   lock: InstanceLock = noLock,
 ): string => {
+  const requested = instance.environments[environment];
+  if (requested === undefined) {
+    throw new Error(`agent.yaml has no environment ${environment}`);
+  }
+  const resolved = resolvedEnvironment(environment, requested, lock);
   const config = {
     compatibility_date: "2026-08-13",
     compatibility_flags: ["nodejs_compat"],
-    env: Object.fromEntries(
-      Object.entries(instance.environments).map(([name, environment]) => {
-        const resolved = resolvedEnvironment(name, environment, lock);
-        return [
-          name,
-          environmentConfig(
-            resolved.environment,
-            resolved.databaseId,
-            migrationsDirectory,
-            outputDirectory,
-          ),
-        ];
-      }),
-    ),
+    env: {
+      [environment]: environmentConfig(
+        resolved.environment,
+        resolved.databaseId,
+        migrationsDirectory,
+        outputDirectory,
+      ),
+    },
     limits: { cpu_ms: 30_000 },
     migrations: [durableObjectMigration],
     name: workerNameFrom(instance.agent.name),

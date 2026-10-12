@@ -521,6 +521,7 @@ bunx agentic-slack build --dir . --env staging
 ```
 
 The build reads `agent.yaml`, generates the agent configuration and the Wrangler configuration under `.agentic-slack/`, and prints the generated `wrangler.json` path to deploy.
+`agentic-slack up` builds and deploys in one command, creating what is missing; see [Provision an environment](#provision-an-environment).
 Both generated files are build output: keep `.agentic-slack/` out of version control and never edit it.
 The package includes D1 migrations at `node_modules/agentic-slack/apps/slack-agent/migrations`.
 For a local package check, run `bun run test:package` from this repository; it packs the package, installs it without development dependencies in a clean temporary folder, scaffolds an instance, and builds it.
@@ -572,6 +573,37 @@ Every rejected configuration stops the build with the YAML path of each problem.
 It holds the non-secret IDs provisioning assigned, so `agent.yaml` stays user input: per environment the Worker name, the D1 database name and id, and the Slack app id with the sha256 of the manifest generated for it.
 The build reads an id from the lock first and falls back to `agent.yaml`; a build that finds neither stops with the command to run.
 The lock holds no token and no secret.
+An entry gains its `slack` block once a Slack app is verified for it, so an environment that is still being provisioned can hold its D1 and Worker alone.
+
+### Provision an environment
+
+`up` creates or reuses the environment's Cloudflare resources and deploys the Worker:
+
+```sh
+bunx agentic-slack up --dir . --env staging
+```
+
+Every phase is idempotent, so a rerun after a failure resumes instead of starting over:
+
+1. **D1**: it reuses the id in the lock, verifies an id `agent.yaml` declares, or creates the database named after the environment, writes the id to the lock, and applies the D1 migrations to that remote database.
+2. **Build**: it builds that environment only, so an environment still missing its ids does not block the one you asked for.
+3. **Deploy**: it deploys the generated configuration, including the custom domain, and records the Worker in the lock.
+4. **Secrets**: for every name in `secrets` the Worker does not have yet, it reads the environment variable of that name or prompts for the value on a terminal without echoing it, and it never prints the value.
+   Secrets the Worker already has are kept, unless `--rotate <NAME>` names them; the flag can be repeated.
+5. **Health**: it GETs `https://<domain>/health` and reports the missing bindings, exiting non-zero when the Worker is not ready.
+
+The Slack phase that creates, updates and installs the app is not in this command yet: `up` reports the lock's Slack entry and changes nothing in Slack.
+
+### Tear down an environment
+
+`down` prints the Worker, the D1 database and the custom domain that the environment's lock entry holds, and requires typing the confirmation it prints:
+
+```sh
+bunx agentic-slack down --dir . --env staging
+```
+
+It deletes only those locked resources and then removes the environment from the lock, keeping every other entry.
+It leaves the Slack app alone, because deleting it belongs to the Slack phase.
 
 ### Adopt an existing deployment
 
