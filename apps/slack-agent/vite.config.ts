@@ -11,6 +11,10 @@ const agentConfig = path.resolve(
 );
 
 export default defineConfig({
+  build: {
+    emptyOutDir: true,
+    outDir: process.env.WORKER_OUT_DIR ?? "dist",
+  },
   plugins: [
     flue(),
     cloudflare({
@@ -21,7 +25,16 @@ export default defineConfig({
   // The agent modules import the config by a relative specifier, so the
   // override aliases that specifier instead of rewriting the import.
   resolve: {
-    alias: [{ find: "../agent.config.ts", replacement: agentConfig }],
+    alias: [
+      { find: "../agent.config.ts", replacement: agentConfig },
+      {
+        find: "@agentic-slack/core",
+        replacement: path.resolve(
+          import.meta.dirname,
+          "../../packages/core/src/index.ts",
+        ),
+      },
+    ],
   },
   root: import.meta.dirname,
   server: {

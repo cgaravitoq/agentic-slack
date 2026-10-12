@@ -10,5 +10,10 @@
     "strict": true,
     "types": ["bun", "@cloudflare/workers-types"]
   },
-  "include": ["apps/**/*.ts", "packages/**/*.ts"]
+  "include": [
+    "apps/**/*.ts",
+    "packages/**/*.ts",
+    "bin/**/*.ts",
+    "scripts/**/*.ts"
+  ]
 }
