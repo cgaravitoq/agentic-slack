@@ -523,8 +523,14 @@ const workerExists = async (
       cwd: directory,
     });
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      /not found|does not exist|\[code: 10007\]/iu.test(error.message)
+    ) {
+      return false;
+    }
+    throw error;
   }
 };
 

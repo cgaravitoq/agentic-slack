@@ -182,6 +182,9 @@ if (group === "secret" && command === "put") {
 }
 if (group === "deployments" && command === "list") {
   const worker = named("--name");
+  if (process.env.STUB_WRANGLER_FAIL_DEPLOYMENTS === "1") {
+    fail("Authentication error [code: 10000]");
+  }
   if (!state.workers.includes(worker)) {
     fail("Worker " + worker + " not found");
   }
@@ -863,6 +866,29 @@ describe("down", () => {
       environments: { prod: prodEntry },
       version: 1,
     });
+  });
+
+  test("keeps everything when wrangler cannot tell whether the Worker exists", async () => {
+    const directory = await prepared();
+
+    const run = await runCli(directory, downArguments(directory), {
+      environment: {
+        SLACK_CONFIG_TOKEN: configToken,
+        STUB_WRANGLER_FAIL_DEPLOYMENTS: "1",
+        STUB_WRANGLER_WORKERS: "provision-fixture-staging",
+      },
+      input: "Provision Fixture/staging\n",
+      lock: lockSource,
+    });
+
+    expect(run.exitCode).toBe(1);
+    expect(run.stderr).toContain("Authentication error");
+    expect(run.calls).toEqual([
+      "deployments list --name provision-fixture-staging --json",
+    ]);
+    expect(run.slack).toEqual([]);
+    const lock = await readLock(directory);
+    expect(Object.keys(lock.environments)).toEqual(["prod", "staging"]);
   });
 
   test("deletes the D1 of an environment whose deploy never happened", async () => {
