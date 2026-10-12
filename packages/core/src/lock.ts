@@ -8,15 +8,19 @@ const text = v.pipe(v.string(), v.minLength(1, "Expected a non-empty string"));
 
 export const lockFileName = "agentic-slack.lock.json";
 
+const lockSlackSchema = v.strictObject({
+  appId: text,
+  manifestSha256: v.pipe(
+    v.string(),
+    v.regex(/^[0-9a-f]{64}$/u, "Expected a lower-case sha256"),
+  ),
+});
+
+// `up` records the D1 and the Worker before any Slack app exists, so an entry
+// gains `slack` only once the Slack phase, or `adopt`, has verified an app.
 const lockEnvironmentSchema = v.strictObject({
   d1: v.strictObject({ id: text, name: text }),
-  slack: v.strictObject({
-    appId: text,
-    manifestSha256: v.pipe(
-      v.string(),
-      v.regex(/^[0-9a-f]{64}$/u, "Expected a lower-case sha256"),
-    ),
-  }),
+  slack: v.optional(lockSlackSchema),
   worker: text,
 });
 
@@ -74,6 +78,16 @@ export const withLockEnvironment = (
   entry: LockEnvironment,
 ): InstanceLock => ({
   environments: { ...lock.environments, [environment]: entry },
+  version: lock.version,
+});
+
+export const withoutLockEnvironment = (
+  lock: InstanceLock,
+  environment: string,
+): InstanceLock => ({
+  environments: Object.fromEntries(
+    Object.entries(lock.environments).filter(([name]) => name !== environment),
+  ),
   version: lock.version,
 });
 
