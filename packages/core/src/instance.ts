@@ -15,6 +15,11 @@ const secretName = v.pipe(
   v.regex(/^[A-Z][A-Z0-9_]*$/u, "Expected a name like SLACK_BOT_TOKEN"),
 );
 
+const headerName = v.pipe(
+  v.string(),
+  v.regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/u, "Expected an HTTP header name"),
+);
+
 const workerName = v.pipe(
   v.string(),
   v.regex(/^[a-z0-9][a-z0-9-]{0,62}$/u, "Expected a lower-case Worker name"),
@@ -75,7 +80,7 @@ const delegationSchema = v.strictObject({
     }),
   ),
   repos: v.array(text),
-  runnerHeaders: v.optional(v.record(secretName, secretName)),
+  runnerHeaders: v.optional(v.record(headerName, secretName)),
 });
 
 const mcpServerSchema = v.strictObject({

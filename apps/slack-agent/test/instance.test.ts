@@ -232,6 +232,25 @@ environments:
     }
   });
 
+  test("accepts delegation runner headers named as HTTP headers", () => {
+    const instance = parseInstance(`agent:
+  name: Slack Agent
+  description: A private assistant.
+  ownerInstructions: Answer.
+  delegation:
+    authSecret: DELEGATION_BEARER
+    repos: [owner/repository]
+    runnerHeaders:
+      CF-Access-Client-Id: RUNNER_ID
+secrets:
+  - DELEGATION_BEARER
+  - RUNNER_ID
+${minimalEnvironment}`);
+    expect(instance.agent.delegation?.runnerHeaders).toEqual({
+      "CF-Access-Client-Id": "RUNNER_ID",
+    });
+  });
+
   test("rejects invalid YAML and an empty document", () => {
     expect(() => parseInstance("agent: [\n")).toThrow(
       /agent\.yaml is not valid YAML/mu,
