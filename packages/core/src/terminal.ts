@@ -1,9 +1,11 @@
-const input: AsyncIterator<string | Uint8Array> =
-  process.stdin[Symbol.asyncIterator]();
+let input: AsyncIterator<string | Uint8Array> | undefined;
 let queued = "";
 let closed = false;
 
 const nextCharacter = async (): Promise<string | undefined> => {
+  // Bun before 1.4 drops the piped stdin that arrives between acquiring the
+  // iterator and its first next, so it is acquired on the first read.
+  input ??= process.stdin[Symbol.asyncIterator]();
   while (queued === "" && !closed) {
     // oxlint-disable-next-line no-await-in-loop
     const chunk = await input.next();
