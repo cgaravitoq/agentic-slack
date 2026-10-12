@@ -23,6 +23,9 @@ const nextCharacter = async (): Promise<string | undefined> => {
   return character;
 };
 
+const bracketedPasteStart = "\u001B[200~";
+const bracketedPasteEnd = "\u001B[201~";
+
 const readLine = async (): Promise<string> => {
   let value = "";
   for (;;) {
@@ -41,6 +44,12 @@ const readLine = async (): Promise<string> => {
       character === "\u007F" || character === "\b"
         ? value.slice(0, -1)
         : `${value}${character}`;
+    if (
+      value.endsWith(bracketedPasteStart) ||
+      value.endsWith(bracketedPasteEnd)
+    ) {
+      value = value.slice(0, -bracketedPasteStart.length);
+    }
   }
   return value.trim();
 };
