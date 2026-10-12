@@ -103,7 +103,7 @@ const build = async (directory: string, environment: string): Promise<void> => {
   );
   await Bun.write(
     path.join(generated, "wrangler.jsonc"),
-    generateWranglerConfig(instance, migrationsDirectory, generated, lock),
+    generateWranglerConfig(instance, environment, migrationsDirectory, generated, lock),
   );
 
   const output = path.join(generated, environment);

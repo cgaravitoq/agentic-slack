@@ -270,9 +270,11 @@ ${minimalEnvironment}`);
 });
 
 describe("generateWranglerConfig", () => {
-  test("writes the instance environments in the self-hosted shape", () => {
+  test("writes only the requested environment in the self-hosted shape", () => {
+    const instance = parseInstance(brokerInstance);
     const generated = generateWranglerConfig(
-      parseInstance(brokerInstance),
+      instance,
+      "staging",
       migrationsDirectory,
       outputDirectory,
     );
@@ -281,13 +283,6 @@ describe("generateWranglerConfig", () => {
       compatibility_date: "2026-08-13",
       compatibility_flags: ["nodejs_compat"],
       env: {
-        prod: environmentConfig(
-          "instance",
-          "instance.example.com",
-          { SLACK_APP_ID: "A0000000002", SLACK_TEAM_ID: "T0000000002" },
-          { id: "22222222-2222-2222-2222-222222222222", name: "instance" },
-          "orb",
-        ),
         staging: environmentConfig(
           "instance-staging",
           "instance-staging.example.com",
@@ -315,6 +310,38 @@ describe("generateWranglerConfig", () => {
       preview_urls: false,
       workers_dev: false,
     });
+    expect(
+      v.parse(
+        generatedWranglerSchema,
+        JSON.parse(
+          generateWranglerConfig(
+            instance,
+            "prod",
+            migrationsDirectory,
+            outputDirectory,
+          ),
+        ),
+      ).env,
+    ).toEqual({
+      prod: environmentConfig(
+        "instance",
+        "instance.example.com",
+        { SLACK_APP_ID: "A0000000002", SLACK_TEAM_ID: "T0000000002" },
+        { id: "22222222-2222-2222-2222-222222222222", name: "instance" },
+        "orb",
+      ),
+    });
+  });
+
+  test("refuses an environment agent.yaml does not name", () => {
+    expect(() =>
+      generateWranglerConfig(
+        parseInstance(brokerInstance),
+        "preview",
+        migrationsDirectory,
+        outputDirectory,
+      ),
+    ).toThrow(/agent.yaml has no environment preview/u);
   });
 
   test("binds Workers AI when the model runs on the cloudflare provider", () => {
@@ -327,6 +354,7 @@ describe("generateWranglerConfig", () => {
   description: A private assistant.
   ownerInstructions: Answer.
 ${minimalEnvironment}`),
+          "staging",
           migrationsDirectory,
           outputDirectory,
         ),
@@ -357,6 +385,7 @@ ${minimalEnvironment}`),
       JSON.parse(
         generateWranglerConfig(
           parseInstance(agentHeader + minimalEnvironment),
+          "staging",
           migrationsDirectory,
           outputDirectory,
           lock,
@@ -376,6 +405,7 @@ ${minimalEnvironment}`),
       JSON.parse(
         generateWranglerConfig(
           parseInstance(agentHeader + minimalEnvironment),
+          "staging",
           migrationsDirectory,
           outputDirectory,
           emptyLock(),
@@ -400,6 +430,7 @@ ${minimalEnvironment}`),
     expect(() =>
       generateWranglerConfig(
         parseInstance(source),
+        "staging",
         migrationsDirectory,
         outputDirectory,
         emptyLock(),
@@ -415,6 +446,28 @@ ${minimalEnvironment}`),
     expect(() =>
       generateWranglerConfig(
         parseInstance(source),
+        "staging",
+        migrationsDirectory,
+        outputDirectory,
+        emptyLock(),
+      ),
+    ).toThrow(
+      /environments\.staging\.vars\.SLACK_APP_ID .*agentic-slack adopt/u,
+    );
+  });
+
+  test("treats an empty SLACK_APP_ID as missing", () => {
+    const source =
+      agentHeader +
+      minimalEnvironment.replace(
+        "SLACK_APP_ID: A0000000001",
+        'SLACK_APP_ID: ""',
+      );
+
+    expect(() =>
+      generateWranglerConfig(
+        parseInstance(source),
+        "staging",
         migrationsDirectory,
         outputDirectory,
         emptyLock(),
@@ -495,6 +548,7 @@ describe("scaffoldFiles", () => {
         JSON.parse(
           generateWranglerConfig(
             instance,
+            "staging",
             migrationsDirectory,
             outputDirectory,
           ),
