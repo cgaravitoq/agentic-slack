@@ -560,10 +560,33 @@ environments:
 
 `agent` holds the behavior, and its `skills` are paths to directories holding a `SKILL.md`, relative to `agent.yaml`.
 `environments` holds one Worker name, custom domain, `vars` and D1 database per environment.
+`d1.id` and the `SLACK_APP_ID` var are optional once `agentic-slack.lock.json` holds them.
 A `cloudflare/<model>` model builds on Workers AI and binds `AI`, with no broker.
 A `broker/<model>` model binds `MODEL_BROKER`, and then every environment needs its own `broker` service and entrypoint, because the model credential stays with the operator's broker.
 `secrets` declares the Worker secrets you create with `wrangler secret put`; the build rejects a configuration that names a secret the list does not declare.
 Every rejected configuration stops the build with the YAML path of each problem.
+
+### agentic-slack.lock.json
+
+`agentic-slack.lock.json` sits beside `agent.yaml` and is committed with it.
+It holds the non-secret IDs provisioning assigned, so `agent.yaml` stays user input: per environment the Worker name, the D1 database name and id, and the Slack app id with the sha256 of the manifest generated for it.
+The build reads an id from the lock first and falls back to `agent.yaml`; a build that finds neither stops with the command to run.
+The lock holds no token and no secret.
+
+### Adopt an existing deployment
+
+Take over a D1 database, Worker and Slack app that already exist instead of provisioning new ones:
+
+```sh
+bunx agentic-slack adopt --dir . --env staging --d1-id 00000000-0000-0000-0000-000000000000 --app-id A00000000
+```
+
+`adopt` verifies that the D1 id exists in your Cloudflare account under the name `agent.yaml` gives it, that the Worker exists, and that the Slack app carries the manifest this instance generates for that environment's domain.
+It compares bot scopes, bot events, the events request URL, and interactivity, and it refuses with a diff when they differ.
+It creates, updates and deletes nothing in Cloudflare or Slack.
+On success it writes that environment's entry into `agentic-slack.lock.json`.
+The manifest export needs a Slack configuration token with `configurations:read` and `configurations:write`: set `SLACK_CONFIG_TOKEN` or answer the prompt.
+An environment the lock already holds can be re-adopted without `--d1-id` and `--app-id`.
 
 ## Consume a pinned copy
 
