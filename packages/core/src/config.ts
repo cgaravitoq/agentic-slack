@@ -303,9 +303,13 @@ export const requiresApproval = (config: ResolvedAgentConfig): boolean =>
 const isModelProvider = (provider: string): provider is ModelProvider =>
   MODEL_PROVIDERS.some((known) => known === provider);
 
-const resolveModelProvider = (model: string): ModelProvider => {
+export const modelProviderOf = (model: string): string => {
   const separator = model.indexOf("/");
-  const provider = separator === -1 ? "" : model.slice(0, separator);
+  return separator === -1 ? "" : model.slice(0, separator);
+};
+
+const resolveModelProvider = (model: string): ModelProvider => {
+  const provider = modelProviderOf(model);
   if (!isModelProvider(provider)) {
     throw new Error(
       `Agent config requires model to name a known provider (${MODEL_PROVIDERS.join(", ")}) before the slash`,

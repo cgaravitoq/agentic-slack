@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as v from "valibot";
@@ -8,7 +8,7 @@ import { version } from "../package.json";
 const root = path.resolve(import.meta.dirname, "..");
 const temporary = await mkdtemp(path.join(tmpdir(), "agentic-slack-package-"));
 const consumer = path.join(temporary, "consumer");
-const fixture = path.join(consumer, "instance");
+const instance = path.join(consumer, "instance");
 await mkdir(consumer);
 
 const run = async (args: string[], cwd: string): Promise<string> => {
@@ -44,100 +44,147 @@ await Bun.write(
 );
 assert.deepEqual(await readdir(consumer), ["package.json"]);
 await run(["install", "--production"], consumer);
-assert.match(
-  await run(["x", "--no-install", "agentic-slack", "--help"], consumer),
-  /build --dir <dir> --env <env>/u,
-);
-const installedVersion = await run(
-  ["x", "--no-install", "agentic-slack", "--version"],
-  consumer,
-);
+
+const cli = (args: string[]): Promise<string> =>
+  run(["x", "--no-install", "agentic-slack", ...args], consumer);
+
+const help = await cli(["--help"]);
+assert.match(help, /init <dir>/u);
+assert.match(help, /build --dir <dir> --env <env>/u);
+const installedVersion = await cli(["--version"]);
 assert.equal(installedVersion.trim(), version);
 
-await mkdir(fixture);
-await Bun.write(
-  path.join(fixture, "agent.config.ts"),
-  `import { defineAgentConfig } from "agentic-slack";
+const distConfig = (stdout: string): string => {
+  const configPath = stdout.trim().split("\n").at(-1);
+  assert.ok(configPath !== undefined);
+  assert.ok(configPath.startsWith(path.join(instance, ".agentic-slack/")));
+  return configPath;
+};
 
-export default defineAgentConfig({
-  description: "An external operator configuration.",
-  model: "broker/gpt-6-luna",
-  name: "Packed External Agent",
-  ownerInstructions: "Answer with the external configuration.",
-  read: {},
-  retention: { channelDays: 15, privateDays: 7 },
-  suggestedPrompts: [],
+const wrangler = v.object({
+  ai: v.optional(v.object({ binding: v.string() })),
+  d1_databases: v.array(
+    v.object({
+      database_id: v.string(),
+      database_name: v.string(),
+      migrations_dir: v.string(),
+    }),
+  ),
+  durable_objects: v.object({
+    bindings: v.array(v.object({ class_name: v.string() })),
+  }),
+  main: v.string(),
+  migrations: v.array(v.object({ tag: v.string() })),
+  name: v.string(),
+  routes: v.array(
+    v.object({ custom_domain: v.boolean(), pattern: v.string() }),
+  ),
+  services: v.optional(
+    v.array(v.object({ binding: v.string(), service: v.string() })),
+  ),
+  vars: v.record(v.string(), v.string()),
 });
+
+const wranglerConfig = async (
+  configPath: string,
+): Promise<v.InferOutput<typeof wrangler>> =>
+  v.parse(wrangler, await Bun.file(configPath).json());
+
+await cli(["init", "instance"]);
+const scaffoldedFiles = await readdir(instance);
+assert.deepEqual(scaffoldedFiles.toSorted(), [
+  ".gitignore",
+  "agent.yaml",
+  "package.json",
+]);
+assert.equal(
+  await Bun.file(path.join(instance, ".gitignore")).text(),
+  "node_modules/\n.agentic-slack/\n",
+);
+const scaffolded = v.parse(
+  v.object({ dependencies: v.record(v.string(), v.string()) }),
+  await Bun.file(path.join(instance, "package.json")).json(),
+);
+assert.equal(scaffolded.dependencies["agentic-slack"], version);
+
+const template = await wranglerConfig(
+  distConfig(await cli(["build", "--dir", "instance", "--env", "staging"])),
+);
+assert.equal(template.name, "slack-agent-staging");
+assert.equal(template.ai?.binding, "AI");
+assert.deepEqual(template.services, []);
+assert.equal(template.vars.SLACK_TEAM_ID, "T00000000");
+assert.equal(template.d1_databases[0].database_name, "slack-agent-staging");
+assert.equal(template.routes[0].pattern, "slack-agent-staging.example.com");
+
+const externalName = "Packed Instance Agent";
+const externalSkillDescription = "Packed refunds skill description.";
+
+await mkdir(path.join(instance, "skills/refunds"), { recursive: true });
+await writeFile(
+  path.join(instance, "skills/refunds/SKILL.md"),
+  `---
+name: refunds
+description: ${externalSkillDescription}
+---
+
+Confirm the order ID and the reason for the refund.
 `,
 );
-await Bun.write(
-  path.join(fixture, "wrangler.jsonc"),
-  JSON.stringify({
-    compatibility_date: "2026-08-13",
-    compatibility_flags: ["nodejs_compat"],
-    env: {
-      staging: {
-        d1_databases: [
-          {
-            binding: "DB",
-            migrations_dir:
-              "../node_modules/agentic-slack/apps/slack-agent/migrations",
-          },
-        ],
-        name: "package-fixture-staging",
-        preview_urls: false,
-        services: [
-          {
-            binding: "MODEL_BROKER",
-            entrypoint: "Completion",
-            service: "fixture-broker",
-          },
-        ],
-        workers_dev: false,
-      },
-    },
-    migrations: [
-      {
-        new_sqlite_classes: ["FlueSlackAgentAgent"],
-        tag: "flue-class-FlueSlackAgentAgent",
-      },
-    ],
-    name: "package-fixture",
-    preview_urls: false,
-    workers_dev: false,
-  }),
+await writeFile(
+  path.join(instance, "agent.yaml"),
+  `agent:
+  name: ${externalName}
+  description: An external operator configuration.
+  ownerInstructions: Answer with the external configuration.
+  model: broker/gpt-6-luna
+  retention:
+    channelDays: 3
+    privateDays: 2
+  skills:
+    - skills/refunds
+secrets:
+  - SLACK_BOT_TOKEN
+  - SLACK_SIGNING_SECRET
+environments:
+  staging:
+    worker: package-fixture-staging
+    domain: package-fixture-staging.example.com
+    vars:
+      SLACK_TEAM_ID: T0000000001
+      SLACK_APP_ID: A0000000001
+    d1:
+      name: package-fixture-staging
+      id: 33333333-3333-3333-3333-333333333333
+    broker:
+      service: fixture-broker
+      entrypoint: OrbCompletion
+`,
 );
 
-const stdout = await run(
-  [
-    "x",
-    "--no-install",
-    "agentic-slack",
-    "build",
-    "--dir",
-    fixture,
-    "--env",
-    "staging",
-  ],
-  consumer,
+const configPath = distConfig(
+  await cli(["build", "--dir", "instance", "--env", "staging"]),
 );
-const configPath = stdout.trim().split("\n").at(-1);
-assert.ok(configPath !== undefined);
-assert.ok(configPath.startsWith(path.join(fixture, ".agentic-slack/staging/")));
-const config = v.parse(
-  v.object({
-    d1_databases: v.array(v.object({ migrations_dir: v.string() })),
-    durable_objects: v.object({
-      bindings: v.array(v.object({ class_name: v.string() })),
-    }),
-    main: v.string(),
-    name: v.string(),
-    services: v.array(v.object({ binding: v.string() })),
-  }),
-  await Bun.file(configPath).json(),
-);
+const generatedFiles = await readdir(path.join(instance, ".agentic-slack"));
+assert.deepEqual(generatedFiles.toSorted(), [
+  "agent.config.ts",
+  "staging",
+  "wrangler.jsonc",
+]);
+const config = await wranglerConfig(configPath);
+
 assert.equal(config.name, "package-fixture-staging");
-assert.equal(config.services[0].binding, "MODEL_BROKER");
+assert.equal(config.services?.[0]?.binding, "MODEL_BROKER");
+assert.equal(config.services?.[0]?.service, "fixture-broker");
+assert.equal(config.ai, undefined);
+assert.equal(config.d1_databases[0].database_name, "package-fixture-staging");
+assert.equal(
+  config.d1_databases[0].database_id,
+  "33333333-3333-3333-3333-333333333333",
+);
+assert.equal(config.vars.SLACK_APP_ID, "A0000000001");
+assert.equal(config.routes[0].pattern, "package-fixture-staging.example.com");
+assert.equal(config.migrations[0].tag, "flue-class-FlueSlackAgentAgent");
 assert.equal(
   config.durable_objects.bindings[0].class_name,
   "FlueSlackAgentAgent",
@@ -154,7 +201,8 @@ assert.ok(
 const bundle = await Bun.file(
   path.join(path.dirname(configPath), config.main),
 ).text();
-assert.ok(bundle.includes("Packed External Agent"));
+assert.ok(bundle.includes(externalName));
+assert.ok(bundle.includes(externalSkillDescription));
 assert.ok(!bundle.includes("Slack Agent"));
 assert.ok(
   bundle.includes(
