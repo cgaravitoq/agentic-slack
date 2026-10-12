@@ -6,6 +6,8 @@ import {
   parseInstance,
   scaffoldFiles,
 } from "../../../packages/core/src/instance.ts";
+import { emptyLock } from "../../../packages/core/src/lock.ts";
+import type { InstanceLock } from "../../../packages/core/src/lock.ts";
 
 const outputDirectory = "/tmp/instance/.agentic-slack";
 const migrationsDirectory =
@@ -45,6 +47,12 @@ const generatedWranglerSchema = v.object({
   env: v.record(v.string(), environmentSchema),
   name: v.string(),
 });
+
+const agentHeader = `agent:
+  name: Slack Agent
+  description: A private assistant.
+  ownerInstructions: Answer.
+`;
 
 const minimalEnvironment = `environments:
   staging:
@@ -328,6 +336,92 @@ ${minimalEnvironment}`),
     expect(generated.name).toBe("slack-agent");
     expect(generated.env.staging.ai).toEqual({ binding: "AI" });
     expect(generated.env.staging.services).toBeUndefined();
+  });
+
+  test("takes the adopted IDs from the lock over agent.yaml", () => {
+    const lock: InstanceLock = {
+      environments: {
+        staging: {
+          d1: {
+            id: "99999999-9999-9999-9999-999999999999",
+            name: "instance-staging",
+          },
+          slack: { appId: "A9999999999", manifestSha256: "a".repeat(64) },
+          worker: "instance-staging",
+        },
+      },
+      version: 1,
+    };
+    const generated = v.parse(
+      generatedWranglerSchema,
+      JSON.parse(
+        generateWranglerConfig(
+          parseInstance(agentHeader + minimalEnvironment),
+          migrationsDirectory,
+          outputDirectory,
+          lock,
+        ),
+      ),
+    );
+
+    expect(generated.env.staging.d1_databases[0]?.database_id).toBe(
+      "99999999-9999-9999-9999-999999999999",
+    );
+    expect(generated.env.staging.vars.SLACK_APP_ID).toBe("A9999999999");
+  });
+
+  test("falls back to agent.yaml when the lock has no entry", () => {
+    const generated = v.parse(
+      generatedWranglerSchema,
+      JSON.parse(
+        generateWranglerConfig(
+          parseInstance(agentHeader + minimalEnvironment),
+          migrationsDirectory,
+          outputDirectory,
+          emptyLock(),
+        ),
+      ),
+    );
+
+    expect(generated.env.staging.d1_databases[0]?.database_id).toBe(
+      "11111111-1111-1111-1111-111111111111",
+    );
+    expect(generated.env.staging.vars.SLACK_APP_ID).toBe("A0000000001");
+  });
+
+  test("stops when neither the lock nor agent.yaml has a D1 id", () => {
+    const source =
+      agentHeader +
+      minimalEnvironment.replace(
+        "      id: 11111111-1111-1111-1111-111111111111\n",
+        "",
+      );
+
+    expect(() =>
+      generateWranglerConfig(
+        parseInstance(source),
+        migrationsDirectory,
+        outputDirectory,
+        emptyLock(),
+      ),
+    ).toThrow(/environments\.staging\.d1\.id .*agentic-slack adopt/u);
+  });
+
+  test("stops when neither the lock nor agent.yaml has SLACK_APP_ID", () => {
+    const source =
+      agentHeader +
+      minimalEnvironment.replace("      SLACK_APP_ID: A0000000001\n", "");
+
+    expect(() =>
+      generateWranglerConfig(
+        parseInstance(source),
+        migrationsDirectory,
+        outputDirectory,
+        emptyLock(),
+      ),
+    ).toThrow(
+      /environments\.staging\.vars\.SLACK_APP_ID .*agentic-slack adopt/u,
+    );
   });
 });
 
