@@ -1225,6 +1225,31 @@ test("claim versus cancellation is exclusive and runner state transitions preser
   ).toBe(200);
 });
 
+test("a done task refuses a runner state with 409 invalid_transition and stays done", async () => {
+  const h = await harness();
+  await h.delegation.store.register(runner);
+  await h.delegation.store.propose(proposal, "instance-1");
+  await h.delegation.store.approve(proposal.id, runner.name, "U1");
+  await h.delegation.store.claim(proposal.id, runner.name);
+  await h.db
+    .prepare("UPDATE delegation_tasks SET state = 'done' WHERE id = ?1")
+    .bind(proposal.id)
+    .run();
+  const refused = await h.request(
+    `/delegation/tasks/${proposal.id}/state`,
+    "POST",
+    JSON.stringify({ runner: runner.name, state: "running" }),
+  );
+  expect(refused.status).toBe(409);
+  expect(await refused.json()).toEqual({
+    error: "invalid_transition",
+    ok: false,
+  });
+  const stored = await h.delegation.store.read(proposal.id);
+  expect(stored?.task.state).toBe("done");
+  expect(h.posts).toHaveLength(0);
+});
+
 test.each(["running", "unknown", "failed"] as const)(
   "a saved %s state answers 200 even when its Slack notice is refused",
   async (state) => {
