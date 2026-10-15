@@ -79,6 +79,7 @@ const proposalInput = (repos: readonly string[]) =>
   v.object({
     channel: v.optional(v.string()),
     repo: v.picklist([...repos]),
+    runner: v.optional(v.pipe(v.string(), v.nonEmpty())),
     summary: v.pipe(v.string(), v.nonEmpty()),
     threadTs: v.optional(v.pipe(v.string(), v.regex(/^\d+\.\d+$/u))),
   });
@@ -91,7 +92,7 @@ export const createDelegation = (
   const fetcher = options.fetcher ?? fetch;
   const labels = resolveDelegationLabels(config.labels);
   const proposal = proposalInput(config.repos);
-  const proposalDescription = `Propose delegation only when the requester explicitly asks. Capture the bound thread and request their approval for a configured repo and runner. The configured repos are ${config.repos.join(", ")}. In an owner's DM, supply an admitted channel and threadTs.`;
+  const proposalDescription = `Propose delegation only when the requester explicitly asks. Capture the bound thread and request their approval for a configured repo and runner. Pass runner only when the requester names one, and only a registered runner is accepted. The configured repos are ${config.repos.join(", ")}. In an owner's DM, supply an admitted channel and threadTs.`;
   const slack = async (
     task: DelegationTask,
     text: string,
@@ -198,11 +199,24 @@ export const createDelegation = (
   const cancel = async (stored: StoredDelegationTask): Promise<void> => {
     await options.cancelSchedule(stored.instanceId, stored.task.id);
   };
-  const offerableRunners = async (
+  const offeredRunners = async (
     repo: string,
+    named: string | undefined,
   ): Promise<DelegationRunner[]> => {
     const registered = await store.runners();
-    return registered.filter((runner) => runner.repos.includes(repo));
+    const forRepo = registered.filter((runner) => runner.repos.includes(repo));
+    if (named === undefined) {
+      return forRepo;
+    }
+    const matching = forRepo.filter((runner) => runner.name === named);
+    if (matching.length === 0) {
+      throw new Error(
+        forRepo.length === 0
+          ? `No runner is registered for ${repo}`
+          : `Runner ${named} is not registered for ${repo}. Registered runners: ${forRepo.map((runner) => runner.name).join(", ")}.`,
+      );
+    }
+    return matching;
   };
   const handleTaskRequest = async (
     request: Request,
@@ -389,6 +403,7 @@ export const createDelegation = (
           if (!config.repos.includes(data.repo)) {
             throw new Error("Repo is not configured for delegation");
           }
+          const runners = await offeredRunners(data.repo, data.runner);
           let channel = binding.channelId;
           let { threadTs } = binding;
           if (binding.surface === "private") {
@@ -447,7 +462,6 @@ export const createDelegation = (
           };
           await store.propose(task, instanceId);
           await options.schedule(instanceId, task);
-          const runners = await offerableRunners(task.repo);
           const buttons = await Promise.all(
             runners.map(async (runner) => {
               let online = false;
