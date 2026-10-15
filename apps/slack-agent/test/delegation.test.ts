@@ -292,9 +292,9 @@ const harness = async (
     "U1",
     "instance-1",
   );
-  const propose = (summary = "Fix login") =>
+  const propose = (summary = "Fix login", named: { runner?: string } = {}) =>
     tool.run({
-      data: v.parse(tool.input, { repo: "example", summary }),
+      data: v.parse(tool.input, { repo: "example", summary, ...named }),
       log: silentLog,
       toolCallId: "delegate-1",
     });
@@ -313,6 +313,20 @@ const harness = async (
     tool,
   };
 };
+const approveIds = (post: { blocks?: unknown[] }): string[] =>
+  v
+    .parse(
+      v.array(
+        v.looseObject({
+          elements: v.optional(v.array(v.object({ action_id: v.string() }))),
+        }),
+      ),
+      post.blocks,
+    )
+    .flatMap((block) => block.elements ?? [])
+    .map((element) => element.action_id)
+    .filter((actionId) => actionId.startsWith("delegation_approve:"));
+
 const click = (
   id: string,
   user = "U1",
@@ -409,6 +423,53 @@ test("the tool offers exactly the configured repos as the repo the model must na
     v.parse(h.tool.input, { repo: "Mac", summary: "Fix login" }),
   ).toThrow();
   expect(() => v.parse(h.tool.input, { summary: "Fix login" })).toThrow();
+});
+
+test("the tool offers every runner registered for the repo and only the named one otherwise", async () => {
+  const h = await harness();
+  await h.request("/delegation/runners", "POST", JSON.stringify(runner));
+  await h.request(
+    "/delegation/runners",
+    "POST",
+    JSON.stringify({ ...runner, name: "runner-2" }),
+  );
+  await h.propose();
+  expect(approveIds(h.posts[0])).toEqual([
+    "delegation_approve:runner-1",
+    "delegation_approve:runner-2",
+  ]);
+  await h.propose("Fix login", { runner: "runner-2" });
+  expect(approveIds(h.posts[1])).toEqual(["delegation_approve:runner-2"]);
+  expect(h.posts[1]?.text).toContain("Only <@U1> can approve");
+  expect(JSON.stringify(h.posts[1])).not.toContain("runner-1");
+});
+
+test("a proposal naming a runner no one registered is refused with the names that are", async () => {
+  const h = await harness();
+  await h.request("/delegation/runners", "POST", JSON.stringify(runner));
+  await h.request(
+    "/delegation/runners",
+    "POST",
+    JSON.stringify({ ...runner, name: "mac-mini" }),
+  );
+  await h.request(
+    "/delegation/runners",
+    "POST",
+    JSON.stringify({ ...runner, name: "other-repo", repos: ["right-hand"] }),
+  );
+  expect(await h.propose("Fix login", { runner: "runner-1" })).toBeDefined();
+  expect(h.propose("Fix login", { runner: "macbook-air" })).rejects.toThrow(
+    "Runner macbook-air is not registered for example. Registered runners: mac-mini, runner-1.",
+  );
+  expect(h.propose("Fix login", { runner: "other-repo" })).rejects.toThrow(
+    "Runner other-repo is not registered for example",
+  );
+  expect(h.posts).toHaveLength(1);
+  expect(h.scheduled).toHaveLength(1);
+  const empty = await harness();
+  expect(empty.propose("Fix login", { runner: "mac-mini" })).rejects.toThrow(
+    "No runner is registered for example",
+  );
 });
 
 test("reporters leave out Bloop's own replies and every bot message", async () => {
