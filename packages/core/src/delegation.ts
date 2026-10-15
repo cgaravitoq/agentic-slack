@@ -198,6 +198,12 @@ export const createDelegation = (
   const cancel = async (stored: StoredDelegationTask): Promise<void> => {
     await options.cancelSchedule(stored.instanceId, stored.task.id);
   };
+  const offerableRunners = async (
+    repo: string,
+  ): Promise<DelegationRunner[]> => {
+    const registered = await store.runners();
+    return registered.filter((runner) => runner.repos.includes(repo));
+  };
   const handleTaskRequest = async (
     request: Request,
     url: URL,
@@ -441,10 +447,7 @@ export const createDelegation = (
           };
           await store.propose(task, instanceId);
           await options.schedule(instanceId, task);
-          const registered = await store.runners();
-          const runners = registered.filter((runner) =>
-            runner.repos.includes(task.repo),
-          );
+          const runners = await offerableRunners(task.repo);
           const buttons = await Promise.all(
             runners.map(async (runner) => {
               let online = false;
