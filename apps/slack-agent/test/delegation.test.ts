@@ -1467,3 +1467,21 @@ test("approval preserves a long summary while bounding its title and Slack secti
     sections.every((block) => (block.text?.text.length ?? 0) <= 3000),
   ).toBe(true);
 });
+
+test("a priority triage request reaches the runner as triage, not as a defect to diagnose", async () => {
+  const h = await harness();
+  await h.request("/delegation/runners", "POST", JSON.stringify(runner));
+  const data = v.parse(h.tool.input, {
+    kind: "triage",
+    repo: "example",
+    summary: "Determine the priority of the request in this Slack thread.",
+  });
+  expect(data).toMatchObject({ kind: "triage" });
+  const { output } = await h.tool.run({
+    data,
+    log: silentLog,
+    toolCallId: "delegate-triage",
+  });
+  const stored = await h.delegation.store.read(output.id);
+  expect(stored?.task).toMatchObject({ kind: "triage" });
+});
