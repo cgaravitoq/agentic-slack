@@ -232,7 +232,7 @@ describe("neutral core composition", () => {
     expect(Object.isFrozen(reporting.progress?.labels)).toBe(true);
   });
 
-  test("rejects a progress block with no secret or a missing label", () => {
+  test("rejects a progress block with no secret, a missing label, or a blank narration or rule", () => {
     const required = {
       description: "Rejects invalid operator fields.",
       name: "Invalid Agent",
@@ -276,6 +276,18 @@ describe("neutral core composition", () => {
         },
       }),
     ).toThrow("Agent config requires a progress label for done");
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        progress: { authSecret: "X", labels, narration: "   " },
+      }),
+    ).toThrow("Agent config requires progress narration");
+    expect(() =>
+      defineAgentConfig({
+        ...required,
+        progress: { authSecret: "X", labels, rule: "   " },
+      }),
+    ).toThrow("Agent config requires progress rule");
   });
 });
 

@@ -13,6 +13,7 @@ import type {
 } from "@agentic-slack/core";
 import type {
   ResolvedSlackProgressConfig,
+  SlackProgressConfig,
   SlackProgressTurn,
 } from "../../../packages/core/src/progress.ts";
 import type { ConversationLifecycleAgent } from "../../../packages/core/src/retention.ts";
@@ -291,7 +292,12 @@ const slackRecorder =
     );
   };
 
-const progressConfig = (narration?: string): ResolvedSlackProgressConfig => {
+const progressConfig = (
+  fields: {
+    readonly narration?: string | undefined;
+    readonly rule?: string | undefined;
+  } = {},
+): ResolvedSlackProgressConfig => {
   const labels = {
     blocked: "Blocked",
     done: "Done",
@@ -301,19 +307,26 @@ const progressConfig = (narration?: string): ResolvedSlackProgressConfig => {
     review: "In review",
     started: "Started",
   };
-  const { progress } = defineAgentConfig({
+  const progress: SlackProgressConfig = {
+    authSecret: "PROGRESS_BEARER",
+    labels,
+  };
+  if (fields.narration !== undefined) {
+    progress.narration = fields.narration;
+  }
+  if (fields.rule !== undefined) {
+    progress.rule = fields.rule;
+  }
+  const resolved = defineAgentConfig({
     description: "Reports task progress.",
     name: "Progress Agent",
     ownerInstructions: "Prefer short answers.",
-    progress:
-      narration === undefined
-        ? { authSecret: "PROGRESS_BEARER", labels }
-        : { authSecret: "PROGRESS_BEARER", labels, narration },
-  });
-  if (progress === undefined) {
+    progress,
+  }).progress;
+  if (resolved === undefined) {
     throw new Error("progress config is required");
   }
-  return progress;
+  return resolved;
 };
 
 interface EndpointOverrides {
@@ -323,6 +336,7 @@ interface EndpointOverrides {
   readonly narration?: string;
   readonly narrate?: (turn: SlackProgressTurn) => Promise<void>;
   readonly refusals?: readonly (string | undefined)[];
+  readonly rule?: string;
 }
 
 const endpointFor = (
@@ -330,7 +344,7 @@ const endpointFor = (
   calls: RecordedCall[],
   overrides: EndpointOverrides = {},
 ) =>
-  createSlackProgressEndpoint(progressConfig(overrides.narration), {
+  createSlackProgressEndpoint(progressConfig(overrides), {
     bearer: overrides.bearer ?? BEARER,
     db: testBindings(db).DB,
     fetcher:
@@ -1836,6 +1850,31 @@ describe("narrated progress endpoint", () => {
         instanceId: "slack:v1:T123:C1:171.1",
       },
     ]);
+  });
+
+  test("rewrites a milestone under the operator's rule when one is configured", async () => {
+    const db = new FakeD1();
+    db.admissions.set("C1", ADMITTED_BY);
+    const calls: RecordedCall[] = [];
+    const { narrate, turns } = narrations();
+
+    const response = await endpointFor(db, calls, {
+      narrate,
+      narration: "Write in Spanish, warm and brief.",
+      rule: "Rewrite this milestone as one plain sentence for a teammate.",
+    }).handle(postMilestone());
+
+    expect(response.status).toBe(200);
+    expect(turns[0]?.body).toBe(
+      [
+        "Write in Spanish, warm and brief.",
+        "Task: release-42",
+        "Status: Started",
+        "Milestone: Kicked off",
+        "Trusted code closes your reply by linking https://example.com/run, so do not write the tags or the link yourself.",
+        "Rewrite this milestone as one plain sentence for a teammate.",
+      ].join("\n\n"),
+    );
   });
 
   test("posts the curated reply when the narration turn cannot start", async () => {

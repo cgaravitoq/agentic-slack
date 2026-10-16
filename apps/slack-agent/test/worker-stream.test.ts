@@ -1504,6 +1504,7 @@ test("a narrated deployment turns a delegation state notice in the task's thread
           started: "Started",
         },
         narration: "Write in Spanish, warm and brief.",
+        rule: "Rewrite this milestone as one sentence for the channel.",
       },
     }),
   }));
@@ -1582,4 +1583,11 @@ test("a narrated deployment turns a delegation state notice in the task's thread
       }),
     },
   ]);
+  const [turn] = dispatched;
+  expect(turn?.request.message.body).toContain(
+    "Rewrite this milestone as one sentence for the channel.",
+  );
+  expect(turn?.request.message.body).not.toContain(
+    "Rewrite this milestone as your reply in that voice",
+  );
 });
