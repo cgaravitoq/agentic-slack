@@ -536,6 +536,7 @@ const narrationBody = (
   narration: string,
   labels: Readonly<Record<ProgressKind, string>>,
   conductor: string | undefined,
+  rule: string,
 ): string =>
   [
     narration,
@@ -544,7 +545,7 @@ const narrationBody = (
     `Status: ${labels[milestone.kind]}`,
     `Milestone: ${milestone.text}`,
     ...attachedOf(milestone, members),
-    NARRATION_RULE,
+    rule,
   ].join("\n\n");
 
 // A delegated task's notice is the runner's own evidence, so it narrates with
@@ -554,6 +555,7 @@ export const delegationNoticeTurn = (
   notice: DelegationNotice,
   narration: string,
   teamId: string,
+  rule: string = NARRATION_RULE,
 ): SlackProgressTurn => {
   const text = noticeLine(notice.label, notice.note);
   return {
@@ -572,7 +574,7 @@ export const delegationNoticeTurn = (
       ...conductorOf(notice.conductor),
       `Status: ${notice.label}`,
       `Milestone: ${text}`,
-      NARRATION_RULE,
+      rule,
     ].join("\n\n"),
     idempotencyKey: `delegation:${notice.task.id}:${notice.state}`,
     instanceId: slackInstanceId({
@@ -874,6 +876,7 @@ export const createSlackProgressEndpoint = (
     root: SlackProgressRoot,
     narration: string,
     conductor: string | undefined,
+    rule: string,
   ): Promise<SlackMilestoneOutcome> => {
     const binding: SlackDeliveryBinding = {
       channelId: milestone.channel,
@@ -899,6 +902,7 @@ export const createSlackProgressEndpoint = (
           narration,
           config.labels,
           conductor,
+          rule,
         ),
         idempotencyKey: `progress:${milestone.id}`,
         instanceId: slackInstanceId({
@@ -951,6 +955,7 @@ export const createSlackProgressEndpoint = (
       root,
       narration,
       conductor,
+      NARRATION_RULE,
     );
   };
 
