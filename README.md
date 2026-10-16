@@ -268,6 +268,8 @@ export default defineAgentConfig({
     },
     narration:
       "Write in Spanish, warm and brief, as one or two sentences for the team.",
+    rule:
+      "Answer with one past-tense sentence that states what this milestone changed.",
   },
 });
 ```
@@ -277,6 +279,10 @@ export default defineAgentConfig({
 With it, each milestone is a short agent turn in that task's thread instead of the curated line posted as given: the turn rewrites the milestone in that voice, sees the earlier milestones of the thread as context, and answers with one or two sentences that restate only what those milestones say.
 Without it, milestones are posted exactly as the sender wrote them.
 Either way the thread owes the milestone an answer: when a narrated turn cannot deliver, the thread gets the curated line rather than the generic failure notice, and a milestone is never silently dropped.
+`rule` is optional and replaces the rewrite instruction the bot appends to every narrated turn, milestone replies and delegation state notices alike.
+Write one when your own evals say another instruction narrates better; leave it out and each body keeps the instruction this package ships, word for word.
+A blank `rule` is refused like a blank narration, and `rule` does nothing without `narration`.
+In `agent.yaml` the field is `agent.progress.rule`.
 Store the token as a Worker secret rather than in the config file:
 
 ```sh
@@ -330,7 +336,7 @@ The refusals are `401` for a missing or wrong bearer, `400` for a body that is n
 A mention no channel member matches answers `422` `unknown_mention`, and one several members share answers `409` `ambiguous_mention` with their `candidates`; both name the `mention` and post nothing.
 A Slack failure answers `500` so the sender can retry, and the retry is deduplicated by its receipt `id`.
 `chat:write` covers both `chat.postMessage` and `chat.update`, so the option adds no scope.
-Milestone content arrives curated: without `narration` it is posted as given, and with it the bot only restates what the milestone and the thread's earlier milestones already say.
+Milestone content arrives curated: without `narration` it is posted as given, and with it the turn is asked to restate only what the milestone and the thread's earlier milestones already say, an instruction your own `rule` replaces.
 
 ## Who can talk to the agent
 
