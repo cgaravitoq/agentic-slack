@@ -51,6 +51,7 @@ export const narrateProgressTurn = async (
 };
 
 const narration = config.progress?.narration;
+const rule = config.progress?.rule;
 const delegation = configuredDelegation(
   bindings,
   trusted.botToken,
@@ -58,7 +59,7 @@ const delegation = configuredDelegation(
     ? undefined
     : (notice) =>
         narrateProgressTurn(
-          delegationNoticeTurn(notice, narration, trusted.teamId),
+          delegationNoticeTurn(notice, narration, trusted.teamId, rule),
         ),
 );
 const progress =

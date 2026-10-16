@@ -69,6 +69,7 @@ const progressSchema = v.strictObject({
     started: text,
   }),
   narration: v.optional(text),
+  rule: v.optional(text),
 });
 
 const delegationSchema = v.strictObject({

@@ -86,6 +86,7 @@ const brokerInstance = `agent:
       progress: Progress
       review: Review
       started: Started
+    rule: Rewrite this milestone as one sentence for the channel.
 secrets:
   - SLACK_PROGRESS_BEARER
   - SLACK_BOT_TOKEN
@@ -205,6 +206,29 @@ secrets:
   - SLACK_BOT_TOKEN
 ${minimalEnvironment}`,
         /^\s+agent\.progress\.authSecret: /mu,
+      ],
+      [
+        "a blank progress rule",
+        `agent:
+  name: Slack Agent
+  description: A private assistant.
+  ownerInstructions: Answer.
+  progress:
+    authSecret: SLACK_PROGRESS_BEARER
+    labels:
+      blocked: Blocked
+      done: Done
+      merged: Merged
+      pr: Pull request
+      progress: Progress
+      review: Review
+      started: Started
+    rule: ""
+secrets:
+  - SLACK_PROGRESS_BEARER
+  - SLACK_BOT_TOKEN
+${minimalEnvironment}`,
+        /^\s+agent\.progress\.rule: /mu,
       ],
       [
         "an unknown model provider",
@@ -542,6 +566,7 @@ describe("generateAgentConfigModule", () => {
           review: "Review",
           started: "Started",
         },
+        rule: "Rewrite this milestone as one sentence for the channel.",
       },
       retention: { channelDays: 15, privateDays: 7 },
     });

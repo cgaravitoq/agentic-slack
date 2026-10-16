@@ -1528,3 +1528,57 @@ test("approval preserves a long summary while bounding its title and Slack secti
     sections.every((block) => (block.text?.text.length ?? 0) <= 3000),
   ).toBe(true);
 });
+
+const CORE_NARRATION_RULE =
+  "Rewrite this milestone as your reply in that voice: one or two short sentences that use the earlier milestones in this thread as context and say only what this milestone and those earlier milestones say.";
+
+const noticeFixture: DelegationNotice = {
+  conductor: "runner-1",
+  label: "Iniciado",
+  note: "Budget ended",
+  state: "running",
+  task: {
+    channel: "C1",
+    expiresAt: 1_800_000_000_000,
+    id: "task-1",
+    rawThread: [],
+    repo: "example",
+    reporters: [],
+    requester: "U1",
+    state: "running",
+    summary: "Fix login",
+    threadTs: "171.1",
+    title: "Fix login",
+  },
+};
+
+const noticeBody = (rule: string): string =>
+  [
+    "Write in Spanish, warm and brief.",
+    "Task: delegation:task-1",
+    "Delegation: the conductor runner-1 is doing this task on the owner's behalf; name the conductor, never the owner, as the one working.",
+    "Status: Iniciado",
+    "Milestone: Iniciado. Budget ended",
+    rule,
+  ].join("\n\n");
+
+test("a delegation notice keeps the core rule byte for byte when no rule is configured", () => {
+  expect(
+    delegationNoticeTurn(
+      noticeFixture,
+      "Write in Spanish, warm and brief.",
+      "T1",
+    ).body,
+  ).toBe(noticeBody(CORE_NARRATION_RULE));
+});
+
+test("a delegation notice narrates under the operator's rule instead of the core one", () => {
+  expect(
+    delegationNoticeTurn(
+      noticeFixture,
+      "Write in Spanish, warm and brief.",
+      "T1",
+      "Rewrite this milestone as one line for the runner.",
+    ).body,
+  ).toBe(noticeBody("Rewrite this milestone as one line for the runner."));
+});

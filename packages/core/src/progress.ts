@@ -28,12 +28,14 @@ export interface SlackProgressConfig {
   authSecret: string;
   labels: SlackProgressLabels;
   narration?: string;
+  rule?: string;
 }
 
 export interface ResolvedSlackProgressConfig {
   readonly authSecret: string;
   readonly labels: Readonly<Record<ProgressKind, string>>;
   readonly narration?: string;
+  readonly rule?: string;
 }
 
 const resolveProgressLabels = (
@@ -71,10 +73,15 @@ export const resolveSlackProgressConfig = (
   if (narration === "") {
     throw new Error("Agent config requires progress narration");
   }
+  const rule = progress.rule?.trim();
+  if (rule === "") {
+    throw new Error("Agent config requires progress rule");
+  }
   return Object.freeze({
     authSecret,
     labels: resolveProgressLabels(progress.labels),
     narration,
+    rule,
   });
 };
 
@@ -498,8 +505,9 @@ const bearerToken = (request: Request): string =>
 export const slackInstanceId = (ref: SlackThreadRef): string =>
   `slack:v1:${encodeURIComponent(ref.teamId)}:${encodeURIComponent(ref.channelId)}:${encodeURIComponent(ref.threadTs)}`;
 
-// Only the voice comes from the operator: a narrated reply may restate the
-// milestone and the thread, never facts of its own, so the rule is core's.
+// The rewrite instruction every narration gets until an operator writes one of
+// its own: keeping it here and not in each config is what makes a deployment
+// with no rule narrate exactly as the package always has.
 const NARRATION_RULE =
   "Rewrite this milestone as your reply in that voice: one or two short sentences that use the earlier milestones in this thread as context and say only what this milestone and those earlier milestones say.";
 
@@ -536,6 +544,7 @@ const narrationBody = (
   narration: string,
   labels: Readonly<Record<ProgressKind, string>>,
   conductor: string | undefined,
+  rule: string | undefined,
 ): string =>
   [
     narration,
@@ -544,7 +553,7 @@ const narrationBody = (
     `Status: ${labels[milestone.kind]}`,
     `Milestone: ${milestone.text}`,
     ...attachedOf(milestone, members),
-    NARRATION_RULE,
+    rule ?? NARRATION_RULE,
   ].join("\n\n");
 
 // A delegated task's notice is the runner's own evidence, so it narrates with
@@ -554,6 +563,7 @@ export const delegationNoticeTurn = (
   notice: DelegationNotice,
   narration: string,
   teamId: string,
+  rule: string = NARRATION_RULE,
 ): SlackProgressTurn => {
   const text = noticeLine(notice.label, notice.note);
   return {
@@ -572,7 +582,7 @@ export const delegationNoticeTurn = (
       ...conductorOf(notice.conductor),
       `Status: ${notice.label}`,
       `Milestone: ${text}`,
-      NARRATION_RULE,
+      rule,
     ].join("\n\n"),
     idempotencyKey: `delegation:${notice.task.id}:${notice.state}`,
     instanceId: slackInstanceId({
@@ -874,6 +884,7 @@ export const createSlackProgressEndpoint = (
     root: SlackProgressRoot,
     narration: string,
     conductor: string | undefined,
+    rule: string | undefined,
   ): Promise<SlackMilestoneOutcome> => {
     const binding: SlackDeliveryBinding = {
       channelId: milestone.channel,
@@ -899,6 +910,7 @@ export const createSlackProgressEndpoint = (
           narration,
           config.labels,
           conductor,
+          rule,
         ),
         idempotencyKey: `progress:${milestone.id}`,
         instanceId: slackInstanceId({
@@ -936,7 +948,7 @@ export const createSlackProgressEndpoint = (
       ...milestone,
       text: milestone.text,
     };
-    const { narration } = config;
+    const { narration, rule } = config;
     const reply = replyOf(replyMilestone, members, redact(replyMilestone.text));
     if (narration === undefined || milestone.verbatim === true) {
       return {
@@ -951,6 +963,7 @@ export const createSlackProgressEndpoint = (
       root,
       narration,
       conductor,
+      rule,
     );
   };
 
